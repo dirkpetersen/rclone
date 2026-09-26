@@ -784,15 +784,11 @@ Many research and academic institutions have an AWS **data egress waiver**:
 egress is not charged as long as it stays within 15% of the organization's
 total monthly AWS bill.
 
-- **Per-destination configuration:** `egress_waiver = true`, and optionally
-  the organization's typical monthly AWS spend, so the estimate can warn when
-  a large download would exceed the 15% cap.
+- **Per-destination configuration:** `egress_waiver = true`.
 - **The dialog shows both totals:** with egress, and with egress waived. With
-  a waiver configured, the waived total is the headline. A warning appears
-  when this download alone would exceed the waiver cap.
-- **GDA can't know the month's egress so far** without billing access, so
-  the cap check is an estimate. Optional access to AWS Cost Explorer can make
-  it exact; open question 2.
+  a waiver configured, the waived total is the headline.
+- **No cap check** (decided 2026-09-26). GDA doesn't track the 15% cap; the
+  separate egress column lets users judge large downloads themselves.
 
 ### Where the estimate comes from
 
@@ -809,8 +805,9 @@ total monthly AWS bill.
     for negotiated rates or Ceph (where most items are zero), and can be
     refreshed from the AWS Price List API.
   - Each estimate states the date of the prices it used.
-- **The network path is configured per destination:** internet, Direct
-  Connect, or same-region AWS.
+- **The network path defaults to internet egress** (decided 2026-09-26). A
+  destination can override it with Direct Connect or same-region AWS, and
+  the matching rates in the price table.
 
 ### Command line
 
@@ -1068,6 +1065,10 @@ Decided on 2026-09-26:
 | Destinations | Chosen per lab: AWS Deep Archive, Ceph, or both |
 | Network for the initial upload | 40 to 100 Gbit/s to AWS |
 | Compression | zstd level 3 in independent frames, skipping incompressible data (proposed 2026-09-26 after review) |
+| Cost estimates | Shown before every restore or copy out, in the CLI and the Motuz copy dialog, from one estimator in GDA |
+| Egress path | Internet egress by default; destinations can override |
+| Egress waiver | Configured per destination; both totals shown; no 15% cap check |
+| Prices | Bundled price table, overridable per destination, refreshable from the AWS Price List API |
 
 ### First step: upstream S3 fixes
 
@@ -1095,6 +1096,3 @@ In order, smallest and most clearly a bug first:
 1. **Deduplication across labs:** deduplicate only within each lab's bucket
    (the default here), or across all buckets, accepting that one lab's
    restores can depend on another lab's bucket?
-2. **Egress cap check:** is an estimate from a configured monthly spend
-   enough, or should GDA read the month's actual egress from AWS Cost
-   Explorer (needs billing permissions)?
