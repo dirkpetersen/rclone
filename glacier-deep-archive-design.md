@@ -741,6 +741,116 @@ Archive, an on-premises Ceph RGW bucket, or both (decided 2026-09-26).
 Without the GDA tool: download the index, restore the named packs with the
 AWS CLI, then `tar xf`.
 
+## Cost estimates before restoring or copying out
+
+Before any restore or copy out of Deep Archive, the user sees what it will
+cost and how long it will take, and chooses the retrieval speed. This works
+the same way in the command line and in the Motuz copy dialog, because both
+use the same estimate from GDA.
+
+### What a copy out of Deep Archive costs
+
+| Component | What it depends on | Example rate (us-east-1 list price, check current pricing) |
+|---|---|---|
+| **Retrieval**, per GB restored | Retrieval speed; whole packs are restored even if only one file is wanted | Standard, within 12 hours: $0.02 per GB. Bulk, within 48 hours: $0.0025 per GB |
+| **Restore requests**, per object | Number of packs and standalone objects | Standard: $0.10 per 1,000. Bulk: $0.025 per 1,000 |
+| **Temporary copy** | Restored copies are billed at the S3 Standard rate for the restore lifetime | $0.023 per GB-month, so about $0.0023 per GB for 3 days |
+| **Download requests** | GET and ranged GET requests | $0.0004 per 1,000, usually negligible |
+| **Egress** | Bytes downloaded (compressed size) and the network path | Internet: $0.09 per GB for the first 10 TB a month, then lower tiers. Same-region AWS: free. Direct Connect: much lower |
+
+Points the estimate has to get right:
+
+- **"Immediately" doesn't exist for Deep Archive.** The fastest option is
+  Standard, within 12 hours. Files are available immediately only if they
+  are already restored, and then there is no retrieval charge. The dialog
+  says this plainly and shows which selected files are already restored.
+- **Restore bytes and download bytes differ.** A restore covers whole packs,
+  but the download can be only the ranges of the selected files. The
+  estimate uses `stored_offset` and `stored_length` from the indexes for
+  egress, and whole-pack sizes for retrieval.
+- **Compression lowers both.** Retrieval and egress are charged on stored
+  (compressed) bytes.
+- **Deduplicated files** may need packs from other directories; the planner
+  follows `location` and counts those packs.
+- **Egress is shown separately**, because it depends on the destination and
+  may be waived (below).
+- **Moving out, not copying,** would delete archived objects. Deleting objects
+  younger than 180 days adds an early-deletion charge, which the estimate
+  shows. With "keep forever", GDA doesn't offer moves out by default.
+
+### Egress waivers
+
+Many research and academic institutions have an AWS **data egress waiver**:
+egress is not charged as long as it stays within 15% of the organization's
+total monthly AWS bill.
+
+- **Per-destination configuration:** `egress_waiver = true`, and optionally
+  the organization's typical monthly AWS spend, so the estimate can warn when
+  a large download would exceed the 15% cap.
+- **The dialog shows both totals:** with egress, and with egress waived. With
+  a waiver configured, the waived total is the headline. A warning appears
+  when this download alone would exceed the waiver cap.
+- **GDA can't know the month's egress so far** without billing access, so
+  the cap check is an estimate. Optional access to AWS Cost Explorer can make
+  it exact; open question 2.
+
+### Where the estimate comes from
+
+- **One estimator in GDA,** used by both the CLI and Motuz. It takes the
+  selected paths and returns every option as JSON: for each retrieval speed,
+  the time, bytes, object counts, each cost component, and the totals with and
+  without egress.
+- **Everything is computed from the hot indexes** and one listing of restore
+  status. Estimating costs nothing and needs no restore.
+- **Prices come from a price table,** not from constants in the code.
+  - The table covers region, storage class, retrieval speed, request rates,
+    temporary storage and egress tiers.
+  - It ships with defaults, can be overridden per destination, for example
+    for negotiated rates or Ceph (where most items are zero), and can be
+    refreshed from the AWS Price List API.
+  - Each estimate states the date of the prices it used.
+- **The network path is configured per destination:** internet, Direct
+  Connect, or same-region AWS.
+
+### Command line
+
+```text
+$ rclone gda restore --estimate s3:lab-bucket/proj/results /fh/fast/lab/restore
+Restore 2,340 files (1.20 TiB stored in 5 packs, 1 standalone object)
+Prices: us-west-2, 2026-09-26. Egress path: internet. Egress waiver: yes
+
+Option    Ready in   Retrieval  Requests  Temp copy (3 d)  Egress    Total     Total, egress waived
+Bulk      48 hours   $3.07      $0.00     $2.83            $110.59   $116.49   $5.90
+Standard  12 hours   $24.58     $0.00     $2.83            $110.59   $137.99   $27.40
+
+Already restored: 0 files. Egress assumes all 1.20 TiB is downloaded.
+```
+
+- `rclone gda restore --tier bulk` shows the same table for the chosen speed
+  and asks for confirmation. `--yes` skips the prompt for scripts, and
+  `--max-cost 50` refuses to start if the estimate exceeds a limit.
+- `--json` prints the estimate in the same format Motuz uses.
+
+### Motuz copy dialog
+
+When the source of a copy job is a GDA destination, the dialog that confirms
+the job shows the table above:
+
+- one row per retrieval speed (Bulk and Standard for Deep Archive), with the
+  time until the data is ready, and the cost of each component;
+- egress as its own column, and the total with and without egress, with the
+  waived total first when the connection has a waiver;
+- how many selected files are already restored and so cost nothing to
+  retrieve;
+- a radio button for the retrieval speed, and "Start" disabled until one is
+  chosen.
+
+Starting the job then runs in two steps, which Motuz already supports as
+Celery jobs: a restore job, which polls restore status until everything
+selected is available, followed by the copy job. The job list shows the
+estimate next to the job, so users can compare it with what actually
+happened.
+
 ## Browsing from Motuz and other front ends
 
 Browsing a GDA destination as raw objects shows packs, changesets and index
@@ -985,3 +1095,6 @@ In order, smallest and most clearly a bug first:
 1. **Deduplication across labs:** deduplicate only within each lab's bucket
    (the default here), or across all buckets, accepting that one lab's
    restores can depend on another lab's bucket?
+2. **Egress cap check:** is an estimate from a configured monthly spend
+   enough, or should GDA read the month's actual egress from AWS Cost
+   Explorer (needs billing permissions)?
