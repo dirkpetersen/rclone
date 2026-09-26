@@ -54,6 +54,65 @@ These come from the analysis and drive every decision below.
 5. **Decide from metadata, never from Deep Archive.** Change detection,
    browsing and restore planning read only the hot manifests.
 
+## What research file systems look like
+
+The defaults below come from real research-computing data rather than
+guesses. The best data available is the census of the OSU CGRB NFS filers
+(September 2026, in `oregonstate-ai/cgrb-drpro-linux/docs/rclone-plan.md`
+section 10.3.1):
+
+| Statistic | Value |
+|---|---|
+| Total | 3.2 PiB in 3.69 billion files |
+| Mean file size | about 933 KB |
+| **Median file size** | **610 B** (per filer: 400 B, 755 B, 819 B) |
+| Files of 64 KiB or less | **96% of files, 0.31% of bytes** (about 10.2 TiB) |
+| Files over 4 GiB | 114,914 files, **54% of bytes** (about 1.73 PiB) |
+
+What this means for the design:
+
+1. **The mean is misleading.** It is about 1,500 times the median and sits
+   where almost no files are. Every default here is based on the
+   distribution.
+2. **The number of directories, not the number of bytes, sets the cost.**
+   With a median of 610 B, the small files in a typical directory add up to
+   kilobytes. Most packs will therefore be far below `pack-size`, and each
+   still costs one PUT plus 40 KB of overhead, which is more than its
+   content. How many directories contain small files is the most important
+   number the census doesn't have yet (see [Profiling a file
+   system](#profiling-a-file-system)).
+3. **The bytes sit in a few huge files.** Files over 4 GiB hold more than
+   half the data in about 115,000 objects. For them, the number of multipart
+   parts matters more than packing: GDA uploads standalone files with large
+   parts (at least 512 MiB) instead of rclone's 5 MiB default (analysis,
+   gap 4).
+4. **Tiny directory trees need rolling up.** When a whole subtree holds only
+   a few KB, one pack per directory level still costs one request per
+   directory. See [Rolling up small subtrees](#rolling-up-small-subtrees).
+
+The drpro cloud tier targets about 10% of this estate: roughly 320 TiB in
+369 million files. Pack requests for that subset, depending on how many
+small files a directory holds on average:
+
+| Small files per directory | Directories | Pack PUTs (Deep Archive) | Changeset and index PUTs (Standard) |
+|---|---|---|---|
+| 20 | 18.5 million | $923 | $185 |
+| 100 | 3.7 million | $185 | $37 |
+| 1,000 | 369,000 | $18 | $4 |
+| For comparison: one PUT per file | | **$18,450** | |
+
+### Defaults
+
+| Setting | Default | Reason |
+|---|---|---|
+| `standalone-min` | 64 MiB | Above it, a file's own PUT and overhead are at most about 2% of its 3-year storage cost, so packing gains little |
+| `pack-size` | 256 MiB | Rarely reached at these file sizes. It bounds temp space and the restore unit for directories with many mid-size files |
+| `rollup-max` | 16 MiB | Twice the 8 MB break-even where one PUT costs as much as 180 days of storage |
+| Standalone part size | at least 512 MiB | Cuts a 100 GiB upload from about 9,300 requests to about 200 |
+
+All four are configurable. They should be revisited once a profile of the
+target file system exists.
+
 ## Overview
 
 For each source directory, one run produces up to four kinds of object:
@@ -125,6 +184,28 @@ S3 tool.
   would save at most one PUT (about 2% of its 3-year storage cost) and would
   lose the native name and direct restore.
 - **Packed files:** everything smaller goes into packs.
+
+### Rolling up small subtrees
+
+A directory whose **entire subtree** holds less than `rollup-max` (default
+16 MiB) and no standalone files is packed as **one unit**, subdirectories
+included. The pack sits at the highest such directory, the rollup root, and
+its member names keep their relative paths (`sub/dir/file.txt`).
+
+- **Why this doesn't break the one-level rule's purpose:** that rule exists to
+  keep restore units small. A rolled-up subtree is small by definition, so
+  restoring it is as cheap as restoring one directory.
+- **What it saves:** a tree of 10,000 directories with a few KB each costs
+  10,000 PUTs and 20,000 metadata PUTs without rolling up, but one PUT and
+  two metadata PUTs with it.
+- **Browsing:** subdirectories inside a rollup have no `gda-index.csv` of
+  their own. Their row in the parent index says `rollup` in the `listing`
+  column, and a browser reads the rollup root's index filtered by path
+  prefix.
+- **Backups:** a change anywhere in the subtree adds a delta pack at the
+  rollup root. If the subtree grows past `rollup-max`, later runs treat its
+  directories individually. Existing packs are left alone, and the indexes
+  show where each file lives.
 
 ### Pack size
 
@@ -243,6 +324,8 @@ manifests.
 | `offset` | `1536` | Data offset inside the pack; empty for standalone files |
 | `version_id` | | S3 version ID for standalone files in a versioned bucket |
 | `run` | `20260926T120000Z` | Run that wrote this version |
+| `tree_size`, `tree_files` | `52428800`, `913` | Directory rows only: total bytes and files in the whole subtree, so a browser can show folder sizes without walking |
+| `listing` | `index` | Directory rows only: `index` (has its own `gda-index.csv`) or `rollup` (listed in this index by path prefix) |
 | `action` | `add` | Changesets only: `add`, `modify`, `meta`, `delete` |
 
 Encoding: RFC 4180 CSV, UTF-8, header row, fields quoted when needed. This
@@ -435,6 +518,127 @@ At the end of the run, write the run ledger.
 Without the GDA tool: download the index, restore the named packs with the
 AWS CLI, then `tar xf`.
 
+## Browsing from Motuz and other front ends
+
+Browsing a GDA destination as raw objects shows packs, changesets and index
+files instead of the user's files. Front ends should show the **logical file
+system** described by the indexes instead.
+
+### Recommended: a read-only `gda` backend in rclone
+
+A read-only rclone backend that wraps the S3 remote, similar to the existing
+`:archive:` backend. `List(dir)` reads that directory's `gda-index.csv`
+instead of listing objects.
+
+- **Motuz needs no change to browse.** It already runs `rclone lsjson` for
+  cloud connections (`motuz/src/backend/api/utils/rclone_connection.py:76`).
+  Pointing it at `:gda,remote="s3:bucket/lab":results`, or offering "GDA
+  archive" as a connection type, returns the real files.
+- **Every other rclone tool gets the same view:** `lsf`, `ncdu`, `mount`,
+  `serve http` and `serve webdav`.
+- **`lsjson` fields come from the index:**
+  - `Name`, `Size`, `IsDir`;
+  - `ModTime` from the file's own mtime, not the upload time;
+  - `Hashes` with the MD5;
+  - `Tier` of `DEEP_ARCHIVE`;
+  - with `--metadata`: owner, group, mode, the pack name, and the restore
+    state described below.
+- **Opening a file:** if its pack or object has been restored, the backend
+  reads just that file with a ranged GET at the recorded offset. Otherwise it
+  returns "restore first", as the S3 backend already does.
+- **Restore state:** one LIST of the directory's objects, with restore status
+  included (as `restore-status` does today), gives each pack's state:
+  archived, restoring, or restored until a given date.
+
+### Cost and speed of a directory click
+
+| | Raw S3 listing today | GDA view |
+|---|---|---|
+| Requests for a directory of 10,000 files | 10 LISTs plus 10,000 HEADs | 1 GET of the index (plus 1 LIST for restore state) |
+| Latency | Seconds to minutes | One round trip |
+| Modification time shown | Needs a HEAD per object for the real mtime | From the index, no extra requests |
+| What the user sees | Packs and CSV files | The original files and folders |
+
+Side finding: Motuz runs `rclone lsjson` without `--no-modtime`, so every
+S3 listing already does a HEAD per object to read the modification time,
+which Motuz then discards. That makes large-directory listings slow today,
+independently of GDA.
+
+### What Motuz should display
+
+- **A Modified column with relative ages:** "just now", "12 minutes ago",
+  "3 hours ago", "3 days ago", "50 days ago", "7 months ago", "2 years ago",
+  with the exact timestamp as a tooltip. Suggested cut-offs: minutes under an
+  hour, hours under 48 hours, days under 60 days, months under 2 years, then
+  years. Sort by the real timestamp. The browser's built-in
+  `Intl.RelativeTimeFormat` does this with no extra library.
+- **Folder sizes and file counts** from `tree_size` and `tree_files`, without
+  walking the tree.
+- **An archive state badge:** Archived, Restoring (with the restore tier and
+  expected time), or Available until a given date.
+- **Optionally, "safe to delete after"** (archive date plus 180 days) for
+  administrators, to avoid early-deletion charges.
+- **A "Show archive internals" toggle**, like the existing hidden-files
+  toggle, to see packs and CSVs when needed.
+- **A Restore action:** select files or folders, show the estimated cost and
+  time for a Bulk restore, submit a restore job, and offer a copy job once
+  the data is available. Motuz already runs long jobs through Celery.
+
+The Motuz changes for the Modified column:
+
+- `src/frontend/js/managers/fileManager.jsx:13`: `convertRcloneFilesToMotuz`
+  keeps only name, type and size; it also needs `ModTime` and, for GDA,
+  `Tier` and `Metadata`.
+- `src/frontend/js/views/App/Pane/PaneFile.jsx`: render the new column.
+- `src/backend/api/utils/local_connection.py`: parses `ls -l` output without
+  timestamps, so local listings need a machine-readable time format as well.
+
+### Alternatives
+
+- **Motuz reads `gda-index.csv` itself**, using `rclone cat` and parsing the
+  CSV in Python. Quick to build, but only Motuz benefits, and the logic for
+  rollups and restore state would have to be duplicated.
+- **A `rclone gda ls` command** instead of a backend. Simpler than a
+  backend, but mount, serve and ncdu wouldn't get the view.
+
+The CSV indexes stay browsable directly in any S3 tool regardless.
+
+## Profiling a file system
+
+Before choosing defaults for a site, measure it. The
+[file-system-analysis](https://github.com/dirkpetersen/file-system-analysis)
+workflow (pwalk to CSV to Parquet, then DuckDB) already collects what is
+needed. This query estimates packs, standalone files and rollup candidates
+per directory. Column names are as produced by that workflow's
+`csv2parquet.sh`, where files have `pw_fcount = -1`; check them against your
+Parquet file.
+
+```sql
+WITH per_dir AS (
+  SELECT st_dev, "parent-inode" AS dir,
+         count(*) FILTER (WHERE st_size <  67108864) AS small_files,
+         coalesce(sum(st_size) FILTER (WHERE st_size < 67108864), 0) AS small_bytes,
+         count(*) FILTER (WHERE st_size >= 67108864) AS standalone_files
+  FROM read_parquet('fs.parquet')
+  WHERE pw_fcount = -1
+  GROUP BY ALL
+)
+SELECT
+  count(*) FILTER (WHERE small_files > 0)                         AS dirs_with_small_files,
+  sum(CASE WHEN small_files > 0
+           THEN greatest(1, ceil(small_bytes / 268435456.0)) END)  AS packs_at_256MiB,
+  sum(standalone_files)                                            AS standalone_objects,
+  sum(small_files)                                                 AS packed_files,
+  quantile_cont(small_bytes, [0.5, 0.9, 0.99])
+    FILTER (WHERE small_files > 0)                                 AS small_bytes_per_dir_p50_p90_p99,
+  count(*) FILTER (WHERE small_files > 0 AND small_bytes < 16777216) AS dirs_under_rollup_max
+FROM per_dir;
+```
+
+This counts packs before rolling up; `dirs_under_rollup_max` shows how many
+directories are candidates. An exact rollup count needs subtree totals,
+which the GDA planner computes during its own walk.
+
 ## Worked cost example
 
 A tree of 10 TB and 10 million files in 100,000 directories: 9.9 million
@@ -455,7 +659,7 @@ prices are the us-east-1 list prices from the analysis.
 | Option | Pros | Cons |
 |---|---|---|
 | **A. New rclone command group in this fork** (`rclone gda backup/restore/find/index/gc`), recommended | Reuses rclone's walk, filters, accounting and S3 backend (Content-MD5, storage class, `restore`); one static binary; parts can go upstream | Needs to stay a clean addition to rebase easily on upstream |
-| B. rclone backend that packs transparently (like `compress` or `chunker`) | Invisible to users | Backends work per object; packing needs a directory-level view and deferred writes; `sync` semantics break. Not recommended |
+| B. rclone backend that packs transparently on write (like `compress` or `chunker`) | Invisible to users | Backends work per object; packing needs a directory-level view and deferred writes; `sync` semantics break. Not recommended for writing. A **read-only** backend for browsing is recommended; see [Browsing](#browsing-from-motuz-and-other-front-ends) |
 | C. Inside Froster (now Go) using rclone as a library | Keeps Froster's workflow: hotspots, Slurm, NIH metadata, `Where-did-the-files-go.txt` | Froster currently shells out to rclone; importing rclone packages is a bigger dependency change |
 
 Option A, with Froster later calling `rclone gda` in place of its tar and CSV
@@ -487,15 +691,17 @@ Pieces that could go upstream independently, all from the analysis:
 
 ## Open questions
 
-1. **Defaults:** `pack-size` 256 MiB and `standalone-min` 64 MiB. Are these
-   right for your data? A file-size histogram of a typical project would
-   settle it.
+1. **Defaults:** `pack-size` 256 MiB, `standalone-min` 64 MiB and
+   `rollup-max` 16 MiB are based on the CGRB census. Is that census the right
+   reference, or should a different cluster's data be used? Running the
+   profiling query on the target file system would settle it, above all the
+   number of directories that contain small files.
 2. **Hash:** MD5 only, or MD5 plus SHA-256?
 3. **Tar or zip for packs?** Tar keeps POSIX metadata and matches Froster;
    zip is browsable with rclone's `:archive:` backend after restore.
-4. **Should very small leaf trees be rolled up?** For example, one pack for
-   a subtree under 64 MiB in total. This breaks the one-level rule but cuts
-   objects for trees with many tiny directories.
+4. **Rolling up small subtrees** is now in the design, on by default at
+   16 MiB. Should it be on by default, or opt-in to keep the strict
+   one-level rule?
 5. **Archive mode:** should GDA delete source files after a verified archive
    and leave a `Where-did-the-files-go.txt`, as Froster does, or leave that to
    Froster?
@@ -503,3 +709,5 @@ Pieces that could go upstream independently, all from the analysis:
    must versioned key names work too?
 7. **Owner and group:** store names, numeric IDs, or both? This matters for
    restores onto other systems.
+8. **Motuz:** add a "GDA archive" connection type that uses the read-only
+   backend, or detect `gda-index.csv` automatically on any S3 connection?
