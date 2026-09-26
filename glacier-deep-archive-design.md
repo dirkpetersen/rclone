@@ -252,7 +252,7 @@ PUT for a pack as a share of that pack's storage cost:
 - **Zip is the main alternative.** It has per-member random access built in,
   and rclone's `:archive:` backend can browse zip files after restore. Tar
   plus recorded offsets gives the same random access with better POSIX
-  metadata, and matches Froster. Open question 3 asks which to use.
+  metadata, and matches Froster, so tar was chosen (see [Decisions](#decisions)).
 
 ### Naming
 
@@ -318,7 +318,7 @@ manifests.
 | `mtime` | `2026-09-20T14:03:11.123456789Z` | UTC, RFC 3339, nanoseconds |
 | `mode` | `0644` | Octal permission bits |
 | `owner`, `group` | `jdoe`, `lab` | Names, with numeric uid and gid in `uid`, `gid` |
-| `md5` | `9e107d9d...` | Hex; matches S3 and rclone. An optional `sha256` column can be added |
+| `md5` | `9e107d9d...` | Hex; matches S3 Content-MD5 and rclone's S3 hash |
 | `link_target` | | Symlinks only |
 | `location` | `results.gda.20260926T120000Z.002.tar` | Pack name, or the object key for a standalone file |
 | `offset` | `1536` | Data offset inside the pack; empty for standalone files |
@@ -418,16 +418,23 @@ ledger, and add staging only if the ledger shows it is needed.
 
 ### Large standalone files that change
 
-Options, recommended first:
+GDA supports both of these and picks one per destination by checking the
+bucket's versioning status at the start of each run:
 
-1. **S3 bucket versioning plus a lifecycle rule.** The new version is
-   uploaded under the same key, and the old one becomes a noncurrent version.
-   Nothing is deleted, so there's no early-deletion charge. A lifecycle rule
-   "expire noncurrent versions after N days", with N at least 180, bounds the
+1. **Versioned bucket, the preferred setup.** The new version is uploaded
+   under the same key, and the old one becomes a noncurrent version. Nothing
+   is deleted, so there's no early-deletion charge. A lifecycle rule "expire
+   noncurrent versions after N days", with N at least 180, bounds the
    history. The index records the `version_id` so point-in-time restores can
    ask for the exact version.
-2. Versioned key names such as `model.bin.gda.<run>`. This works without
-   bucket versioning, but only the first version keeps its native name.
+2. **Unversioned bucket.** The first version keeps its native name, and later
+   versions are uploaded as `<name>.gda.<run>`, for example
+   `model.bin.gda.20261015T120000Z`. The index's `location` column points at
+   the current one. The `.gda.` infix is already reserved, so these can't
+   collide with source files.
+
+If versioning is switched on or off later, existing objects stay where they
+are, because the index records each version's location either way.
 
 ### Deletions and history
 
@@ -530,10 +537,17 @@ A read-only rclone backend that wraps the S3 remote, similar to the existing
 `:archive:` backend. `List(dir)` reads that directory's `gda-index.csv`
 instead of listing objects.
 
-- **Motuz needs no change to browse.** It already runs `rclone lsjson` for
-  cloud connections (`motuz/src/backend/api/utils/rclone_connection.py:76`).
-  Pointing it at `:gda,remote="s3:bucket/lab":results`, or offering "GDA
-  archive" as a connection type, returns the real files.
+- **Motuz detects GDA folders automatically.** It already runs
+  `rclone lsjson` for cloud connections
+  (`motuz/src/backend/api/utils/rclone_connection.py:76`). It wraps every S3
+  connection in the backend, for example `:gda,remote="s3:bucket":lab/results`.
+  - In a folder that has a `gda-index.csv`, the backend lists the logical
+    files from it.
+  - Anywhere else, it passes the listing through to plain S3, as the
+    `:archive:` backend does for paths outside an archive.
+  - This costs one extra small GET per folder click on non-GDA folders,
+    about $0.0004 per 1,000 clicks. Users need no special connection type,
+    and the "Show archive internals" toggle shows the raw objects.
 - **Every other rclone tool gets the same view:** `lsf`, `ncdu`, `mount`,
   `serve http` and `serve webdav`.
 - **`lsjson` fields come from the index:**
@@ -689,25 +703,41 @@ Pieces that could go upstream independently, all from the analysis:
   change forces a huge rewrite or a large delta, and restoring one directory
   means restoring the whole tree.
 
-## Open questions
+## Decisions
 
-1. **Defaults:** `pack-size` 256 MiB, `standalone-min` 64 MiB and
-   `rollup-max` 16 MiB are based on the CGRB census. Is that census the right
-   reference, or should a different cluster's data be used? Running the
-   profiling query on the target file system would settle it, above all the
-   number of directories that contain small files.
-2. **Hash:** MD5 only, or MD5 plus SHA-256?
-3. **Tar or zip for packs?** Tar keeps POSIX metadata and matches Froster;
-   zip is browsable with rclone's `:archive:` backend after restore.
-4. **Rolling up small subtrees** is now in the design, on by default at
-   16 MiB. Should it be on by default, or opt-in to keep the strict
-   one-level rule?
-5. **Archive mode:** should GDA delete source files after a verified archive
-   and leave a `Where-did-the-files-go.txt`, as Froster does, or leave that to
-   Froster?
-6. **Bucket versioning:** can we require it (for standalone file history), or
-   must versioned key names work too?
-7. **Owner and group:** store names, numeric IDs, or both? This matters for
-   restores onto other systems.
-8. **Motuz:** add a "GDA archive" connection type that uses the read-only
-   backend, or detect `gda-index.csv` automatically on any S3 connection?
+Decided on 2026-09-26:
+
+| Topic | Decision |
+|---|---|
+| Reference data for defaults | The CGRB NFS census. Defaults: `standalone-min` 64 MiB, `pack-size` 256 MiB, `rollup-max` 16 MiB, refined later with the profiling query |
+| Pack format | Uncompressed POSIX tar (PAX), with member byte offsets in the manifests |
+| Rolling up small subtrees | On by default at 16 MiB |
+| Deleting source files after archiving | Not done by GDA. Froster keeps its archive-and-delete workflow and `Where-did-the-files-go.txt` |
+| Checksums | MD5 only |
+| History of large standalone files | Both methods: bucket versioning when enabled, otherwise `<name>.gda.<run>` key names |
+| Owner and group | Stored as names and numeric IDs (`owner`, `group`, `uid`, `gid`) |
+| Motuz | Detects `gda-index.csv` automatically on S3 connections, through the read-only `gda` backend |
+| Retention | Keep superseded and deleted versions forever by default. Garbage collection runs only when invoked, with a dry-run cost report |
+| Encryption | SSE-S3 (bucket default encryption) |
+| Where the code lives | In the fork first. Propose `rclone gda` and the `gda` backend upstream once the format is proven; send generic S3 fixes upstream right away |
+| First step | The upstream S3 fixes from the analysis, each on its own branch from `master` |
+
+### First step: upstream S3 fixes
+
+In order, smallest and most clearly a bug first:
+
+1. **`--s3-versions` listings drop the storage class**
+   (`backend/s3/setfrom.go:71`), so `backend restore` skips archived objects.
+2. **The restore error says GLACIER for DEEP_ARCHIVE objects**
+   (`backend/s3/s3.go:4529`); report the real storage class.
+3. **`SetModTime` applies the configured `storage_class`** to the object it
+   copies onto itself, so a STANDARD object can move to DEEP_ARCHIVE
+   (`s3.go:3074`); keep the object's own class.
+4. **`settier` on objects over `copy_cutoff` may lose Content-Type**
+   (`s3.go:3138`); confirm with a test first.
+5. **Intelligent-Tiering archive access tiers aren't covered** by the
+   `SetModTime` guard (`s3.go:4341`). This needs the object's archive status
+   from HEAD, since the storage class alone is `INTELLIGENT_TIERING`.
+6. **A guard against overwriting or deleting archived objects**, modelled on
+   azureblob's `archive_tier_delete`. This is a new feature, so discuss it
+   upstream in an issue first.
