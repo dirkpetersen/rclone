@@ -17,6 +17,11 @@ format supports repeated backup runs as well as one-shot archiving.
 
 Working name for the tool and format: **GDA**.
 
+**Target scale:** many petabytes and about 10 billion files, written by many
+parallel workers (10 to 15 per host, on several hosts). Every part of the
+design has to work at that scale from the start; see
+[Scale and parallel workers](#scale-and-parallel-workers).
+
 ## Goals
 
 - **Lowest total cost** for data that is written once and rarely read:
@@ -30,8 +35,11 @@ Working name for the tool and format: **GDA**.
   a few bounded-size objects.
 - **Incremental backup.** Repeated runs upload only what changed and never
   overwrite or delete objects that are already in Deep Archive.
+- **Scale.** Many petabytes, about 10 billion files, many parallel workers.
+- **Store identical large files once** (file-level deduplication, see
+  [Deduplication](#deduplication)).
 
-Non-goals: block-level deduplication across files (use restic, Kopia or Borg
+Non-goals: block-level deduplication inside files (use restic, Kopia or Borg
 for that; see [Alternatives considered](#alternatives-considered)), and
 workloads that need restores in less than 12 hours.
 
@@ -119,7 +127,7 @@ For each source directory, one run produces up to four kinds of object:
 
 | Object | Content | Storage class | Mutable? |
 |---|---|---|---|
-| **Pack** `<dir>.gda.<run>.<part>.tar` | Small files from this directory only, at most `pack-size` | DEEP_ARCHIVE | No, never rewritten |
+| **Pack** `<dir>.gda.<run>.<worker>.<part>.tar[.zst]` | Small files from this directory only, at most `pack-size` | DEEP_ARCHIVE | No, never rewritten |
 | **Standalone file** `<original name>` | One large file, stored under its own name | DEEP_ARCHIVE | Only via bucket versioning (see below) |
 | **Changeset** `<dir>.gda.<run>.csv` | What this run changed in this directory: added, modified and deleted entries, and where each lives | STANDARD | No, immutable |
 | **Index** `gda-index.csv` | Current state of the directory: every live entry and where it lives | STANDARD | Yes, regenerated each run that changes the directory |
@@ -128,7 +136,7 @@ Plus, once per run and once globally:
 
 | Object | Content | Storage class |
 |---|---|---|
-| **Run ledger** `_gda/runs/<run>.json` | Run parameters, directories touched, counts, bytes, estimated cost | STANDARD |
+| **Run ledger** `_gda/runs/<run>/<worker>.json` | Run parameters, directories touched, counts, bytes, estimated cost | STANDARD |
 | **Catalog** `_gda/catalog/*.parquet` (optional) | Every index of the tree combined, for search | STANDARD |
 
 ### Example layout
@@ -151,13 +159,13 @@ Bucket after the first run `20260926T120000Z` with `pack-size=256MiB` and
 
 ```text
 s3://bucket/lab/
-├── lab.gda.20260926T120000Z.001.tar         DEEP_ARCHIVE  (README.txt)
+├── lab.gda.20260926T120000Z.w01.001.tar.zst     DEEP_ARCHIVE  (README.txt, compressed)
 ├── lab.gda.20260926T120000Z.csv             STANDARD
 ├── gda-index.csv                            STANDARD
 ├── results/
-│   ├── results.gda.20260926T120000Z.001.tar DEEP_ARCHIVE  (summary.csv, plot-001..plot-436)
-│   ├── results.gda.20260926T120000Z.002.tar DEEP_ARCHIVE  (plot-437..plot-873)
-│   ├── results.gda.20260926T120000Z.003.tar DEEP_ARCHIVE  (plot-874..plot-900)
+│   ├── results.gda.20260926T120000Z.w01.001.tar DEEP_ARCHIVE  (summary.csv, plot-001..plot-436)
+│   ├── results.gda.20260926T120000Z.w01.002.tar DEEP_ARCHIVE  (plot-437..plot-873)
+│   ├── results.gda.20260926T120000Z.w01.003.tar DEEP_ARCHIVE  (plot-874..plot-900)
 │   ├── model.bin                            DEEP_ARCHIVE  (standalone)
 │   ├── results.gda.20260926T120000Z.csv     STANDARD
 │   └── gda-index.csv                        STANDARD
@@ -166,7 +174,7 @@ s3://bucket/lab/
 │   ├── raw.gda.20260926T120000Z.csv         STANDARD
 │   └── gda-index.csv                        STANDARD
 └── _gda/
-    └── runs/20260926T120000Z.json           STANDARD
+    └── runs/20260926T120000Z/w01.json       STANDARD
 ```
 
 The tree mirrors the source, so browsing the bucket feels like browsing the
@@ -234,21 +242,19 @@ PUT for a pack as a share of that pack's storage cost:
 
 ### Pack format
 
-- **Plain POSIX tar (PAX), uncompressed.** Every Linux system can read it,
-  and it keeps nanosecond mtimes, long names, owner, group, mode, symlinks and
-  optionally xattrs. Member names are just the file names, as in Froster.
-- **No compression by default.** Storage is about $1 per TB-month, research
-  data is often already compressed (`.gz`, `.bam`, images), and compression
-  would break the byte offsets described below. Compression can be an option
-  later.
+- **Plain POSIX tar (PAX).** Every Linux system can read it, and it keeps
+  nanosecond mtimes, long names, owner, group, mode, symlinks and optionally
+  xattrs. Member names are just the file names, as in Froster.
+- **Compressed with zstd where it helps** (see [Compression](#compression)).
+  A compressed pack is a normal `.tar.zst` file.
 - **The last member is the pack's own manifest** (`<pack>.csv`). Each pack is
   therefore self-describing even if every hot manifest is lost.
-- **Byte offsets in the manifest.** The manifest records each member's data
-  offset inside the tar. After a restore, a single file can be fetched with a
-  ranged GET (`aws s3api get-object --range bytes=a-b` or
-  `rclone cat --offset --count`) instead of downloading the whole pack. The
-  restore still covers the whole pack, but download and egress cover only the
-  file.
+- **Byte offsets in the manifest.** The manifest records where each member's
+  bytes are stored in the pack. After a restore, a single file can be fetched
+  with a ranged GET (`aws s3api get-object --range bytes=a-b` or
+  `rclone cat --offset --count`), then decompressed if needed, instead of
+  downloading the whole pack. The restore still covers the whole pack, but
+  download and egress cover only the file.
 - **Zip is the main alternative.** It has per-member random access built in,
   and rclone's `:archive:` backend can browse zip files after restore. Tar
   plus recorded offsets gives the same random access with better POSIX
@@ -256,14 +262,19 @@ PUT for a pack as a share of that pack's storage cost:
 
 ### Naming
 
-`<dirname>.gda.<run>.<part>.tar`, for example
-`results.gda.20260926T120000Z.002.tar`.
+`<dirname>.gda.<run>.<worker>.<part>.tar`, plus `.zst` when compressed, for
+example `results.gda.20260926T120000Z.w07.002.tar.zst`.
 
 - **`dirname` in the name** makes a downloaded pack recognisable on its own,
   as in the `foldername.1.tar` idea.
 - **`run` is the UTC start time of the run.** Names are never reused, so
   nothing is ever overwritten; no counter has to be read and updated; and the
   name shows the pack's age, which matters for the 180-day rule.
+- **`worker` is the worker ID**, so parallel workers can never pick the same
+  name, even for a directory that is handed from one worker to another after
+  a crash.
+- **Compressed standalone files** are stored as `<name>.gda.zst`, for example
+  `run1.fastq.gda.zst`.
 - **`.gda.` is a reserved infix.** A source file whose name already matches
   `*.gda.*.tar` or `*.gda.*.csv`, or is `gda-index.csv`, is reported as a
   conflict rather than silently shadowed.
@@ -320,8 +331,12 @@ manifests.
 | `owner`, `group` | `jdoe`, `lab` | Names, with numeric uid and gid in `uid`, `gid` |
 | `md5` | `9e107d9d...` | Hex; matches S3 Content-MD5 and rclone's S3 hash |
 | `link_target` | | Symlinks only |
-| `location` | `results.gda.20260926T120000Z.002.tar` | Pack name, or the object key for a standalone file |
-| `offset` | `1536` | Data offset inside the pack; empty for standalone files |
+| `location` | `results.gda.20260926T120000Z.w01.002.tar` | Pack name, or the object key for a standalone file |
+| `offset` | `1536` | Data offset inside the uncompressed tar; empty for standalone files |
+| `codec` | `zstd` | `none` or `zstd` |
+| `stored_offset`, `stored_length` | `1048576`, `2097152` | Byte range of the compressed frames holding this file, for a ranged GET |
+| `stored_size`, `stored_md5` | | Standalone objects only: size and MD5 of the bytes actually stored |
+| `dedup_of` | | Set when this file is stored once elsewhere: the `location` it points to is another directory's pack or object |
 | `version_id` | | S3 version ID for standalone files in a versioned bucket |
 | `run` | `20260926T120000Z` | Run that wrote this version |
 | `tree_size`, `tree_files` | `52428800`, `913` | Directory rows only: total bytes and files in the whole subtree, so a browser can show folder sizes without walking |
@@ -341,31 +356,62 @@ UTF-8 are percent-encoded, with a `name_encoding` column to mark them.
 | Parquet | No | Yes, columnar and compressed | Ideal for tree-wide search |
 | SQLite | No | Yes | Single file, must be downloaded; good as a local cache |
 
-- **CSV only has to scale per directory**, because each index covers one
-  directory. At about 200 bytes per row, a directory of 100,000 files has a
-  20 MB index. Only directories with more than a million files exceed
-  spreadsheet limits, and they remain fine for scripts and DuckDB.
-- **Tree-wide questions don't need a merged CSV.** DuckDB and Athena read many
-  CSVs in place with a glob, for example:
+- **Per-directory CSVs are the source of truth** (decided 2026-09-26). CSV
+  only has to scale per directory, because each index covers one directory.
+- **Big directories get a split index.** Parsing a million rows (about
+  200 MB) takes only a second or two, but downloading 200 MB on every Motuz
+  click, or rewriting it on every run that changes two files, doesn't work.
+  Above 100,000 rows (about 20 MB):
+  - the entries go into name-sorted parts `gda-index.00001.csv`,
+    `gda-index.00002.csv` and so on, each up to 100,000 rows;
+  - `gda-index.csv` becomes a short table of contents with each part's name,
+    first and last entry name, and row count;
+  - readers fetch only the part they need, and a run rewrites only the parts
+    that changed. A person still starts at `gda-index.csv`.
+- **Tree-wide questions use the Parquet catalog, not the CSVs.** Globbing a
+  few thousand CSVs with DuckDB works for one lab:
 
   ```sql
   SELECT * FROM read_csv('s3://bucket/lab/**/gda-index.csv', filename=true)
   WHERE name LIKE '%.bam' AND size > 1e9;
   ```
 
-- **The optional Parquet catalog** under `_gda/catalog/` is a periodic,
-  compressed copy of all indexes for fast search over very large trees. It is
-  rebuilt from the indexes and is never the source of truth.
+  At 10 billion files there are hundreds of millions of index files, and
+  just listing them takes hours. So every worker also writes the rows of its
+  changesets to one Parquet file per run, under
+  `_gda/catalog/runs/<run>/<worker>.parquet`. The catalog is the union of
+  those files, compacted periodically into files sorted by path. It is
+  derived and can always be rebuilt from the CSVs, but it never needs a scan
+  of them.
 - **Cost of keeping all metadata hot:** 10 million files make about 2 GB of
   indexes plus a similar amount of changesets, roughly $0.09 per month in S3
-  Standard.
+  Standard. At 10 billion files it is about 4 TB, roughly $90 per month.
 
 ## Incremental backup
 
 ### Change detection
 
-Each run lists the source and compares every entry against that directory's
-`gda-index.csv`, never against Deep Archive:
+Each run compares the source against that directory's `gda-index.csv`,
+never against Deep Archive. At 10 billion files a full scan of the sources
+takes days, so where the source file system can report its own changes, runs
+use that instead:
+
+| Source | How changes are found |
+|---|---|
+| ZFS | `zfs diff` between the snapshot of the last run and a new snapshot |
+| GPFS / Spectrum Scale | Policy engine (`mmapplypolicy`) list of files modified since the last run; it scans metadata at millions of files per second |
+| Lustre | Changelogs, consumed from the last recorded position |
+| NFS, Ceph FS and others | Parallel scan (pwalk style) across many workers |
+
+- **A full reconciliation scan still runs periodically** (for example
+  quarterly) on every source, to catch anything a change feed missed.
+- **Local index cache:** each worker keeps copies of the indexes it owns,
+  checked against their S3 ETags, so a run doesn't download millions of
+  indexes just to compare them.
+- **Back up from snapshots** wherever the file system has them. Otherwise a
+  run lasting hours captures different files at different moments.
+
+For each changed entry:
 
 | Source compared with index | Action |
 |---|---|
@@ -382,7 +428,7 @@ change on an unchanged file never re-uploads data.
 ### "Two small files changed in a directory with one big pack"
 
 The two files go into a **new small pack** for that run,
-`results.gda.<run2>.001.tar`. The index now points those two names at the new
+`results.gda.<run2>.w01.001.tar`. The index now points those two names at the new
 pack and every other name at the old pack. The old pack is never touched:
 
 - no rewrite, so no re-upload of 256 MiB and no early-deletion charge;
@@ -415,6 +461,33 @@ installations this is acceptable. Three levers if it isn't:
 
 The recommendation is to start without staging, record the costs in the run
 ledger, and add staging only if the ledger shows it is needed.
+
+### Running for many years
+
+Two things accumulate when backups run for a decade:
+
+- **Changesets.** Nightly runs leave thousands of changesets in a busy
+  directory, and rebuilding its index, or its state at a past run, means
+  replaying them all. Once a month, a run also saves a dated copy of each
+  changed index, `gda-index.<run>.csv`, as a checkpoint. Rebuilds and
+  point-in-time views replay only from the latest checkpoint before the
+  requested time.
+- **Fragmented packs.** A busy directory's live files end up spread over
+  hundreds of small delta packs that are mostly dead data. Restoring the
+  directory then means restoring hundreds of objects. When a directory's live
+  files are spread over more than about 20 packs, or more than half of their
+  bytes are dead, the next run **rebases** it: it writes a fresh full set of
+  packs from the source, which costs nothing to read, and points the index at
+  them. The old packs are kept, following the retention policy.
+
+With "keep forever", history grows with every change: a 1 TB directory that
+is rewritten weekly adds about 52 TB of old versions a year, about $620 a
+year. Scratch and temporary areas should be excluded, or given a retention
+limit.
+
+The CSV format will also change over the years. The run ledger records the
+format version, new columns are only ever added at the end, and readers
+ignore columns they don't know.
 
 ### Large standalone files that change
 
@@ -454,6 +527,76 @@ indexes and record a `location` that points into the existing pack instead of
 uploading again. This saves requests, but that directory's restore then needs
 packs stored under the old path. The manifest handles it; it just weakens
 the "one directory, one set of packs" property.
+
+## Deduplication
+
+Identical files of **at least 1 MiB** are stored once (decided 2026-09-26).
+
+- **Why 1 MiB:** files of 64 KiB or less hold 0.31% of the bytes in the CGRB
+  census, so deduplicating small files saves almost nothing. Limiting it to
+  files of 1 MiB or more keeps the hash index to an estimated few hundred
+  million entries (about 10 GB) instead of 10 billion (about 400 GB).
+- **The hash index** maps size plus MD5 to the `location` (and `offset`) of
+  the stored copy. It is split into shards by hash prefix,
+  `_gda/dedup/<prefix>.parquet`, and is derived from the catalog, so it can
+  always be rebuilt.
+- **Workers read a snapshot of the index** at the start of a run, and write
+  the hashes they store to their own per-run file, which the coordinator
+  merges at the end.
+- **Races are harmless.** If two workers store the same new file at the
+  same moment, it's simply stored twice. Deduplication saves space, and
+  nothing depends on it for correctness.
+- **A duplicate** gets an index row whose `location` points to the existing
+  copy, with `dedup_of` set. No data is uploaded.
+- **Restores follow the pointer.** Restoring a directory may therefore
+  restore packs that belong to other directories. The restore planner already
+  works from `location`, so this needs no special handling.
+- **Deleting data now needs reference checks.** Garbage collection and
+  rebasing may only remove a stored copy when no index row in the catalog
+  still points to it. With "keep forever" this only matters when garbage
+  collection is run explicitly.
+- **Scope across buckets:** each lab has its own bucket. Deduplicating across
+  labs saves more, but a restore in one lab can then depend on another lab's
+  bucket, its permissions and its billing. The default is to deduplicate
+  within a bucket, with cross-bucket deduplication as an option (open
+  question 1).
+
+## Compression
+
+Large files hold 99.7% of the bytes, so storage, and retrieval charged per GB,
+is where the money is. A lot of research data is text-like and compresses
+well.
+
+- **zstd, level 3 by default.** It compresses at several hundred MB/s per core
+  and decompresses at over 1 GB/s whatever the level.
+- **Skip what won't compress:**
+  - files whose extension or file signature shows they are already
+    compressed, such as `.gz`, `.bz2`, `.xz`, `.zst`, BAM, CRAM, JPEG, PNG,
+    MP4 and zip;
+  - files whose first 1 MiB shrinks by less than 10% in a trial compression
+    (the same check rclone's `compress` backend uses).
+- **Keep random access.** Data is compressed in independent zstd frames:
+  about 16 MiB each for standalone files, and aligned to member boundaries in
+  packs. The manifest records each file's `stored_offset` and
+  `stored_length`, so after a restore one ranged GET plus decompression reads
+  one file.
+- **Still a standard format.** Multi-frame zstd is a normal `.zst` file:
+  `zstd -d pack.tar.zst | tar x` works without GDA.
+- **Never convert formats**, for example gzip to zstd. A restore must return
+  exactly the original bytes, verified against the original `md5`.
+- **Rough ratios** (from general experience, not measured on our data):
+  about 3 to 4 times for plain FASTQ and SAM, more for VCF, CSV and logs, and
+  none for already-compressed formats. If a third of the bytes shrink 3
+  times, storage and Bulk retrieval costs fall by about 20%.
+
+## Paths that don't fit S3 keys
+
+- **S3 keys are limited to 1,024 bytes**, while file paths can be up to
+  4,096. A directory whose key would be too long is stored inside the nearest
+  ancestor's packs and index, with its path relative to that ancestor, in the
+  same way as a rolled-up subtree.
+- **S3 keys must be valid UTF-8.** Directory names that aren't are
+  percent-encoded in the key, and the index records the original name.
 
 ## Garbage collection and compaction
 
@@ -501,9 +644,82 @@ At the end of the run, write the run ledger.
   and garbage collection removes.
 - **A crash between steps 5 and 6** leaves a stale index. The next run
   detects a changeset newer than the index and rebuilds the index.
-- **One writer per destination:** a lock object `_gda/lock` with the run ID
-  and host, with a takeover timeout, prevents two runs from writing the same
-  tree.
+- **One writer per directory:** the coordinator assigns each partition to
+  exactly one worker for the run (see
+  [Scale and parallel workers](#scale-and-parallel-workers)). A lock object
+  `_gda/lock` with the run ID and coordinator host, with a takeover timeout,
+  prevents two coordinators from running against the same destination.
+
+## Scale and parallel workers
+
+Targets: many petabytes, about 10 billion files, 10 to 15 workers per host on
+several hosts. The same binary runs standalone for small trees, and as a
+coordinator with workers for large ones (decided 2026-09-26).
+
+### Partitions and the single-writer rule
+
+- **The coordinator splits the tree into partitions**, for example per lab or
+  per top-level directory, splitting large ones further by subdirectory. A
+  partition always contains whole rolled-up subtrees.
+- **Each partition has exactly one worker for the whole run.** Only that
+  worker writes the packs, changesets and indexes of its directories, so the
+  CSVs never see concurrent edits and need no locking.
+- **How work is handed out:** on one host the coordinator starts the worker
+  processes and gives each its partitions. Across hosts it writes a plan,
+  `_gda/runs/<run>/plan.csv`, and each Slurm array task takes its share of
+  it. Partitions not finished by a crashed worker are handed out again in the
+  next run. The worker ID in pack names means the new worker never collides
+  with the old one's leftovers.
+- **No locks in S3 per directory.** They would need conditional writes
+  (`If-None-Match`), which AWS supports but which I haven't confirmed for
+  Ceph RGW.
+
+### Shared files are written per worker
+
+Each worker writes its own run ledger, catalog rows and dedup entries under
+`_gda/runs/<run>/<worker>.*`. The coordinator merges them at the end of the
+run. Nothing shared is written by two processes.
+
+### Resource budget per host
+
+| Resource | Estimate for 15 workers | Control |
+|---|---|---|
+| Memory or local NVMe temp | About 30 GB: two 256 MiB packs in progress per worker, plus standalone uploads in 512 MiB parts, four at a time | Limits per worker and per host |
+| CPU | MD5 plus zstd level 3 is roughly one core per 300 to 500 MB/s, so 15 busy workers need 32 or more cores | Number of workers from the CPU count |
+| Source file system | 15 workers scanning and reading at once load NFS servers and the Lustre metadata server | A throttle per source file system |
+| S3 request rates | S3 scales per key prefix; keys that mirror the directory tree spread well | rclone's pacer handles "slow down" responses |
+
+### Initial upload
+
+With 40 to 100 Gbit/s to AWS (decided 2026-09-26), 5 PB takes about 12 days
+at 40 Gbit/s or 5 days at 100 Gbit/s at full rate; plan for roughly twice
+that. Filling 100 Gbit/s (12.5 GB/s) needs about 15 to 25 busy workers across
+hosts, limited mainly by compression and hashing speed. The first run is a
+project in itself: run it partition by partition, with the run ledger showing
+progress and cost.
+
+## Destinations: AWS and Ceph
+
+Each lab has its own bucket, and chooses one or more destinations: AWS Deep
+Archive, an on-premises Ceph RGW bucket, or both (decided 2026-09-26).
+
+- **The format is the same everywhere**, so the same packs and CSVs can be
+  written to each destination.
+- **Without bucket versioning** (for example on a Ceph cluster where it is
+  off), later versions of standalone files become `<name>.gda.<run>`. Packs
+  and changesets are never overwritten anyway, and indexes can be rebuilt
+  from changesets. Recent Ceph RGW releases do support S3 versioning.
+- **Ceph has a different cost model:** no request fees, no 180-day minimum
+  and no restore step. For destinations that aren't archive storage classes,
+  GDA skips restores, and garbage collection and rebasing can run freely.
+- **Bundling still pays off on Ceph:** fewer RADOS objects and smaller bucket
+  indexes (large RGW buckets need their indexes resharded), and less wasted
+  space, because each small object is padded to Ceph's minimum allocation
+  size, with more padding under erasure coding.
+- **Protection without versioning:** backup runs only need PUT, GET and LIST.
+  Their credentials get no delete permission, and garbage collection runs
+  with separate credentials. Protection against overwrites by a compromised
+  key needs conditional writes, which still have to be checked on Ceph.
 
 ## Restore
 
@@ -668,6 +884,18 @@ prices are the us-east-1 list prices from the analysis.
 | Bulk restore of everything | $250 in requests plus $26 retrieval | $5 in requests plus $26 retrieval |
 | Find one file | Needs a listing; names only | Instant from the index, with size, MD5 and location |
 
+At the target scale of 10 billion files and 5 PB, with the census file sizes:
+
+| | One object per file | GDA |
+|---|---|---|
+| Deep Archive objects | 10 billion | About one per directory with small files, after rolling up, plus one per file of 64 MiB or more. With 500 million directories, at most about 500 million |
+| Upload requests | **$500,000** | At most about **$25,000**, plus about $5,000 of Standard PUTs for changesets and indexes |
+| Restore requests for everything | $250,000 | At most about $12,500 |
+| Storage per month | About $5,000 | About $5,000 before compression and deduplication, plus about $100 for hot metadata |
+
+The number of directories is still the most important unknown; the
+profiling query measures it.
+
 ## Where to implement
 
 | Option | Pros | Cons |
@@ -721,6 +949,15 @@ Decided on 2026-09-26:
 | Encryption | SSE-S3 (bucket default encryption) |
 | Where the code lives | In the fork first. Propose `rclone gda` and the `gda` backend upstream once the format is proven; send generic S3 fixes upstream right away |
 | First step | The upstream S3 fixes from the analysis, each on its own branch from `master` |
+| Scale target | Many petabytes, about 10 billion files, 10 to 15 workers per host on several hosts |
+| Source of truth for metadata | Per-directory CSVs. The Parquet catalog is derived from per-worker, per-run files |
+| Source file systems | ZFS, GPFS / Spectrum Scale, Lustre, and NFS, Ceph FS and others |
+| Execution | Both: standalone for small trees, coordinator with workers for large ones |
+| Deduplication | From the start, for files of 1 MiB or more |
+| Buckets | One bucket per lab or project |
+| Destinations | Chosen per lab: AWS Deep Archive, Ceph, or both |
+| Network for the initial upload | 40 to 100 Gbit/s to AWS |
+| Compression | zstd level 3 in independent frames, skipping incompressible data (proposed 2026-09-26 after review) |
 
 ### First step: upstream S3 fixes
 
@@ -728,6 +965,7 @@ In order, smallest and most clearly a bug first:
 
 1. **`--s3-versions` listings drop the storage class**
    (`backend/s3/setfrom.go:71`), so `backend restore` skips archived objects.
+   Fixed on branch `fix-s3-versions-storage-class` and verified on AWS.
 2. **The restore error says GLACIER for DEEP_ARCHIVE objects**
    (`backend/s3/s3.go:4529`); report the real storage class.
 3. **`SetModTime` applies the configured `storage_class`** to the object it
@@ -741,3 +979,9 @@ In order, smallest and most clearly a bug first:
 6. **A guard against overwriting or deleting archived objects**, modelled on
    azureblob's `archive_tier_delete`. This is a new feature, so discuss it
    upstream in an issue first.
+
+## Open questions
+
+1. **Deduplication across labs:** deduplicate only within each lab's bucket
+   (the default here), or across all buckets, accepting that one lab's
+   restores can depend on another lab's bucket?
