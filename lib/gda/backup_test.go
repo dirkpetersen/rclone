@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	gosync "sync"
 	"syscall"
 	"testing"
 	"time"
@@ -27,8 +28,11 @@ import (
 // fakeClock makes each run start a minute after the previous one.
 func fakeClock(t *testing.T) {
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	var mu gosync.Mutex
 	old := timeNow
 	timeNow = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
 		now = now.Add(time.Minute)
 		return now
 	}

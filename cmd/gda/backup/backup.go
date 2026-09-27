@@ -5,6 +5,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 	"github.com/rclone/rclone/fs/config/flags"
 	libgda "github.com/rclone/rclone/lib/gda"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 var (
@@ -27,7 +29,20 @@ var (
 
 func init() {
 	opt.Workers = min(runtime.NumCPU(), 15)
+	addFlags(Command.Flags())
 	flagSet := Command.Flags()
+	flags.StringVarP(flagSet, &runID, "run", "", runID, "Back up a partition of this planned run (see rclone gda plan)", "")
+	flags.IntVarP(flagSet, &partitionIndex, "partition", "", partitionIndex, "Index of the worker whose partitions to back up with --run", "")
+	gda.Command.AddCommand(Command)
+}
+
+var (
+	runID          = ""
+	partitionIndex = -1
+)
+
+// addFlags adds the options which shape a backup to flagSet.
+func addFlags(flagSet *pflag.FlagSet) {
 	flags.FVarP(flagSet, &packSize, "pack-size", "", "Maximum size of a pack of small files", "")
 	flags.FVarP(flagSet, &standaloneMin, "standalone-min", "", "Store files at least this big as their own objects", "")
 	flags.FVarP(flagSet, &rollupMax, "rollup-max", "", "Pack whole subtrees smaller than this as one unit (0 to disable)", "")
@@ -41,7 +56,25 @@ func init() {
 	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
 	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
 	flags.IntVarP(flagSet, &opt.Workers, "workers", "", opt.Workers, "Directories to back up in parallel (default one per CPU, up to 15)", "")
-	gda.Command.AddCommand(Command)
+}
+
+// setSizes copies the size flags into opt.
+func setSizes() {
+	opt.PackSize = int64(packSize)
+	opt.StandaloneMin = int64(standaloneMin)
+	opt.RollupMax = int64(rollupMax)
+}
+
+// logLedger logs what a run did.
+func logLedger(ledger *libgda.Ledger) {
+	if ledger == nil {
+		return
+	}
+	s := ledger.Stats
+	fs.Logf(nil, "gda: run %s: %d dirs indexed, %d added, %d modified, %d metadata only, %d deleted, %d unchanged; %d packs (%s), %d standalone (%s), %s compressed; %d skipped, %d deferred, %d errors",
+		ledger.RunID, s.IndexedDirs, s.Added, s.Modified, s.MetaOnly, s.Deleted, s.Unchanged,
+		s.Packs, fs.SizeSuffix(s.PackBytes), s.Standalone, fs.SizeSuffix(s.StandaloneBytes), fs.SizeSuffix(s.CompressedFrom),
+		s.Skipped, s.Deferred, s.Errors)
 }
 
 // Command is 'rclone gda backup'.
@@ -83,6 +116,16 @@ directory is handled by one worker, whose ID is part of the names of
 the packs it writes, so workers never write the same object. Each
 worker may have a pack of up to !--pack-size! in !--temp-dir! at once.
 
+To split a run over several hosts, plan it with !rclone gda plan!,
+which prints its run ID, run one !rclone gda backup --run ID --partition
+N! per worker, each with its own !--worker! ID, and end it with !rclone
+gda finish!. For example with a Slurm job array:
+
+    RUN=$(rclone gda plan /data s3:bucket/lab --partitions 20)
+    sbatch --array=0-19 --wrap "rclone gda backup /data s3:bucket/lab \
+        --run $RUN --partition \$SLURM_ARRAY_TASK_ID --worker p\$SLURM_ARRAY_TASK_ID"
+    rclone gda finish s3:bucket/lab --run $RUN   # once all tasks are done
+
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose
 modification time changed but whose content didn't are recorded without
@@ -101,18 +144,19 @@ calls to keep owners, permissions, symlinks and special files.
 			return fmt.Errorf("source %q must be a local directory", src)
 		}
 		dst := cmd.NewFsDir(args[1:2])
-		opt.PackSize = int64(packSize)
-		opt.StandaloneMin = int64(standaloneMin)
-		opt.RollupMax = int64(rollupMax)
+		setSizes()
+		if (runID == "") != (partitionIndex < 0) {
+			return errors.New("--run and --partition go together")
+		}
 		cmd.Run(false, true, command, func() error {
-			ledger, err := libgda.Backup(context.Background(), src, dst, opt)
-			if ledger != nil {
-				s := ledger.Stats
-				fs.Logf(nil, "gda: run %s: %d dirs indexed, %d added, %d modified, %d metadata only, %d deleted, %d unchanged; %d packs (%s), %d standalone (%s), %s compressed; %d skipped, %d deferred, %d errors",
-					ledger.RunID, s.IndexedDirs, s.Added, s.Modified, s.MetaOnly, s.Deleted, s.Unchanged,
-					s.Packs, fs.SizeSuffix(s.PackBytes), s.Standalone, fs.SizeSuffix(s.StandaloneBytes), fs.SizeSuffix(s.CompressedFrom),
-					s.Skipped, s.Deferred, s.Errors)
+			var ledger *libgda.Ledger
+			var err error
+			if runID != "" {
+				ledger, err = libgda.BackupPartition(context.Background(), src, dst, opt, runID, partitionIndex)
+			} else {
+				ledger, err = libgda.Backup(context.Background(), src, dst, opt)
 			}
+			logLedger(ledger)
 			return err
 		})
 		return nil

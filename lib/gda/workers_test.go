@@ -5,6 +5,7 @@ package gda
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -112,4 +113,58 @@ func TestWorkQueue(t *testing.T) {
 	q.done()
 	_, ok = q.pop()
 	assert.False(t, ok)
+}
+
+func TestBackupPartitioned(t *testing.T) {
+	fakeClock(t)
+	src := parallelTree(t)
+	serial, split := filepath.Join(t.TempDir(), "lab"), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 16
+	runBackup(t, src, serial, opt)
+
+	f := newDst(t, split)
+	runID, err := Plan(context.Background(), src, f, opt, 4)
+	require.NoError(t, err)
+	// The plan holds the lock for the whole run.
+	_, err = Backup(context.Background(), src, f, opt)
+	assert.ErrorContains(t, err, "locked by run "+runID)
+
+	// Four workers, as a job array would run them.
+	errs := make(chan error, 4)
+	for i := range 4 {
+		wopt := opt
+		wopt.Worker = fmt.Sprintf("p%03d", i)
+		wopt.Workers = 2
+		go func() {
+			_, err := BackupPartition(context.Background(), src, f, wopt, runID, i)
+			errs <- err
+		}()
+	}
+	for range 4 {
+		require.NoError(t, <-errs)
+	}
+	// Worker IDs must be unique within a run.
+	dup := opt
+	dup.Worker = "p000"
+	_, err = BackupPartition(context.Background(), src, f, dup, runID, 0)
+	assert.ErrorContains(t, err, "already has a ledger")
+
+	merged, err := FinishRun(context.Background(), f, runID, opt)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), merged.Stats.Errors)
+	assert.NoFileExists(t, filepath.Join(split, MetaDir, "lock"))
+	assert.Equal(t, indexRows(t, serial), indexRows(t, split))
+
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+
+	// The partitions really were split.
+	parts, err := os.ReadFile(filepath.Join(split, MetaDir, "runs", runID, "plan.csv"))
+	require.NoError(t, err)
+	assert.Contains(t, string(parts), ",dir,")
+	assert.Greater(t, strings.Count(string(parts), "\n"), 10)
 }

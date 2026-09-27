@@ -141,11 +141,32 @@ func (b *backup) isStopped() bool {
 
 // Backup backs up the directory tree at srcRoot to dst.
 func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledger, error) {
+	b, ledger, err := newBackup(ctx, srcRoot, dst, opt)
+	if err != nil {
+		return nil, err
+	}
+	defer b.close()
+	if err := b.chooseRunID(ctx, ledger); err != nil {
+		return nil, err
+	}
+	if err := b.lock(ctx, ledger.Host); err != nil {
+		return nil, err
+	}
+	defer b.unlock(ctx)
+	fs.Infof(nil, "gda: run %s: scanning %s with %d workers", b.runID, b.srcRoot, b.opt.Workers)
+	b.summarizeAll()
+	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, fs.ConfigString(dst))
+	b.processAll(ctx)
+	return b.finishLedger(ctx, ledger)
+}
+
+// newBackup checks the options and sets up a run.
+func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*backup, *Ledger, error) {
 	if opt.PackSize < opt.StandaloneMin {
-		return nil, fmt.Errorf("pack size %d must be at least the standalone minimum %d", opt.PackSize, opt.StandaloneMin)
+		return nil, nil, fmt.Errorf("pack size %d must be at least the standalone minimum %d", opt.PackSize, opt.StandaloneMin)
 	}
 	if opt.Worker == "" || strings.ContainsAny(opt.Worker, "./") {
-		return nil, fmt.Errorf("invalid worker ID %q", opt.Worker)
+		return nil, nil, fmt.Errorf("invalid worker ID %q", opt.Worker)
 	}
 	if opt.Retries < 1 {
 		opt.Retries = 1
@@ -154,15 +175,15 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		opt.Workers = 1
 	}
 	if opt.Compression != CodecZstd && opt.Compression != CodecNone {
-		return nil, fmt.Errorf("unknown compression %q: use %s or %s", opt.Compression, CodecZstd, CodecNone)
+		return nil, nil, fmt.Errorf("unknown compression %q: use %s or %s", opt.Compression, CodecZstd, CodecNone)
 	}
 	srcRoot = filepath.Clean(srcRoot)
 	info, err := os.Stat(srcRoot)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("source %q is not a directory", srcRoot)
+		return nil, nil, fmt.Errorf("source %q is not a directory", srcRoot)
 	}
 	ci := fs.GetConfig(ctx)
 	started := timeNow().UTC()
@@ -183,9 +204,8 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	}
 	if opt.Compression == CodecZstd {
 		if b.enc, err = newEncoder(opt.Level); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		defer func() { _ = b.enc.Close() }()
 	}
 	if b.opt.RootLabel == "" {
 		// The last element of the destination path, or "root" when the
@@ -207,34 +227,40 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		Started:       started,
 		Options:       b.opt,
 	}
+	return b, ledger, nil
+}
 
-	// Run IDs have a resolution of one second, so make sure a run
-	// that finished within the same second can't share this one's names.
+// close releases what the run holds.
+func (b *backup) close() {
+	if b.enc != nil {
+		_ = b.enc.Close()
+	}
+}
+
+// chooseRunID makes sure the run ID isn't shared with a run which
+// finished within the same second, as run IDs have a resolution of one
+// second.
+func (b *backup) chooseRunID(ctx context.Context, ledger *Ledger) error {
 	for {
-		used, err := b.d.exists(ctx, joinRemote(MetaDir, "runs", b.runID, opt.Worker+".json"))
-		if err != nil {
-			return nil, fmt.Errorf("check run ID: %w", err)
+		entries, err := b.d.f.List(ctx, joinRemote(MetaDir, "runs", b.runID))
+		if err != nil && !errors.Is(err, fs.ErrorDirNotFound) {
+			return fmt.Errorf("check run ID: %w", err)
 		}
-		if !used {
-			break
+		if len(entries) == 0 {
+			return nil
 		}
 		time.Sleep(time.Second)
 		b.runID = NewRunID(timeNow())
 		ledger.RunID = b.runID
 	}
+}
 
-	if err := b.lock(ctx, host); err != nil {
-		return nil, err
-	}
-	defer b.unlock(ctx)
-	fs.Infof(nil, "gda: run %s: scanning %s with %d workers", b.runID, srcRoot, opt.Workers)
-	b.summarizeAll()
-	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, fs.ConfigString(dst))
-	b.processAll(ctx)
+// finishLedger writes the ledger of this worker's part of the run and
+// returns an error if anything failed.
+func (b *backup) finishLedger(ctx context.Context, ledger *Ledger) (*Ledger, error) {
 	if b.isStopped() {
 		fs.Errorf(nil, "gda: run %s stopped early", b.runID)
 	}
-
 	ledger.Finished = time.Now().UTC()
 	ledger.Stats = b.stats
 	ledger.Errors = b.errors
@@ -242,8 +268,8 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	if err != nil {
 		return ledger, err
 	}
-	ledgerKey := joinRemote(MetaDir, "runs", b.runID, opt.Worker+".json")
-	if err := b.d.putBytes(ctx, ledgerKey, data, opt.MetaTier); err != nil {
+	ledgerKey := joinRemote(MetaDir, "runs", b.runID, b.opt.Worker+".json")
+	if err := b.d.putBytes(ctx, ledgerKey, data, b.opt.MetaTier); err != nil {
 		b.errorf("write run ledger: %v", err)
 		ledger.Stats = b.stats
 	}
@@ -435,6 +461,7 @@ type dirChange struct {
 // childDir is a subdirectory to process.
 type childDir struct {
 	rel, key string
+	shallow  bool // process only this directory, not the ones below it
 }
 
 // processDir backs up the directory at rel, whose destination key is key,
