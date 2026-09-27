@@ -1131,11 +1131,14 @@ func hashFile(p string) (sum string, err error) {
 // one, and writes its index, in that order. It returns false if the
 // directory couldn't be committed, in which case its previous index stays
 // in place and the next run tries again.
-func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries []Entry, c *dirChange) bool {
-	label := dirLabel(key, b.opt.RootLabel)
-	stored, failed := b.storeData(ctx, w, key, label, c.store)
+// resolve stores the data of the entries in c.store, numbering packs on
+// from *part, and returns the directory's changeset rows and new index
+// rows. ok is false if storing failed, in which case nothing may be
+// committed.
+func (b *backup) resolve(ctx context.Context, w, key, label string, prevEntries []Entry, c *dirChange, part *int) (changes, index []Entry, ok bool) {
+	stored, failed := b.storeData(ctx, w, key, label, c.store, part)
 	if failed {
-		return false
+		return nil, nil, false
 	}
 	// Entries whose data couldn't be stored this run keep their
 	// previous rows and are left out of the changeset.
@@ -1152,7 +1155,7 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 		prevByName[prevEntries[i].Name] = &prevEntries[i]
 	}
 	// Filtered in place, as a directory may have millions of rows.
-	changes := c.changes[:0]
+	changes = c.changes[:0]
 	for _, row := range c.changes {
 		if skip[row.Name] {
 			continue
@@ -1167,7 +1170,7 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 		}
 		changes = append(changes, row)
 	}
-	index := c.index
+	index = c.index
 	for _, e := range c.store {
 		if s, ok := stored[e.Name]; ok {
 			s.Action = ""
@@ -1178,6 +1181,16 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 		if p, ok := prevByName[name]; ok {
 			index = append(index, *p)
 		}
+	}
+	return changes, index, true
+}
+
+func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries []Entry, c *dirChange) bool {
+	label := dirLabel(key, b.opt.RootLabel)
+	part := 0
+	changes, index, ok := b.resolve(ctx, w, key, label, prevEntries, c, &part)
+	if !ok {
+		return false
 	}
 	changed, err := indexChanged(prevEntries, index)
 	if err != nil {
@@ -1329,10 +1342,10 @@ func sameRow(a, b *Entry) (bool, error) {
 // storeData stores the data of entries in packs and standalone objects.
 // It returns the stored entries by name. failed is set if an upload
 // failed, in which case nothing from this directory may be committed.
-func (b *backup) storeData(ctx context.Context, w, key, label string, entries []*sourceEntry) (stored map[string]Entry, failed bool) {
+func (b *backup) storeData(ctx context.Context, w, key, label string, entries []*sourceEntry, part *int) (stored map[string]Entry, failed bool) {
 	stored = map[string]Entry{}
 	if b.d.dryRun {
-		b.planData(w, key, label, entries, stored)
+		b.planData(w, key, label, entries, stored, part)
 		return stored, false
 	}
 	entries = b.dedupEntries(key, entries, stored)
@@ -1365,7 +1378,6 @@ func (b *backup) storeData(ctx context.Context, w, key, label string, entries []
 		return stored, false
 	}
 	var pw *packWriter
-	part := 0
 	closePack := func() bool {
 		if pw == nil {
 			return true
@@ -1382,9 +1394,9 @@ func (b *backup) storeData(ctx context.Context, w, key, label string, entries []
 			}
 		}
 		if pw == nil {
-			part++
+			*part++
 			var err error
-			pw, err = newPackWriter(packName(label, b.runID, w, part), b.opt.TempDir)
+			pw, err = newPackWriter(packName(label, b.runID, w, *part), b.opt.TempDir)
 			if err != nil {
 				b.errorf("%v", err)
 				return nil, true
@@ -1497,9 +1509,9 @@ func fullRow(key string, row Entry) Entry {
 
 // planData fills in stored as storeData would, without reading or
 // uploading any data. It is used for --dry-run.
-func (b *backup) planData(w, key, label string, entries []*sourceEntry, stored map[string]Entry) {
+func (b *backup) planData(w, key, label string, entries []*sourceEntry, stored map[string]Entry, part *int) {
 	var packSize int64
-	part := 0
+	started := false
 	for _, e := range entries {
 		row := e.Entry
 		row.Run = b.runID
@@ -1511,14 +1523,15 @@ func (b *backup) planData(w, key, label string, entries []*sourceEntry, stored m
 			b.count(func(s *Stats) *int64 { return &s.StandaloneBytes }, e.Size)
 		default:
 			size := max(e.Size, 0) + packOverhead(&e.Entry)
-			if part == 0 || packSize+size > b.opt.PackSize {
-				part++
+			if !started || packSize+size > b.opt.PackSize {
+				*part++
+				started = true
 				packSize = 0
 				b.count(func(s *Stats) *int64 { return &s.Packs }, 1)
 			}
 			packSize += size
 			b.count(func(s *Stats) *int64 { return &s.PackBytes }, size)
-			row.Location = packName(label, b.runID, w, part)
+			row.Location = packName(label, b.runID, w, *part)
 		}
 		stored[e.Name] = row
 	}
