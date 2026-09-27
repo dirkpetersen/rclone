@@ -289,6 +289,7 @@ func TestRandomHistory(t *testing.T) {
 				if r.Intn(2) == 0 {
 					opt.IndexCache = cache
 				}
+				opt.Checksum = r.Intn(4) == 0
 				if r.Intn(4) == 0 {
 					// A dry run changes nothing.
 					ctx, ci := fs.AddConfig(context.Background())
