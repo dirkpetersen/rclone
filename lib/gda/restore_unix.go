@@ -1259,13 +1259,13 @@ func createSpecial(e *Entry, p string, overwrite bool) error {
 // applyMeta sets the permissions, modification time and extended
 // attributes of p from e, and its owner and group when running as root.
 func applyMeta(e *Entry, p string, isRoot bool) error {
-	err := applyMode(e, p, isRoot)
-	// Last, so a failure to set one, as for a namespace only root can
-	// write, doesn't stop the rest.
+	// Before the mode, as setting a user attribute needs write
+	// permission, which a read only file no longer has after it.
+	var err error
 	if e.Xattrs != "" {
-		err = errors.Join(err, writeXattrs(p, e.Xattrs, isRoot))
+		err = writeXattrs(p, e.Xattrs, isRoot)
 	}
-	return err
+	return errors.Join(err, applyMode(e, p, isRoot))
 }
 
 // applyMode sets the owner, permissions and modification time of p from e.

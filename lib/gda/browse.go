@@ -54,7 +54,9 @@ func (b *Browser) resetExpired() {
 // entries returns the rows of the index at key, or nil if there is none.
 // Concurrent reads of the same index are done once.
 func (b *Browser) entries(ctx context.Context, key string) ([]Entry, error) {
-	if key == "" && b.f.Features().BucketBased && b.f.Root() == "" {
+	// Wrapping backends such as crypt have their own root, so it is the
+	// root of the wrapped remote which says whether this is above them.
+	if key == "" && b.f.Features().BucketBased && fs.UnWrapFs(b.f).Root() == "" {
 		// Above the buckets there are no objects, so no index.
 		return nil, nil
 	}

@@ -346,7 +346,10 @@ manifests.
 
 Encoding: RFC 4180 CSV, UTF-8, header row, fields quoted when needed. This
 handles commas, quotes and newlines in names. File names that aren't valid
-UTF-8 are percent-encoded, with a `name_encoding` column to mark them.
+UTF-8, or contain `%` or ASCII control characters, are percent-encoded,
+with a `name_encoding` column to mark them. (Control characters were added
+on 2026-09-27, as backends map them differently in object names; files
+named with them in older backups are stored again once.)
 
 ### Why CSV, and where it stops scaling
 
