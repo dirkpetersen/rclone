@@ -300,7 +300,7 @@ func TestGCCompact(t *testing.T) {
 
 	// Once history from the rebase on is all that is kept, the old pack
 	// goes.
-	r, err = GC(context.Background(), f, GCOptions{KeepFrom: l.RunID, DeleteExpired: true, LockTimeout: time.Hour})
+	_, err = GC(context.Background(), f, GCOptions{KeepFrom: l.RunID, DeleteExpired: true, LockTimeout: time.Hour})
 	require.NoError(t, err)
 	assert.NoFileExists(t, filepath.Join(dst, filepath.FromSlash(firstPack)))
 	target := t.TempDir()
