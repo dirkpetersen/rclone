@@ -156,7 +156,10 @@ Each directory gets a !gda-index.csv! describing its current contents,
 and each run that changes a directory adds a changeset CSV next to it.
 Files smaller than !--standalone-min! are packed into tar files of at
 most !--pack-size!, one set of packs per directory; bigger files are
-stored as their own objects under their own names. A subtree smaller
+stored as their own objects under their own names. When such a file
+changes, the new copy is stored as !<name>.gda.<run>.<worker>!, or, in
+an S3 bucket with versioning enabled, under its own name as a new
+version, whose ID its row records. A subtree smaller
 than !--rollup-max! in total is packed as one unit with its
 subdirectories.
 

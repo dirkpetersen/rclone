@@ -131,6 +131,7 @@ type sourceEntry struct {
 	path   string // full source path
 	rel    string // source path relative to the source root, "/" separated
 	rebase bool   // packed again although unchanged, so never a dedup copy
+	prev   *Entry // for a changed file, its previous row
 }
 
 // columns are the CSV columns in the order they are written. New columns

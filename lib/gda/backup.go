@@ -155,6 +155,8 @@ type backup struct {
 
 	claim *partitionClaim // this worker's claim on its partition of a planned run
 
+	versioned bool // the destination keeps each version of an object under its key
+
 	hardLinks map[string]Entry // stored files with more than one link, by HardLink, located by full key
 }
 
@@ -192,6 +194,7 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	if err := b.openCache(ctx); err != nil {
 		fs.Errorf(nil, "gda: not using the index cache: %v", err)
 	}
+	b.checkVersioned(ctx)
 	// A ledger without a finish time shows the run started, so even if
 	// it doesn't finish, other hosts' index caches see it wrote here.
 	if err := b.putLedger(ctx, ledger); err != nil {
@@ -305,6 +308,22 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 		return nil, nil, err
 	}
 	return b, ledger, nil
+}
+
+// checkVersioned finds out whether the destination keeps versions.
+func (b *backup) checkVersioned(ctx context.Context) {
+	if b.d.dryRun {
+		return
+	}
+	versioned, err := isVersioned(ctx, b.d.f)
+	if err != nil {
+		fs.Debugf(nil, "gda: can't read bucket versioning, so not using it: %v", err)
+		return
+	}
+	b.versioned = versioned
+	if versioned {
+		fs.Infof(nil, "gda: the bucket keeps versions, so changed large files are stored under their own names")
+	}
 }
 
 // openCache opens the index cache, if one is configured.
@@ -971,6 +990,7 @@ func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, 
 		case p.Type != e.Type || e.Size != p.Size || e.LinkTarget != p.LinkTarget ||
 			e.DevMajor != p.DevMajor || e.DevMinor != p.DevMinor:
 			c.changes = append(c.changes, changeRow(e.Entry, ActionModify))
+			e.prev = &p
 			c.store = append(c.store, e)
 		case e.Type == TypeFile && (!e.ModTime.Equal(p.ModTime) || b.opt.Checksum && e.Size > 0):
 			sum, err := hashFile(e.path)
@@ -981,6 +1001,7 @@ func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, 
 			}
 			if sum != p.MD5 {
 				c.changes = append(c.changes, changeRow(e.Entry, ActionModify))
+				e.prev = &p
 				c.store = append(c.store, e)
 				continue
 			}
@@ -1602,7 +1623,7 @@ func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEn
 		name += ".gda.zst"
 	}
 	remote := joinRemote(key, name)
-	exists, err := b.d.exists(ctx, remote)
+	exists, err := b.nameTaken(ctx, remote, name, e)
 	if err != nil {
 		b.errorf("check %q: %v", remote, err)
 		return true
@@ -1626,13 +1647,25 @@ func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEn
 	if !b.checkDataTier(ctx, remote) {
 		return false
 	}
+	versionID := ""
+	if b.versioned {
+		o, err := b.d.f.NewObject(ctx, remote)
+		if err != nil {
+			b.errorf("read version of %q: %v", remote, err)
+			return true
+		}
+		if v, ok := o.(versionedObject); ok {
+			versionID = v.VersionID()
+		}
+	}
 	info, err := os.Lstat(e.path)
 	if err != nil || info.Size() != e.Size || !info.ModTime().Equal(e.ModTime) {
 		fs.Logf(e.path, "gda: changed while being uploaded, leaving it for the next run")
 		b.count(func(s *Stats) *int64 { return &s.Deferred }, 1)
 		// Nothing refers to the incomplete copy, and leaving it would
-		// take the file's own name for good.
-		if o, err := b.d.f.NewObject(ctx, remote); err == nil {
+		// take the file's own name for good. In a versioned bucket
+		// removing the version itself leaves the previous one current.
+		if o, err := newDataObject(ctx, b.d.f, versionKey(remote, versionID)); err == nil {
 			if err := o.Remove(ctx); err != nil {
 				fs.Errorf(remote, "gda: failed to remove incomplete copy: %v", err)
 			}
@@ -1649,11 +1682,35 @@ func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEn
 	row.MD5 = sum
 	row.StoredSize = storedSize
 	row.StoredMD5 = storedSum
+	row.VersionID = versionID
 	row.Run = b.runID
 	stored[e.Name] = row
 	b.count(func(s *Stats) *int64 { return &s.Standalone }, 1)
 	b.count(func(s *Stats) *int64 { return &s.StandaloneBytes }, storedSize)
 	return true
+}
+
+// nameTaken returns true if the standalone file e can't be stored under
+// name, at remote, as another object has it. In a versioned bucket a
+// changed file is stored under its name as a new version, as long as the
+// version there now is the one its previous row refers to by ID, so
+// that every row reading that name reads it by version.
+func (b *backup) nameTaken(ctx context.Context, remote, name string, e *sourceEntry) (bool, error) {
+	if !b.versioned {
+		return b.d.exists(ctx, remote)
+	}
+	o, err := b.d.f.NewObject(ctx, remote)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	v, ok := o.(versionedObject)
+	if !ok || v.VersionID() == "" || e.prev == nil {
+		return true, nil
+	}
+	return e.prev.Location != name || e.prev.VersionID != v.VersionID(), nil
 }
 
 // compressStandalone returns true if the standalone file e should be

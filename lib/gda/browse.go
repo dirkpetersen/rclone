@@ -218,7 +218,7 @@ func (b *Browser) Open(ctx context.Context, l *Located, options ...fs.OpenOption
 	if l.outsideRoot() {
 		return nil, l.errOutsideRoot()
 	}
-	o, err := b.f.NewObject(ctx, l.ObjectKey())
+	o, err := newDataObject(ctx, b.f, l.objectRef())
 	if err != nil {
 		return nil, err
 	}

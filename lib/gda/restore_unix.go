@@ -453,7 +453,7 @@ func buildPlan(ctx context.Context, t *tree, paths []string) ([]Entry, error) {
 				return l.errOutsideRoot()
 			}
 			if e.Location != "" || e.DedupOf != "" {
-				e.Location = l.ObjectKey()
+				e.Location = l.objectRef()
 			}
 			e.Action = ""
 			plan = append(plan, e)
@@ -551,6 +551,45 @@ func inPlace(e *Entry, p string) (same, exists bool, err error) {
 // are always readable. It returns an error if any object is missing or
 // its restore couldn't be requested.
 func requestRestore(ctx context.Context, f fs.Fs, keys []string, tier string, lifetime int) error {
+	var plain []string
+	var problems []string
+	for _, k := range keys {
+		if _, version := splitVersionKey(k); version == "" {
+			plain = append(plain, k)
+			continue
+		}
+		// The restore command acts on current versions only.
+		if err := requestVersionRestore(ctx, f, k, tier, lifetime); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
+	err := requestPlainRestore(ctx, f, plain, tier, lifetime)
+	if len(problems) > 0 {
+		err = errors.Join(err, fmt.Errorf("request restore of %d object versions failed:\n  %s", len(problems), strings.Join(problems, "\n  ")))
+	}
+	return err
+}
+
+// requestVersionRestore requests the restore of one version of an object.
+func requestVersionRestore(ctx context.Context, f fs.Fs, ref, tier string, lifetime int) error {
+	o, err := newDataObject(ctx, f, ref)
+	if err != nil {
+		return err
+	}
+	r, ok := o.(restorableObject)
+	if !ok {
+		return fmt.Errorf("%s: can't request the restore of a version", o.Remote())
+	}
+	err = r.RequestRestore(ctx, tier, int32(lifetime))
+	if err != nil && strings.Contains(err.Error(), "RestoreAlreadyInProgress") {
+		return nil
+	}
+	return err
+}
+
+// requestPlainRestore requests the restore of the current versions of
+// the objects at keys.
+func requestPlainRestore(ctx context.Context, f fs.Fs, keys []string, tier string, lifetime int) error {
 	command := f.Features().Command
 	if command == nil || len(keys) == 0 {
 		return nil
@@ -1017,7 +1056,7 @@ const wholeObjectMembers = 16
 // with the object as a whole.
 func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []int, localPath func(*Entry) string, errorf func(string, ...any), pattern string) (map[int]bool, error) {
 	fetched := map[int]bool{}
-	o, err := d.f.NewObject(ctx, key)
+	o, err := newDataObject(ctx, d.f, key)
 	if err != nil {
 		return fetched, err
 	}

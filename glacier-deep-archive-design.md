@@ -1280,8 +1280,11 @@ the local and memory backends and production uses S3 or Ceph.
 
 Milestone 1 limits, each lifted by a later milestone:
 
-- changed standalone files always get `<name>.gda.<run>` keys; using bucket
-  versioning when it is enabled comes later;
+- changed standalone files always got `<name>.gda.<run>` keys (lifted for
+  S3: when the bucket has versioning enabled, a changed file is stored
+  under its own name as a new version and its row records the version
+  ID, which restores, browsing and checks read by; a name another row
+  reads without a version ID keeps using versioned names);
 - hard links were stored as separate files (lifted: files with several
   links record their device and inode in `hard_link`, the data is stored
   once per run, and restores link them again), and extended attributes
