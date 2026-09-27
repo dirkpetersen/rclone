@@ -52,8 +52,9 @@ func readXattrs(p string) (string, error) {
 }
 
 // writeXattrs sets the extended attributes encoded in xattrs on p,
-// without following a symlink.
-func writeXattrs(p, xattrs string) error {
+// without following a symlink. Unless isRoot, the trusted and security
+// namespaces, which only root may write, are left out.
+func writeXattrs(p, xattrs string, isRoot bool) error {
 	var errs []error
 	for _, pair := range strings.Fields(xattrs) {
 		encName, encValue, ok := strings.Cut(pair, ":")
@@ -61,6 +62,9 @@ func writeXattrs(p, xattrs string) error {
 		value, err2 := base64.StdEncoding.DecodeString(encValue)
 		if !ok || err1 != nil || err2 != nil {
 			errs = append(errs, fmt.Errorf("bad extended attribute %q", pair))
+			continue
+		}
+		if !isRoot && (strings.HasPrefix(string(name), "trusted.") || strings.HasPrefix(string(name), "security.")) {
 			continue
 		}
 		if err := unix.Lsetxattr(p, string(name), value, 0); err != nil {
