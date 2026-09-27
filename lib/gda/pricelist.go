@@ -142,8 +142,9 @@ func roundPrice(p float64) float64 {
 // FetchPrices returns the price table for an AWS region, starting from
 // the defaults and updating the rates the AWS Price List publishes:
 // retrieval per GB, Flexible Retrieval request fees, the temporary copy,
-// GET requests and internet egress. Deep Archive restore request fees
-// aren't in the price list, so they keep their default values.
+// GET requests, internet egress, and storage and uploads in STANDARD and
+// GLACIER. Deep Archive storage, upload and restore request fees aren't
+// in the price list, so they keep their default values.
 func FetchPrices(ctx context.Context, client *http.Client, region string) (Prices, error) {
 	prices := DefaultPrices()
 	s3, err := fetchOffer(ctx, client, "AmazonS3", region)
@@ -198,6 +199,21 @@ func FetchPrices(ctx context.Context, client *http.Client, region string) (Price
 		errs = append(errs, err)
 	}
 	prices.GetPer1000 = roundPrice(get * 1000)
+	storage := func(class, usage, putUsage, putOperation string) {
+		p := prices.Storage[class]
+		var err error
+		if p.PerGBMonth, err = first(usage, "", "GB-Mo"); err != nil {
+			errs = append(errs, err)
+		}
+		put, err := first(putUsage, putOperation, "Requests")
+		if err != nil {
+			errs = append(errs, err)
+		}
+		p.PutPer1000 = roundPrice(put * 1000)
+		prices.Storage[class] = p
+	}
+	storage("STANDARD", "TimedStorage-ByteHrs", "Requests-Tier1", "")
+	storage("GLACIER", "TimedStorage-GlacierByteHrs", "Requests-GLACIER-Tier1", "PutObject")
 	egress, err := transfer.find(map[string]string{
 		"fromRegionCode": region,
 		"transferType":   "AWS Outbound",

@@ -29,6 +29,7 @@ var (
 	rollupMax     = fs.SizeSuffix(opt.RollupMax)
 	dedupMin      = fs.SizeSuffix(opt.DedupMin)
 	compressMax   = fs.SizeSuffix(opt.CompressMax)
+	pricesFile    = ""
 )
 
 func init() {
@@ -87,6 +88,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
 	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
 	flags.FVarP(flagSet, &compressMax, "compress-max", "", "Store standalone files bigger than this uncompressed", "")
+	flags.StringVarP(flagSet, &pricesFile, "prices", "", pricesFile, "JSON file with the prices to use for the cost estimate (default built in)", "")
 	flags.StringVarP(flagSet, &opt.IndexCache, "index-cache-dir", "", opt.IndexCache, "Directory for local copies of the destination's indexes (\"\" to disable)", "")
 	flags.IntVarP(flagSet, &opt.Workers, "workers", "", opt.Workers, "Directories to back up in parallel (default one per CPU, up to 15)", "")
 }
@@ -110,6 +112,20 @@ func logLedger(ledger *libgda.Ledger) {
 		ledger.RunID, s.IndexedDirs, s.Added, s.Modified, s.MetaOnly, s.Deleted, s.Unchanged, s.Rebased,
 		s.Packs, fs.SizeSuffix(s.PackBytes), s.Standalone, fs.SizeSuffix(s.StandaloneBytes), fs.SizeSuffix(s.CompressedFrom),
 		s.Deduplicated, fs.SizeSuffix(s.DeduplicatedBytes), s.Skipped, s.Deferred, s.Errors)
+	prices := libgda.DefaultPrices()
+	if pricesFile != "" {
+		var err error
+		if prices, err = libgda.LoadPrices(pricesFile); err != nil {
+			fs.Errorf(nil, "gda: %v", err)
+			return
+		}
+	}
+	cost, ok := prices.EstimateBackup(s.Packs+s.Standalone, s.PackBytes+s.StandaloneBytes, s.MetaObjects, ledger.Options.DataTier, ledger.Options.MetaTier)
+	if !ok {
+		return
+	}
+	fs.Logf(nil, "gda: run %s: estimated cost %.2f %s for uploads, and %.2f %s per month to store the data it added, for at least %d days (prices of %s)",
+		ledger.RunID, float64(cost.Requests), cost.Currency, float64(cost.Monthly), cost.Currency, cost.MinDays, prices.Date)
 }
 
 // Command is 'rclone gda backup'.
@@ -203,6 +219,13 @@ and over more than twice the packs they would fill, as happens after
 many small changes, the run packs them again from the
 source, so restoring the directory needs fewer objects. The old packs
 are kept for the history.
+
+Each run logs an estimate of what it cost in upload requests and adds
+to the monthly storage bill, from the built in prices or !--prices!
+(see !rclone gda prices!); with !--dry-run! this estimates a backup
+before making it, counting data before compression, so as an upper
+bound. Metadata storage and the requests of reading indexes
+are small and not counted.
 
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose
