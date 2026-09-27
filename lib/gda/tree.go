@@ -139,9 +139,28 @@ type Located struct {
 // which for a duplicate is the stored copy's.
 func (l *Located) ObjectKey() string {
 	if l.DedupOf != "" {
-		return l.DedupOf
+		return strings.TrimPrefix(path.Join("/", l.IndexKey, l.DedupOf), "/")
 	}
 	return joinRemote(l.IndexKey, l.Location)
+}
+
+// relKey returns the path from the directory at key from to the object
+// at key to, so that it resolves wherever the tree is read from.
+func relKey(from, to string) string {
+	var fromParts, toParts []string
+	if from != "" {
+		fromParts = strings.Split(from, "/")
+	}
+	toParts = strings.Split(to, "/")
+	common := 0
+	for common < len(fromParts) && common < len(toParts)-1 && fromParts[common] == toParts[common] {
+		common++
+	}
+	parts := make([]string, 0, len(fromParts)-common+len(toParts)-common)
+	for range fromParts[common:] {
+		parts = append(parts, "..")
+	}
+	return path.Join(append(parts, toParts[common:]...)...)
 }
 
 // errNotFound is returned when a requested path isn't in the tree.
