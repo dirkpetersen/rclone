@@ -1282,8 +1282,11 @@ Milestone 1 limits, each lifted by a later milestone:
   once per run, and restores link them again), and extended attributes
   were not stored (lifted on Linux: `--xattrs` records them, including
   POSIX and NFSv4 ACLs, in an `xattrs` column, and restores set them);
-- paths whose S3 key would exceed 1,024 bytes are reported and skipped rather
-  than moved into an ancestor's pack;
+- paths whose S3 key would exceed 1,024 bytes were reported and skipped
+  rather than moved into an ancestor's pack (lifted: such a directory is
+  packed with the deepest directory that has an index, and such a large
+  file is packed rather than stored on its own; only names which need
+  encoding are still skipped);
 - the scan reads file metadata twice (once for subtree totals, once to
   process each directory).
 

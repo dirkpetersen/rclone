@@ -786,7 +786,11 @@ func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, ke
 			continue
 		}
 		e.TreeSize, e.TreeFiles = s.treeSize, s.treeFiles
-		if rollup {
+		tooLong := !rollup && b.dirKeysTooLong(joinRemote(key, encName))
+		// A subdirectory whose own keys would be too long is packed with
+		// this directory, unless it holds names which need encoding,
+		// which can't be rolled up.
+		if rollup || tooLong && encoding == "" && !s.badName {
 			e.Listing = ListingRollup
 			cur = append(cur, e)
 			sub, subKeep, err := b.collect(w, childRel, "", true)
@@ -803,7 +807,7 @@ func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, ke
 			b.count(func(s *Stats) *int64 { return &s.RollupDirs }, 1)
 			continue
 		}
-		if b.dirKeysTooLong(joinRemote(key, encName)) {
+		if tooLong {
 			b.errorf("skipping directory %q: its keys would be longer than %d bytes", childRel, maxKeyLength)
 			keep[encName] = true
 			continue
@@ -1235,7 +1239,7 @@ func sameRow(a, b *Entry) (bool, error) {
 func (b *backup) storeData(ctx context.Context, w, key, label string, entries []*sourceEntry) (stored map[string]Entry, failed bool) {
 	stored = map[string]Entry{}
 	if b.d.dryRun {
-		b.planData(w, label, entries, stored)
+		b.planData(w, key, label, entries, stored)
 		return stored, false
 	}
 	entries = b.dedupEntries(key, entries, stored)
@@ -1256,7 +1260,7 @@ func (b *backup) storeData(ctx context.Context, w, key, label string, entries []
 			stored[e.Name] = row
 			continue
 		}
-		if e.Type == TypeFile && e.Size >= b.opt.StandaloneMin && isDirectChild(e.Name) {
+		if b.isStandalone(key, e) {
 			if !b.storeStandalone(ctx, w, key, e, stored) {
 				return nil, true
 			}
@@ -1400,7 +1404,7 @@ func fullRow(key string, row Entry) Entry {
 
 // planData fills in stored as storeData would, without reading or
 // uploading any data. It is used for --dry-run.
-func (b *backup) planData(w, label string, entries []*sourceEntry, stored map[string]Entry) {
+func (b *backup) planData(w, key, label string, entries []*sourceEntry, stored map[string]Entry) {
 	var packSize int64
 	part := 0
 	for _, e := range entries {
@@ -1408,7 +1412,7 @@ func (b *backup) planData(w, label string, entries []*sourceEntry, stored map[st
 		row.Run = b.runID
 		switch {
 		case e.Type == TypeSocket:
-		case e.Type == TypeFile && e.Size >= b.opt.StandaloneMin && isDirectChild(e.Name):
+		case b.isStandalone(key, e):
 			row.Location = e.Name
 			b.count(func(s *Stats) *int64 { return &s.Standalone }, 1)
 			b.count(func(s *Stats) *int64 { return &s.StandaloneBytes }, e.Size)
@@ -1506,18 +1510,20 @@ func (b *backup) uploadPack(ctx context.Context, key string, pw *packWriter, sto
 	return true
 }
 
+// isStandalone returns true if the file e, in the directory at key, is
+// stored as its own object: it is big enough, and the longest name it
+// could be stored under fits in a key, whatever the worker and whether
+// a copy exists already. Otherwise it is packed.
+func (b *backup) isStandalone(key string, e *sourceEntry) bool {
+	return e.Type == TypeFile && e.Size >= b.opt.StandaloneMin && isDirectChild(e.Name) &&
+		!keyTooLong(b.rootKey, joinRemote(key, versionedName(e.Name, b.runID, longestWorkerID)+".zst"))
+}
+
 // storeStandalone uploads a large file as its own object, never
 // overwriting an existing object. A file which can't be stored is left
 // out of stored, so the directory keeps its previous row. It returns
 // false only if the run must stop.
 func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEntry, stored map[string]Entry) bool {
-	// Checked with the longest name the file could be stored under, so
-	// whether it is stored doesn't depend on the worker or on whether a
-	// copy exists already.
-	if keyTooLong(b.rootKey, joinRemote(key, versionedName(e.Name, b.runID, longestWorkerID)+".zst")) {
-		b.errorf("skipping %q: its key would be longer than %d bytes", e.path, maxKeyLength)
-		return true
-	}
 	compress, err := b.compressStandalone(e)
 	if err != nil {
 		b.errorf("read %q: %v", e.path, err)
