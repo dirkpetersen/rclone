@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"time"
@@ -32,20 +31,6 @@ func packOverhead(e *Entry) int64 {
 	return tarBlockSize + (roundBlock(max(e.Size, 0)) - max(e.Size, 0)) + tarBlockSize + pax
 }
 
-// countingWriter counts and hashes the bytes written through it.
-type countingWriter struct {
-	w io.Writer
-	n int64
-	h hash.Hash
-}
-
-func (c *countingWriter) Write(p []byte) (int, error) {
-	n, err := c.w.Write(p)
-	c.n += int64(n)
-	c.h.Write(p[:n])
-	return n, err
-}
-
 // packWriter writes one pack to a temporary file.
 type packWriter struct {
 	name          string
@@ -53,7 +38,8 @@ type packWriter struct {
 	cw            *countingWriter
 	tw            *tar.Writer
 	members       []Entry
-	manifestBytes int64 // estimated size of the manifest so far
+	manifestBytes int64   // estimated size of the manifest so far
+	starts        []int64 // offsets where members' headers start, where compressed frames may be cut
 }
 
 // manifestRowEstimate estimates the bytes e adds to a pack's manifest.
@@ -131,6 +117,7 @@ func (p *packWriter) add(e *sourceEntry) error {
 	default:
 		return fmt.Errorf("pack %s: can't store %q of type %s", p.name, e.Name, e.Type)
 	}
+	p.starts = append(p.starts, p.cw.n)
 	if err := p.tw.WriteHeader(hdr); err != nil {
 		return fmt.Errorf("pack %s: write header for %q: %w", p.name, e.Name, err)
 	}
@@ -199,6 +186,7 @@ func (p *packWriter) finish(now time.Time) (int64, string, error) {
 	if err := WriteEntries(&manifest, p.members); err != nil {
 		return 0, "", err
 	}
+	p.starts = append(p.starts, p.cw.n)
 	hdr := &tar.Header{
 		Typeflag: tar.TypeReg,
 		Name:     p.name + ".csv",

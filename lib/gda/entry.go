@@ -91,6 +91,7 @@ type Entry struct {
 	Action       string    `json:"action,omitempty"` // changesets only: one of the Action constants
 	DevMajor     int64     `json:"dev_major"`        // device files: major device number
 	DevMinor     int64     `json:"dev_minor"`        // device files: minor device number
+	StoredStart  int64     `json:"stored_start"`     // offset in the uncompressed pack where the stored range starts
 	Target       string    `json:"target,omitempty"` // restore plans only: path below the restore target
 }
 
@@ -110,6 +111,7 @@ func NewEntry(name, typ string) Entry {
 		TreeFiles:    -1,
 		DevMajor:     -1,
 		DevMinor:     -1,
+		StoredStart:  -1,
 	}
 }
 
@@ -132,7 +134,7 @@ var columns = []string{
 	"md5", "link_target", "location", "offset", "codec", "stored_offset",
 	"stored_length", "stored_size", "stored_md5", "dedup_of", "version_id",
 	"run", "tree_size", "tree_files", "listing", "name_encoding", "action",
-	"dev_major", "dev_minor",
+	"dev_major", "dev_minor", "stored_start",
 }
 
 // planColumns are the columns of a restore plan.
@@ -221,6 +223,8 @@ func (e *Entry) value(col string) string {
 		return formatInt(e.DevMajor)
 	case "dev_minor":
 		return formatInt(e.DevMinor)
+	case "stored_start":
+		return formatInt(e.StoredStart)
 	case "target":
 		return e.Target
 	}
@@ -292,6 +296,8 @@ func (e *Entry) setField(col, v string) (err error) {
 		e.DevMajor, err = parseInt(v)
 	case "dev_minor":
 		e.DevMinor, err = parseInt(v)
+	case "stored_start":
+		e.StoredStart, err = parseInt(v)
 	case "target":
 		e.Target = v
 	}

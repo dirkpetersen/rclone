@@ -1,0 +1,177 @@
+//go:build unix
+
+package gda
+
+import (
+	"archive/tar"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/rclone/rclone/fs"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// smallFrames makes frames small enough for packs of a few files to
+// have several.
+func smallFrames(t *testing.T) {
+	oldMin, oldMax := packFrameMin, frameMax
+	packFrameMin, frameMax = 4096, 16384
+	t.Cleanup(func() { packFrameMin, frameMax = oldMin, oldMax })
+}
+
+// writeText writes a compressible file of size bytes.
+func writeText(t *testing.T, root, rel string, size int) {
+	t.Helper()
+	p := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+	line := "ACGTACGGTTACGATCGATCGGCTAGCTAGGCTA " + rel + "\n"
+	require.NoError(t, os.WriteFile(p, []byte(strings.Repeat(line, size/len(line)+1)[:size]), 0o644))
+}
+
+func writeRandom(t *testing.T, root, rel string, size int) {
+	t.Helper()
+	p := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+	data := make([]byte, size)
+	_, err := rand.Read(data)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p, data, 0o644))
+}
+
+func compressOptions() Options {
+	opt := testOptions()
+	opt.Compression = CodecZstd
+	opt.PackSize = 64 * 1024
+	opt.StandaloneMin = 40 * 1024
+	opt.RollupMax = 0
+	return opt
+}
+
+func TestBackupCompression(t *testing.T) {
+	fakeClock(t)
+	smallFrames(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	for _, name := range []string{"a.txt", "b.txt", "c.txt", "d.txt"} {
+		writeText(t, src, "text/"+name, 10000)
+	}
+	writeRandom(t, src, "random/a.bin", 10000)
+	writeRandom(t, src, "random/b.bin", 10000)
+	writeText(t, src, "big/reads.fastq", 50000)
+	writeText(t, src, "big/reads.fastq.gz", 50000)
+	l := runBackup(t, src, dst, compressOptions())
+	assert.Greater(t, l.Stats.CompressedFrom, l.Stats.PackBytes)
+
+	// Text is packed and compressed in several frames; each file's stored
+	// range is only the frames holding it.
+	text := readIndexFile(t, dst, "text")
+	var packSize int64
+	for name, e := range text {
+		assert.Equal(t, CodecZstd, e.Codec, name)
+		assert.True(t, strings.HasSuffix(e.Location, ".tar.zst"), name)
+		info, err := os.Stat(filepath.Join(dst, "text", e.Location))
+		require.NoError(t, err)
+		packSize = info.Size()
+		assert.LessOrEqual(t, e.StoredStart, e.Offset, name)
+		assert.Less(t, e.StoredLength, packSize, name)
+	}
+	assert.Less(t, packSize, int64(40000))
+
+	// Random data isn't worth compressing.
+	for name, e := range readIndexFile(t, dst, "random") {
+		assert.Equal(t, CodecNone, e.Codec, name)
+		assert.True(t, strings.HasSuffix(e.Location, ".tar"), name)
+	}
+
+	// A large text file is compressed on its own; a .gz one isn't.
+	big := readIndexFile(t, dst, "big")
+	assert.Equal(t, "reads.fastq.gda.zst", big["reads.fastq"].Location)
+	assert.Equal(t, CodecZstd, big["reads.fastq"].Codec)
+	assert.Less(t, big["reads.fastq"].StoredSize, int64(50000))
+	assert.Equal(t, "reads.fastq.gz", big["reads.fastq.gz"].Location)
+	assert.Equal(t, CodecNone, big["reads.fastq.gz"].Codec)
+
+	// The compressed pack is a standard zstd file holding a normal tar.
+	var names []string
+	for _, e := range text {
+		in, err := os.Open(filepath.Join(dst, "text", e.Location))
+		require.NoError(t, err)
+		dec, err := zstd.NewReader(in)
+		require.NoError(t, err)
+		tr := tar.NewReader(dec)
+		for {
+			hdr, err := tr.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			require.NoError(t, err)
+			names = append(names, hdr.Name)
+		}
+		dec.Close()
+		require.NoError(t, in.Close())
+		break
+	}
+	assert.Contains(t, names, "a.txt")
+
+	// Everything comes back through both kinds of fetch.
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), newDst(t, dst), target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+	one := DefaultRestoreOptions()
+	one.Paths = []string{"text/c.txt"}
+	other := t.TempDir()
+	st, err = StartRestore(context.Background(), newDst(t, dst), other, one)
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	want, _ := os.ReadFile(filepath.Join(src, "text/c.txt"))
+	got, _ := os.ReadFile(filepath.Join(other, "text/c.txt"))
+	assert.Equal(t, want, got)
+}
+
+func TestBrowseCompressed(t *testing.T) {
+	fakeClock(t)
+	smallFrames(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		writeText(t, src, name, 10000)
+	}
+	writeText(t, src, "big.fastq", 50000)
+	runBackup(t, src, dst, compressOptions())
+	b, err := NewBrowser(newDst(t, dst), "")
+	require.NoError(t, err)
+	entries, ok, err := b.List(context.Background(), "")
+	require.NoError(t, err)
+	require.True(t, ok)
+	for i := range entries {
+		l := &entries[i]
+		want, err := os.ReadFile(filepath.Join(src, l.LocalPath))
+		require.NoError(t, err)
+		for _, r := range [][2]int64{{0, l.Size - 1}, {5000, 5099}, {l.Size - 10, l.Size - 1}} {
+			in, err := b.Open(context.Background(), l, &fs.RangeOption{Start: r[0], End: r[1]})
+			require.NoError(t, err)
+			got, err := io.ReadAll(in)
+			require.NoError(t, err)
+			require.NoError(t, in.Close())
+			assert.True(t, bytes.Equal(want[r[0]:r[1]+1], got), "%s %v", l.Path, r)
+		}
+	}
+}
+
+func TestFrameCuts(t *testing.T) {
+	smallFrames(t)
+	// Cut at the first boundary after packFrameMin, and at frameMax when
+	// there is none.
+	assert.Equal(t, []int64{0}, frameCuts(1000, []int64{0, 500}))
+	assert.Equal(t, []int64{0, 5000, 10000}, frameCuts(12000, []int64{0, 3000, 5000, 7000, 10000}))
+	assert.Equal(t, []int64{0, 16384, 32768}, frameCuts(40000, []int64{0}))
+}

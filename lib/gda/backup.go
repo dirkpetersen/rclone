@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/rclone/rclone/fs"
 )
 
@@ -32,6 +33,8 @@ type Options struct {
 	RootLabel     string        // name used for the top directory in pack names; "" to derive it
 	LockTimeout   time.Duration // age after which another run's lock is taken over
 	Retries       int           // upload attempts per object
+	Compression   string        // CodecZstd to compress data where it helps, or CodecNone
+	Level         int           // zstd compression level, 1 to 22
 }
 
 // DefaultOptions returns the default options.
@@ -45,6 +48,8 @@ func DefaultOptions() Options {
 		Worker:        "w01",
 		LockTimeout:   24 * time.Hour,
 		Retries:       3,
+		Compression:   CodecZstd,
+		Level:         3,
 	}
 }
 
@@ -58,7 +63,8 @@ type Stats struct {
 	MetaOnly        int64 // entries whose metadata changed but not their data
 	Deleted         int64 // entries no longer in the source
 	Packs           int64 // packs uploaded
-	PackBytes       int64 // bytes in packs uploaded
+	PackBytes       int64 // bytes in packs uploaded, as stored
+	CompressedFrom  int64 // bytes of compressed packs and files before compression
 	Standalone      int64 // standalone objects uploaded
 	StandaloneBytes int64 // bytes in standalone objects uploaded
 	MetaObjects     int64 // changesets and index objects written
@@ -114,6 +120,8 @@ type backup struct {
 	errors          []string
 	dataTierChecked bool // whether the storage class of data uploads was checked
 	stopped         bool // whether the run was stopped by a fatal error
+
+	enc *zstd.Encoder // for compressing packs, nil if not compressing
 }
 
 // stop stops the run after the directory in progress.
@@ -140,6 +148,9 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	if opt.Retries < 1 {
 		opt.Retries = 1
 	}
+	if opt.Compression != CodecZstd && opt.Compression != CodecNone {
+		return nil, fmt.Errorf("unknown compression %q: use %s or %s", opt.Compression, CodecZstd, CodecNone)
+	}
 	srcRoot = filepath.Clean(srcRoot)
 	info, err := os.Stat(srcRoot)
 	if err != nil {
@@ -164,6 +175,12 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		runID:     NewRunID(started),
 		names:     newIDNames(),
 		summaries: map[string]*dirSummary{},
+	}
+	if opt.Compression == CodecZstd {
+		if b.enc, err = newEncoder(opt.Level); err != nil {
+			return nil, err
+		}
+		defer func() { _ = b.enc.Close() }()
 	}
 	if b.opt.RootLabel == "" {
 		// The last element of the destination path, or "root" when the
@@ -892,8 +909,31 @@ func (b *backup) uploadPack(ctx context.Context, key string, pw *packWriter, sto
 		b.errorf("finish pack %q: %v", pw.name, err)
 		return false
 	}
-	remote := joinRemote(key, pw.name)
-	if err := b.d.putFile(ctx, remote, pw.file.Name(), size, sum, b.opt.DataTier); err != nil {
+	name, file := pw.name, pw.file.Name()
+	if b.enc != nil {
+		sample, err := memberSample(file, pw.members)
+		if err != nil {
+			b.errorf("read pack %q: %v", pw.name, err)
+			return false
+		}
+		if worthCompressing(b.enc, sample) {
+			cPath, cSize, cSum, frames, err := compressFile(b.enc, file, b.opt.TempDir, size, frameCuts(size, pw.starts))
+			if err != nil {
+				b.errorf("compress pack %q: %v", pw.name, err)
+				return false
+			}
+			defer func() { _ = os.Remove(cPath) }()
+			b.count(func(s *Stats) *int64 { return &s.CompressedFrom }, size)
+			name, file, size, sum = pw.name+".zst", cPath, cSize, cSum
+			for i := range pw.members {
+				m := &pw.members[i]
+				m.Location, m.Codec = name, CodecZstd
+				storedRange(m, frames)
+			}
+		}
+	}
+	remote := joinRemote(key, name)
+	if err := b.d.putFile(ctx, remote, file, size, sum, b.opt.DataTier); err != nil {
 		b.errorf("upload pack %q: %v", remote, err)
 		return false
 	}
@@ -911,7 +951,19 @@ func (b *backup) uploadPack(ctx context.Context, key string, pw *packWriter, sto
 // storeStandalone uploads a large file as its own object, never
 // overwriting an existing object.
 func (b *backup) storeStandalone(ctx context.Context, key string, e *sourceEntry, stored map[string]Entry) bool {
+	compress, err := b.compressStandalone(e)
+	if err != nil {
+		b.errorf("read %q: %v", e.path, err)
+		return false
+	}
+	suffix := ""
+	if compress {
+		suffix = ".zst"
+	}
 	name := e.Name
+	if compress {
+		name += ".gda.zst"
+	}
 	remote := joinRemote(key, name)
 	exists, err := b.d.exists(ctx, remote)
 	if err != nil {
@@ -919,14 +971,21 @@ func (b *backup) storeStandalone(ctx context.Context, key string, e *sourceEntry
 		return false
 	}
 	if exists {
-		name = versionedName(e.Name, b.runID, b.opt.Worker)
+		name = versionedName(e.Name, b.runID, b.opt.Worker) + suffix
 		remote = joinRemote(key, name)
 	}
 	if keyTooLong(b.rootKey, remote) {
 		b.errorf("skipping %q: its key would be longer than %d bytes", e.path, maxKeyLength)
 		return true
 	}
-	sum, err := b.d.putSourceFile(ctx, remote, e, b.opt.DataTier)
+	var sum, storedSum string
+	storedSize := e.Size
+	if compress {
+		sum, storedSum, storedSize, err = b.d.putCompressed(ctx, remote, e, b.opt.DataTier, b.opt.Level)
+	} else {
+		sum, err = b.d.putSourceFile(ctx, remote, e, b.opt.DataTier)
+		storedSum = sum
+	}
 	if err != nil {
 		b.errorf("upload %q: %v", remote, err)
 		return false
@@ -950,14 +1009,72 @@ func (b *backup) storeStandalone(ctx context.Context, key string, e *sourceEntry
 	row := e.Entry
 	row.Location = name
 	row.Codec = CodecNone
+	if compress {
+		row.Codec = CodecZstd
+		b.count(func(s *Stats) *int64 { return &s.CompressedFrom }, e.Size)
+	}
 	row.MD5 = sum
-	row.StoredSize = e.Size
-	row.StoredMD5 = sum
+	row.StoredSize = storedSize
+	row.StoredMD5 = storedSum
 	row.Run = b.runID
 	stored[e.Name] = row
 	b.count(func(s *Stats) *int64 { return &s.Standalone }, 1)
-	b.count(func(s *Stats) *int64 { return &s.StandaloneBytes }, e.Size)
+	b.count(func(s *Stats) *int64 { return &s.StandaloneBytes }, storedSize)
 	return true
+}
+
+// compressStandalone returns true if the standalone file e should be
+// compressed: compression is on, the destination can take uploads of
+// unknown size, the file isn't in a compressed format by its name, and a
+// trial compression of its start saves enough.
+func (b *backup) compressStandalone(e *sourceEntry) (bool, error) {
+	if b.enc == nil || b.d.f.Features().PutStream == nil || isCompressedName(e.Name) {
+		return false, nil
+	}
+	sample, err := readStart(e.path, trialBytes)
+	if err != nil {
+		return false, err
+	}
+	return worthCompressing(b.enc, sample), nil
+}
+
+// memberSample returns data from the start of each file member of the
+// pack at p, up to trialBytes in all, so that tar headers and the
+// manifest, which always compress well, don't decide whether the files'
+// data is worth compressing.
+func memberSample(p string, members []Entry) (sample []byte, err error) {
+	in, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer fs.CheckClose(in, &err)
+	const perMember = 64 * 1024
+	for i := range members {
+		m := &members[i]
+		if m.Type != TypeFile || m.Size <= 0 {
+			continue
+		}
+		n := min(m.Size, perMember, trialBytes-int64(len(sample)))
+		if n <= 0 {
+			break
+		}
+		buf := make([]byte, n)
+		if _, err := in.ReadAt(buf, m.Offset); err != nil {
+			return nil, err
+		}
+		sample = append(sample, buf...)
+	}
+	return sample, nil
+}
+
+// readStart returns up to n bytes from the start of the file at p.
+func readStart(p string, n int64) (data []byte, err error) {
+	in, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer fs.CheckClose(in, &err)
+	return io.ReadAll(io.LimitReader(in, n))
 }
 
 // retireIndex marks every entry in the index at key as deleted and
