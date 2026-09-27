@@ -1318,7 +1318,7 @@ func (b *backup) linkedEntries(key string, entries []*sourceEntry, stored map[st
 		copyRow, ok := b.hardLinks[e.HardLink]
 		b.mu.Unlock()
 		switch {
-		case ok && copyRow.Size == e.Size:
+		case ok && sameLink(&copyRow, &e.Entry):
 			stored[e.Name] = dedupRow(key, e, copyRow, b.runID)
 		case first[e.HardLink]:
 			linked = append(linked, e)
@@ -1344,12 +1344,19 @@ func (b *backup) storeLinked(key string, linked []*sourceEntry, stored map[strin
 	}
 	for _, e := range linked {
 		row, ok := byLink[e.HardLink]
-		if !ok || row.Size != e.Size {
+		if !ok || !sameLink(&row, &e.Entry) {
 			// Not stored, so this link is left for the next run too.
 			continue
 		}
 		stored[e.Name] = dedupRow(key, e, fullRow(key, row), b.runID)
 	}
+}
+
+// sameLink returns true if the file e can be another link to the file
+// stored as row. Links to one file share its size, time and metadata; a
+// file which reuses the inode of one removed since has its own.
+func sameLink(row, e *Entry) bool {
+	return row.Size == e.Size && row.ModTime.Equal(e.ModTime) && sameMeta(row, e)
 }
 
 // recordLinks remembers where the files with several links in stored,

@@ -815,3 +815,16 @@ func TestBackupLedgerAtStart(t *testing.T) {
 	require.NotNil(t, ledger)
 	assert.True(t, ledger.Finished.IsZero())
 }
+
+func TestSameLink(t *testing.T) {
+	now := time.Now()
+	a := Entry{Type: TypeFile, Size: 10, ModTime: now, Mode: 0o644, HardLink: "1:2"}
+	b := a
+	assert.True(t, sameLink(&a, &b))
+	// A file reusing the inode of a removed one has its own time.
+	b.ModTime = now.Add(time.Second)
+	assert.False(t, sameLink(&a, &b))
+	b = a
+	b.Mode = 0o600
+	assert.False(t, sameLink(&a, &b))
+}

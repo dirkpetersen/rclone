@@ -374,3 +374,30 @@ func TestHardLinks(t *testing.T) {
 	assert.True(t, same("a/big.bin", "b/big2.bin"))
 	assert.False(t, same("a/x.dat", "a/big.bin"))
 }
+
+func TestLinkFilesNeedSameData(t *testing.T) {
+	target := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(target, "old"), []byte("old"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(target, "p"), []byte("new"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(target, "q"), []byte("new"), 0o644))
+	// An inode number reused for other data after old was deleted.
+	plan := []Entry{
+		{Name: "old", Target: "old", Type: TypeFile, Size: 3, MD5: "a", HardLink: "1:2"},
+		{Name: "p", Target: "p", Type: TypeFile, Size: 3, MD5: "b", HardLink: "1:2"},
+		{Name: "q", Target: "q", Type: TypeFile, Size: 3, MD5: "b", HardLink: "1:2"},
+	}
+	done := []bool{true, true, true}
+	failed := make([]bool, 3)
+	localPath := func(e *Entry) string { return filepath.Join(target, e.Target) }
+	linkFiles(plan, done, failed, false, localPath, func(format string, args ...any) { t.Errorf(format, args...) }, tempPattern("x"))
+	for name, want := range map[string]string{"old": "old", "p": "new", "q": "new"} {
+		got, err := os.ReadFile(filepath.Join(target, name))
+		require.NoError(t, err)
+		assert.Equal(t, want, string(got), name)
+	}
+	pi, _ := os.Stat(filepath.Join(target, "p"))
+	qi, _ := os.Stat(filepath.Join(target, "q"))
+	oi, _ := os.Stat(filepath.Join(target, "old"))
+	assert.True(t, os.SameFile(pi, qi))
+	assert.False(t, os.SameFile(pi, oi))
+}

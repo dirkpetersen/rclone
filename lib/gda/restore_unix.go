@@ -799,7 +799,7 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, ta
 		}
 	}
 
-	linkFiles(plan, done, failed, localPath, errorf, pattern)
+	linkFiles(plan, done, failed, overwrite, localPath, errorf, pattern)
 
 	// Symlinks and special files need no data.
 	for i := range plan {
@@ -881,8 +881,9 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, ta
 }
 
 // linkFiles makes the restored files which were links to the same file
-// when backed up into links to the same file again.
-func linkFiles(plan []Entry, done, failed []bool, localPath func(*Entry) string, errorf func(string, ...any), pattern string) {
+// when backed up into links to the same file again. Without overwrite,
+// files which were in place before the restore are left as they are.
+func linkFiles(plan []Entry, done, failed []bool, overwrite bool, localPath func(*Entry) string, errorf func(string, ...any), pattern string) {
 	groups := map[string][]int{}
 	var order []string
 	for i := range plan {
@@ -890,10 +891,13 @@ func linkFiles(plan []Entry, done, failed []bool, localPath func(*Entry) string,
 		if e.Type != TypeFile || e.HardLink == "" || !done[i] {
 			continue
 		}
-		if groups[e.HardLink] == nil {
-			order = append(order, e.HardLink)
+		// Rows recorded at different times may share an inode number
+		// reused by another file, so the data must match too.
+		link := fmt.Sprintf("%s %d %s", e.HardLink, e.Size, e.MD5)
+		if groups[link] == nil {
+			order = append(order, link)
 		}
-		groups[e.HardLink] = append(groups[e.HardLink], i)
+		groups[link] = append(groups[link], i)
 	}
 	for _, link := range order {
 		members := groups[link]
@@ -904,6 +908,9 @@ func linkFiles(plan []Entry, done, failed []bool, localPath func(*Entry) string,
 			continue
 		}
 		for _, i := range members[1:] {
+			if !overwrite && plan[i].Action == actionSkip {
+				continue
+			}
 			p := localPath(&plan[i])
 			if info, err := os.Lstat(p); err == nil && os.SameFile(firstInfo, info) {
 				continue
@@ -916,7 +923,12 @@ func linkFiles(plan []Entry, done, failed []bool, localPath func(*Entry) string,
 			if err == nil {
 				err = os.Rename(tmp, p)
 			}
-			if err != nil {
+			switch {
+			case errors.Is(err, syscall.EXDEV):
+				// Across file systems the copy has to do.
+				_ = os.Remove(tmp)
+				fs.Logf(plan[i].Target, "gda: can't link to %q on another file system, leaving a copy", plan[members[0]].Target)
+			case err != nil:
 				_ = os.Remove(tmp)
 				errorf("link %q to %q: %v", plan[i].Target, plan[members[0]].Target, err)
 				failed[i], done[i] = true, false
