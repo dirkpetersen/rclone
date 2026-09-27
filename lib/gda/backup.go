@@ -141,7 +141,7 @@ type backup struct {
 	enc *zstd.Encoder // for compressing packs, nil if not compressing
 
 	dirty   map[string]bool // for change runs, directories to process
-	newDirs map[string]bool // for change runs, directories new since the last run
+	newDirs map[string]bool // for change runs, tops of subtrees new since the last run, or to scan in full
 
 	dedup *dedupIndex // stored copies, nil if not deduplicating
 

@@ -189,21 +189,28 @@ func (b *backup) prevRow(ctx context.Context, t *tree, rel string) (*Entry, erro
 func (b *backup) markNew(rel string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for p := range b.summaries {
-		if p == rel || strings.HasPrefix(p, rel+"/") {
-			b.newDirs[p] = true
-		}
-	}
+	b.newDirs[rel] = true
 }
 
-// wanted returns true if a change run must process the directory at rel.
+// wanted returns true if a change run must process the directory at rel:
+// it is dirty, or it or a directory above it is new.
 func (b *backup) wanted(rel string) bool {
 	if b.dirty == nil {
 		return true
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.dirty[rel] || b.newDirs[rel]
+	if b.dirty[rel] {
+		return true
+	}
+	for p := rel; ; p = parentRel(p) {
+		if b.newDirs[p] {
+			return true
+		}
+		if p == "" {
+			return false
+		}
+	}
 }
 
 // backupChanges runs a change run: only directories affected by changes
