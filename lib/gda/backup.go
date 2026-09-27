@@ -377,7 +377,7 @@ func (b *backup) checkNotEmpty(ctx context.Context) error {
 		return err
 	}
 	if len(index) > 0 {
-		return fmt.Errorf("source %q is empty but the backup at %s isn't; check the source is mounted, or allow it with --allow-empty", b.srcRoot, fs.ConfigString(b.d.f))
+		return fmt.Errorf("source %q is empty but the backup isn't; check the source is mounted, or allow it with --allow-empty", b.srcRoot)
 	}
 	return nil
 }
