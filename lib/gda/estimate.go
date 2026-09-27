@@ -140,7 +140,16 @@ func LoadPrices(path string) (Prices, error) {
 	for path, tiers := range file.Egress {
 		prices.Egress[path] = tiers
 	}
-	for class, price := range file.Storage {
+	// A class keeps the defaults of the fields the file doesn't give.
+	var storage struct {
+		Storage map[string]json.RawMessage `json:"storage"`
+	}
+	_ = json.Unmarshal(data, &storage)
+	for class, raw := range storage.Storage {
+		price := prices.Storage[class]
+		if err := json.Unmarshal(raw, &price); err != nil {
+			return prices, fmt.Errorf("parse prices %q: %w", path, err)
+		}
 		prices.Storage[class] = price
 	}
 	return prices, nil

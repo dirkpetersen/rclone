@@ -122,10 +122,15 @@ func logLedger(ledger *libgda.Ledger) {
 	}
 	cost, ok := prices.EstimateBackup(s.Packs+s.Standalone, s.PackBytes+s.StandaloneBytes, s.MetaObjects, ledger.Options.DataTier, ledger.Options.MetaTier)
 	if !ok {
+		fs.Debugf(nil, "gda: no prices for storage class %s or %s, so no cost estimate", ledger.Options.DataTier, ledger.Options.MetaTier)
 		return
 	}
-	fs.Logf(nil, "gda: run %s: estimated cost %.2f %s for uploads, and %.2f %s per month to store the data it added, for at least %d days (prices of %s)",
-		ledger.RunID, float64(cost.Requests), cost.Currency, float64(cost.Monthly), cost.Currency, cost.MinDays, prices.Date)
+	minimum := ""
+	if cost.MinDays > 0 {
+		minimum = fmt.Sprintf(", for at least %d days", cost.MinDays)
+	}
+	fs.Logf(nil, "gda: run %s: estimated cost %.2f %s for uploads, and %.2f %s per month to store the data it added%s (prices of %s)",
+		ledger.RunID, float64(cost.Requests), cost.Currency, float64(cost.Monthly), cost.Currency, minimum, prices.Date)
 }
 
 // Command is 'rclone gda backup'.
@@ -223,8 +228,10 @@ are kept for the history.
 Each run logs an estimate of what it cost in upload requests and adds
 to the monthly storage bill, from the built in prices or !--prices!
 (see !rclone gda prices!); with !--dry-run! this estimates a backup
-before making it, counting data before compression, so as an upper
-bound. Metadata storage and the requests of reading indexes
+before making it, counting data before compression and
+deduplication, so as an upper bound. Uploads are counted as one request
+per object, which they are for packs when !--s3-upload-cutoff! is above
+!--pack-size!; each part of a multipart upload is charged too. Metadata storage and the requests of reading indexes
 are small and not counted.
 
 Runs are incremental: only new and changed files are uploaded, and
