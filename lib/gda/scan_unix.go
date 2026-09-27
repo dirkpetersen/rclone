@@ -3,7 +3,9 @@
 package gda
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/user"
@@ -147,6 +149,32 @@ func readDir(p string) ([]string, error) {
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+// readDirDirs returns the names of the subdirectories of the directory
+// at p, from the directory's own entry types where the file system
+// gives them, so without reading every entry's metadata.
+func readDirDirs(p string) (map[string]bool, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	dirs := map[string]bool{}
+	for {
+		entries, err := f.ReadDir(10000)
+		for _, e := range entries {
+			if e.IsDir() {
+				dirs[e.Name()] = true
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return dirs, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // sourcePath returns the source path of rel below root.

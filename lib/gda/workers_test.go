@@ -250,3 +250,55 @@ func TestBackupPartitionRetry(t *testing.T) {
 	_, err = BackupPartition(context.Background(), src, f, bad, runID, 0)
 	assert.ErrorContains(t, err, "invalid worker ID")
 }
+
+// smallStreams makes directories of more than a few entries be
+// committed in chunks.
+func smallStreams(t *testing.T, min, chunk int) {
+	oldMin, oldChunk := streamMin, streamChunk
+	streamMin, streamChunk = min, chunk
+	t.Cleanup(func() { streamMin, streamChunk = oldMin, oldChunk })
+}
+
+func TestBackupStreamed(t *testing.T) {
+	fakeClock(t)
+	src := parallelTree(t)
+	for i := range 12 {
+		writeFile(t, src, fmt.Sprintf("big/f%02d.dat", i), 100+i)
+	}
+	writeFile(t, src, "big/huge.bin", 9000)
+	writeFile(t, src, "big/sub/x.txt", 5)
+	serial, streamed := filepath.Join(t.TempDir(), "lab"), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 16
+	runBackup(t, src, serial, opt)
+	func() {
+		smallStreams(t, 5, 3)
+		old := maxIndexRows
+		maxIndexRows = 4
+		defer func() { maxIndexRows = old }()
+		runBackup(t, src, streamed, opt)
+
+		// Changes, deletions and additions across chunks.
+		writeFile(t, src, "big/f03.dat", 7)
+		require.NoError(t, os.Remove(filepath.Join(src, "big/f07.dat")))
+		writeFile(t, src, "big/f99.dat", 9)
+		writeFile(t, src, "big/a00.dat", 9)
+		l := runBackup(t, src, streamed, opt)
+		assert.Equal(t, int64(0), l.Stats.Errors)
+		assert.Equal(t, int64(2), l.Stats.Added)
+		assert.Equal(t, int64(1), l.Stats.Modified)
+		assert.Equal(t, int64(1), l.Stats.Deleted)
+		l = runBackup(t, src, streamed, opt)
+		assert.Zero(t, l.Stats.Added+l.Stats.Modified+l.Stats.Deleted+l.Stats.MetaOnly)
+	}()
+	serial2 := filepath.Join(t.TempDir(), "lab")
+	runBackup(t, src, serial2, opt)
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), newDst(t, streamed), target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+	entries, err := List(context.Background(), newDst(t, streamed), "big", "")
+	require.NoError(t, err)
+	assert.Len(t, entries, 15)
+}

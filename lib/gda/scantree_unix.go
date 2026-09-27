@@ -100,6 +100,10 @@ func (b *backup) scanTree(ctx context.Context, d *scanned, rel string, sem chan 
 		d.failed = true
 		return
 	}
+	if len(names) > streamMin && !d.mustRoll {
+		b.streamTree(ctx, d, rel, names, sem, ids)
+		return
+	}
 	var (
 		cur  []sourceEntry
 		keep = map[string]bool{}
