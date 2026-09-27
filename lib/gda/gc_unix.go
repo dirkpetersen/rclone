@@ -43,6 +43,7 @@ type GCOptions struct {
 	KeepHistory   time.Duration // history to keep; 0 keeps all of it
 	KeepFrom      string        // run from which to keep history, instead of KeepHistory
 	DeleteExpired bool          // remove data only history older than KeepHistory needs
+	Compact       bool          // mark the directories of compactable packs for the next backup to pack again
 }
 
 // GCReport describes the data objects of a GDA tree.
@@ -190,6 +191,11 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 	sort.Slice(r.Unknown, func(i, j int) bool { return r.Unknown[i].Key < r.Unknown[j].Key })
 	sort.Slice(r.StaleIndexes, func(i, j int) bool { return r.StaleIndexes[i].Key < r.StaleIndexes[j].Key })
 	sort.Slice(r.Compactable, func(i, j int) bool { return r.Compactable[i].Key < r.Compactable[j].Key })
+	if opt.Compact && len(r.Errors) == 0 {
+		if err := r.markCompactable(ctx, d); err != nil {
+			r.errorf("mark directories to pack again: %v", err)
+		}
+	}
 	if !opt.DeleteOrphans && !opt.DeleteExpired {
 		return r.GCReport, nil
 	}
@@ -235,6 +241,27 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		return r.GCReport, fmt.Errorf("gc finished with %d errors", len(r.Errors))
 	}
 	return r.GCReport, nil
+}
+
+// markCompactable marks the directories of the compactable packs which
+// no other directory refers to, for the next full backup to pack their
+// current files again from the source.
+func (r *gcScan) markCompactable(ctx context.Context, d *dest) error {
+	var dirs []string
+	for _, u := range r.Compactable {
+		if u.Shared {
+			continue
+		}
+		dir := path.Dir(u.Key)
+		if dir == "." {
+			dir = ""
+		}
+		dirs = append(dirs, dir)
+	}
+	if len(dirs) == 0 || d.dryRun {
+		return nil
+	}
+	return markRebase(ctx, d, dirs)
 }
 
 // deleteExpired removes the expired data, records from which run history

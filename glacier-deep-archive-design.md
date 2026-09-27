@@ -695,6 +695,42 @@ moves their `location`, then deletes the old pack.
   live file stay; rebasing gathers live files out of fragmented ones.
   Changesets stay, as they are small.
 
+### Expiring part of a pack
+
+Retention works per file version, but storage is per object, and a pack
+holds many files. With a one-year retention, a pack from last year may
+hold some files that were replaced or deleted more than a year ago, so
+have expired, and others that are still current, or were replaced less
+than a year ago. GDA never cuts files out of an archived pack:
+
+- **A pack is kept until nothing still needs any file in it.** A file
+  version is needed while it is current, or while it was replaced or
+  deleted within the retention period, and so is anything a `dedup_of`
+  in another directory points at. `gc --keep-history 365d` reports the
+  packs nobody needs, and `--delete-expired` removes them; a pack with
+  even one needed member stays whole.
+- **Files still current are moved out of mostly-dead packs by repacking
+  them from the source.** When `gc` finds packs at least 180 days old
+  whose current files are under half of their data, with at least 1 GiB
+  dead, `gc --compact` marks their directories, and the next backup packs
+  those directories' unchanged files again from the source (free to read,
+  one PUT per new pack), recording them as `rebase` rows. The current
+  index then points at the new packs, the old pack is only needed by
+  history, and it expires one retention period later.
+- **Files that are only in history are never moved.** Their bytes stay in
+  the old pack until they expire too, as rewriting them would mean a
+  restore.
+
+Why not extract the live files from the old pack? In Deep Archive that
+means a Bulk restore of the whole pack ($2.50 per TB plus requests), a
+temporary copy at the S3 Standard rate, a new PUT, and an early deletion
+charge if the pack is under 180 days old. Keeping dead bytes instead
+costs $0.00099 per GB-month, about $12 per TB per year, so waiting for
+the last member to expire, and repacking current files from the source
+when a directory is mostly dead, is cheaper in almost every case. On
+Ceph, where reads are free, extracting would be cheap, but repacking from
+the source is just as good and uses the same code.
+
 ## Commit protocol and crash safety
 
 Per directory, in order:

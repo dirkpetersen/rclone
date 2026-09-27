@@ -40,6 +40,7 @@ func init() {
 	flags.BoolVarP(flagSet, &jsonOut, "json", "", jsonOut, "Print the report as JSON", "")
 	flags.DurationVarP(flagSet, &opt.KeepHistory, "keep-history", "", opt.KeepHistory, "Keep history this far back, reporting data only older history needs (default all of it)", "")
 	flags.StringVarP(flagSet, &keepFrom, "keep-from", "", keepFrom, "Keep history from this run ID or RFC 3339 time, as --keep-history", "")
+	flags.BoolVarP(flagSet, &opt.Compact, "compact", "", opt.Compact, "Mark the directories of packs worth compacting for the next full backup to pack again", "")
 	flags.BoolVarP(flagSet, &opt.DeleteExpired, "delete-expired", "", opt.DeleteExpired, "Remove data only history older than --keep-history needs", "")
 	gda.Command.AddCommand(Command)
 }
@@ -69,6 +70,11 @@ history is kept, so that restoring or listing the tree as it was before
 then is refused rather than failing part way. Removing archived data
 younger than its minimum storage duration, 180 days for Deep Archive,
 is charged as if it had been kept that long.
+
+With !--compact!, the directories of the packs worth compacting are
+marked, and the next full backup packs their current files again from
+the source, so the old packs are only needed by history and expire with
+it. Files that are only in history stay where they are.
 
 With !--delete-orphans! it also removes the orphans and old index parts
 older than !--min-age!, holding the destination lock so that no backup

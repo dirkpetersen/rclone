@@ -157,6 +157,8 @@ type backup struct {
 
 	versioned bool // the destination keeps each version of an object under its key
 
+	rebaseDirs map[string]bool // directory keys gc marked to be packed again
+
 	hardLinks map[string]Entry // stored files with more than one link, by HardLink, located by full key
 }
 
@@ -195,6 +197,9 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		fs.Errorf(nil, "gda: not using the index cache: %v", err)
 	}
 	b.checkVersioned(ctx)
+	if b.rebaseDirs, err = readRebase(ctx, b.d); err != nil {
+		return nil, err
+	}
 	// A ledger without a finish time shows the run started, so even if
 	// it doesn't finish, other hosts' index caches see it wrote here.
 	if err := b.putLedger(ctx, ledger); err != nil {
@@ -211,6 +216,9 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	}
 	fs.Infof(nil, "gda: run %s: backing up %s to %s with %d workers", b.runID, b.srcRoot, destName(dst), b.opt.Workers)
 	b.scanAll(ctx)
+	if len(b.rebaseDirs) > 0 && !b.isStopped() && ctx.Err() == nil {
+		clearRebase(ctx, b.d)
+	}
 	ledger, err = b.finishLedger(ctx, ledger)
 	b.finishCache(ctx)
 	if b.dedup != nil {
@@ -1034,7 +1042,7 @@ func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, 
 			c.retire = append(c.retire, joinRemote(key, name))
 		}
 	}
-	rebase(c, cur, b.opt.PackSize)
+	rebase(c, cur, b.opt.PackSize, b.rebaseDirs[key])
 	return c
 }
 
@@ -1048,7 +1056,7 @@ var rebaseMaxPacks = 20
 // if they are spread over more than rebaseMaxPacks packs and more than
 // twice the packs of packSize they would fill. The old packs are kept,
 // as history refers to them.
-func rebase(c *dirChange, cur []sourceEntry, packSize int64) {
+func rebase(c *dirChange, cur []sourceEntry, packSize int64, force bool) {
 	isPacked := func(row *Entry) bool {
 		return row.Type == TypeFile && row.Size > 0 && row.Offset >= 0 && row.DedupOf == "" && row.Location != ""
 	}
@@ -1061,7 +1069,7 @@ func rebase(c *dirChange, cur []sourceEntry, packSize int64) {
 		}
 	}
 	needed := int((bytes + packSize - 1) / max(packSize, 1))
-	if len(packs) <= rebaseMaxPacks || len(packs) <= 2*needed {
+	if len(packs) == 0 || !force && (len(packs) <= rebaseMaxPacks || len(packs) <= 2*needed) {
 		return
 	}
 	source := make(map[string]*sourceEntry, len(cur))

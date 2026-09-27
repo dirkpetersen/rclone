@@ -1,10 +1,13 @@
 package gda
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/rclone/rclone/fs"
 )
@@ -63,4 +66,74 @@ func checkHistory(ctx context.Context, d *dest, at string) error {
 		return fmt.Errorf("history before run %s has been removed, so the tree can't be read as it was at %s", from, at)
 	}
 	return nil
+}
+
+// rebaseKey lists the directories gc marked for the next full backup to
+// pack again from the source, so their mostly dead packs can expire.
+var rebaseKey = joinRemote(MetaDir, "rebase.csv")
+
+// readRebase returns the directory keys marked for packing again.
+func readRebase(ctx context.Context, d *dest) (map[string]bool, error) {
+	dirs := map[string]bool{}
+	data, err := d.get(ctx, rebaseKey)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return dirs, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", rebaseKey, err)
+	}
+	records, err := csv.NewReader(bytes.NewReader(data)).ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("parse %q: %w", rebaseKey, err)
+	}
+	for i, r := range records {
+		if i > 0 && len(r) > 0 {
+			dirs[r[0]] = true
+		}
+	}
+	return dirs, nil
+}
+
+// markRebase adds dirs to the directories marked for packing again.
+func markRebase(ctx context.Context, d *dest, dirs []string) error {
+	marked, err := readRebase(ctx, d)
+	if err != nil {
+		return err
+	}
+	for _, dir := range dirs {
+		marked[dir] = true
+	}
+	all := make([]string, 0, len(marked))
+	for dir := range marked {
+		all = append(all, dir)
+	}
+	sort.Strings(all)
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	_ = w.Write([]string{"dir"})
+	for _, dir := range all {
+		_ = w.Write([]string{dir})
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return err
+	}
+	return d.putBytes(ctx, rebaseKey, buf.Bytes(), d.metaTier)
+}
+
+// clearRebase removes the marks, once a full backup has acted on them.
+func clearRebase(ctx context.Context, d *dest) {
+	if d.dryRun {
+		return
+	}
+	o, err := d.f.NewObject(ctx, rebaseKey)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return
+	}
+	if err == nil {
+		err = o.Remove(ctx)
+	}
+	if err != nil {
+		fs.Errorf(nil, "gda: remove %q: %v", rebaseKey, err)
+	}
 }
