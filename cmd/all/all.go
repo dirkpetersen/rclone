@@ -31,6 +31,7 @@ import (
 	_ "github.com/rclone/rclone/cmd/gda"
 	_ "github.com/rclone/rclone/cmd/gda/backup"
 	_ "github.com/rclone/rclone/cmd/gda/ls"
+	_ "github.com/rclone/rclone/cmd/gda/prices"
 	_ "github.com/rclone/rclone/cmd/gda/restore"
 	_ "github.com/rclone/rclone/cmd/genautocomplete"
 	_ "github.com/rclone/rclone/cmd/gendocs"
