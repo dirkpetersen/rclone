@@ -5,6 +5,8 @@ package gda
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -26,12 +28,75 @@ import (
 var dedupDir = joinRemote(MetaDir, "dedup")
 
 // dedupIndex finds stored copies by size and MD5. It is safe for
-// concurrent use.
+// concurrent use. It can hold many millions of copies, so it keeps only
+// what a reference to a copy needs, and shares repeated strings.
 type dedupIndex struct {
-	mu    sync.Mutex
-	bySum map[string]Entry // by dedupName
-	sizes map[int64]bool   // sizes of stored copies
-	added []Entry          // copies stored by this run
+	mu      sync.Mutex
+	bySum   map[dedupKey]dedupCopy
+	sizes   map[int64]struct{} // sizes of stored copies
+	strings map[string]string  // one copy of each location and codec
+	added   []Entry            // copies stored by this run
+}
+
+// dedupKey identifies content by its MD5 and size.
+type dedupKey struct {
+	md5  [md5.Size]byte
+	size int64
+}
+
+// dedupCopy is where a copy is stored: the fields of its row which a
+// reference to it copies.
+type dedupCopy struct {
+	location, codec, storedMD5                      string
+	offset, storedOffset, storedLength, storedStart int64
+	storedSize                                      int64
+}
+
+// keyOf returns the key of content with md5sum and size, or false if
+// md5sum isn't a hex MD5.
+func keyOf(md5sum string, size int64) (dedupKey, bool) {
+	k := dedupKey{size: size}
+	n, err := hex.Decode(k.md5[:], []byte(md5sum))
+	return k, err == nil && n == md5.Size
+}
+
+// intern returns the shared copy of s. It must be called with idx.mu
+// held.
+func (idx *dedupIndex) intern(s string) string {
+	if shared, ok := idx.strings[s]; ok {
+		return shared
+	}
+	s = strings.Clone(s)
+	idx.strings[s] = s
+	return s
+}
+
+// put records row, whose location is a full key, as a stored copy,
+// unless one is recorded already. It must be called with idx.mu held.
+func (idx *dedupIndex) put(row *Entry) bool {
+	k, ok := keyOf(row.MD5, row.Size)
+	if !ok {
+		return false
+	}
+	if _, ok := idx.bySum[k]; ok {
+		return false
+	}
+	idx.bySum[k] = dedupCopy{
+		location:     idx.intern(row.Location),
+		codec:        idx.intern(row.Codec),
+		storedMD5:    strings.Clone(row.StoredMD5),
+		offset:       row.Offset,
+		storedOffset: row.StoredOffset,
+		storedLength: row.StoredLength,
+		storedStart:  row.StoredStart,
+		storedSize:   row.StoredSize,
+	}
+	idx.sizes[row.Size] = struct{}{}
+	return true
+}
+
+func newDedupIndex() *dedupIndex {
+	return &dedupIndex{bySum: map[dedupKey]dedupCopy{}, sizes: map[int64]struct{}{}, strings: map[string]string{}}
 }
 
 // dedupName is the key of a copy in the dedup index.
@@ -41,7 +106,7 @@ func dedupName(md5sum string, size int64) string {
 
 // loadDedup reads the dedup index of the destination.
 func loadDedup(ctx context.Context, d *dest) (*dedupIndex, error) {
-	idx := &dedupIndex{bySum: map[string]Entry{}, sizes: map[int64]bool{}}
+	idx := newDedupIndex()
 	entries, err := d.f.List(ctx, dedupDir)
 	if errors.Is(err, fs.ErrorDirNotFound) {
 		return idx, nil
@@ -50,23 +115,31 @@ func loadDedup(ctx context.Context, d *dest) (*dedupIndex, error) {
 		return nil, fmt.Errorf("list dedup index: %w", err)
 	}
 	for _, entry := range entries {
-		if _, ok := entry.(fs.Object); !ok || path.Ext(entry.Remote()) != ".csv" {
+		o, ok := entry.(fs.Object)
+		if !ok || path.Ext(o.Remote()) != ".csv" {
 			continue
 		}
-		data, err := d.get(ctx, entry.Remote())
-		if err != nil {
-			return nil, fmt.Errorf("read dedup index: %w", err)
-		}
-		rows, err := ReadEntries(bytes.NewReader(data))
-		if err != nil {
-			return nil, fmt.Errorf("parse dedup index %q: %w", entry.Remote(), err)
-		}
-		for _, row := range rows {
-			idx.bySum[row.Name] = row
-			idx.sizes[row.Size] = true
+		if err := idx.load(ctx, o); err != nil {
+			return nil, fmt.Errorf("read dedup index %q: %w", o.Remote(), err)
 		}
 	}
 	return idx, nil
+}
+
+// load adds the copies listed in the dedup index file o, reading it as
+// a stream, as it can be large.
+func (idx *dedupIndex) load(ctx context.Context, o fs.Object) (err error) {
+	in, err := o.Open(ctx)
+	if err != nil {
+		return err
+	}
+	defer fs.CheckClose(in, &err)
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	return readEntriesFunc(in, func(row *Entry) error {
+		idx.put(row)
+		return nil
+	})
 }
 
 // mayHave returns true if a copy of this size is stored, so a file of
@@ -74,15 +147,28 @@ func loadDedup(ctx context.Context, d *dest) (*dedupIndex, error) {
 func (idx *dedupIndex) mayHave(size int64) bool {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	return idx.sizes[size]
+	_, ok := idx.sizes[size]
+	return ok
 }
 
 // find returns the stored copy of content with md5sum and size.
 func (idx *dedupIndex) find(md5sum string, size int64) (Entry, bool) {
+	k, ok := keyOf(md5sum, size)
+	if !ok {
+		return Entry{}, false
+	}
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	row, ok := idx.bySum[dedupName(md5sum, size)]
-	return row, ok
+	c, ok := idx.bySum[k]
+	idx.mu.Unlock()
+	if !ok {
+		return Entry{}, false
+	}
+	row := NewEntry(dedupName(md5sum, size), TypeFile)
+	row.Size, row.MD5 = size, md5sum
+	row.Location, row.Codec, row.StoredMD5 = c.location, c.codec, c.storedMD5
+	row.Offset, row.StoredOffset, row.StoredLength, row.StoredStart = c.offset, c.storedOffset, c.storedLength, c.storedStart
+	row.StoredSize = c.storedSize
+	return row, true
 }
 
 // add records the copy in row, stored in the directory at key.
@@ -96,12 +182,9 @@ func (idx *dedupIndex) add(key string, row Entry) {
 	copyRow.Action, copyRow.Target, copyRow.DedupOf = "", "", ""
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	if _, ok := idx.bySum[copyRow.Name]; ok {
-		return
+	if idx.put(&copyRow) {
+		idx.added = append(idx.added, copyRow)
 	}
-	idx.bySum[copyRow.Name] = copyRow
-	idx.sizes[copyRow.Size] = true
-	idx.added = append(idx.added, copyRow)
 }
 
 // save writes the copies stored by this run.
