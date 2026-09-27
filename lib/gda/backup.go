@@ -756,7 +756,7 @@ func (b *backup) rollupEligible(rel string) bool {
 // eligible returns true if a subtree with summary s could be packed as
 // one unit.
 func (b *backup) eligible(s *dirSummary) bool {
-	return b.opt.RollupMax > 0 && s != nil && s.treeSize < b.opt.RollupMax &&
+	return b.opt.RollupMax > 0 && s != nil && s.treeSize < b.opt.RollupMax && s.treeFiles <= int64(streamMin) &&
 		!s.standalone && !s.unreadable && !s.badName && !s.noRollup
 }
 
@@ -818,7 +818,7 @@ func (b *backup) commitEntries(ctx context.Context, w, rel, key string, cur []so
 	for i := range prevEntries {
 		prev[prevEntries[i].Name] = &prevEntries[i]
 	}
-	change := b.compare(key, prev, cur, keep)
+	change := b.compare(key, prev, cur, keep, true)
 	b.commitDir(ctx, w, rel, key, prevEntries, change)
 	return change.recurse
 }
@@ -943,7 +943,7 @@ func dirMetaChanged(cur, prev *Entry) bool {
 }
 
 // compare works out what changed in a directory since its previous index.
-func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, keep map[string]bool) *dirChange {
+func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, keep map[string]bool, rebaseOK bool) *dirChange {
 	c := &dirChange{}
 	seen := make(map[string]bool, len(cur))
 	for i := range cur {
@@ -1042,7 +1042,9 @@ func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, 
 			c.retire = append(c.retire, joinRemote(key, name))
 		}
 	}
-	rebase(c, cur, b.opt.PackSize, b.rebaseDirs[key])
+	if rebaseOK {
+		rebase(c, cur, b.opt.PackSize, b.rebaseDirs[key])
+	}
 	return c
 }
 

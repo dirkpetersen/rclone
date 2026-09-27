@@ -256,10 +256,16 @@ func TestRandomHistory(t *testing.T) {
 	for seed := int64(1); seed <= 6; seed++ {
 		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
 			fakeClock(t)
-			oldRebase := rebaseMaxPacks
+			oldRebase, oldRows := rebaseMaxPacks, maxIndexRows
 			rebaseMaxPacks = 2
-			t.Cleanup(func() { rebaseMaxPacks = oldRebase })
+			t.Cleanup(func() { rebaseMaxPacks, maxIndexRows = oldRebase, oldRows })
 			r := rand.New(rand.NewSource(seed))
+			if r.Intn(3) == 0 {
+				// Directories of more than a few entries are committed
+				// in chunks, and their indexes split.
+				smallStreams(t, 3+r.Intn(5), 1+r.Intn(4))
+				maxIndexRows = 2 + r.Intn(4)
+			}
 			// Odd seeds use an object store, where an object and a
 			// directory can have the same name, as they can after a file
 			// is replaced by a directory; even seeds a file system,
@@ -430,6 +436,9 @@ func TestRandomFailures(t *testing.T) {
 		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
 			fakeClock(t)
 			r := rand.New(rand.NewSource(seed))
+			if r.Intn(3) == 0 {
+				smallStreams(t, 3+r.Intn(5), 1+r.Intn(4))
+			}
 			src := t.TempDir()
 			f := newDst(t, fmt.Sprintf(":memory:failures%d/lab", seed))
 			m := &mutator{t: t, r: r, root: src, clock: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
