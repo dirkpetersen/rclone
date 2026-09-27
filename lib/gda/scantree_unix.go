@@ -42,6 +42,12 @@ type scanned struct {
 
 // scanAll backs up the whole source in a single pass.
 func (b *backup) scanAll(ctx context.Context) {
+	b.scanFrom(ctx, "", "")
+}
+
+// scanFrom backs up the subtree at rel, whose destination key is key, in
+// a single pass. Its parent, if it has one, mustn't be rolled up.
+func (b *backup) scanFrom(ctx context.Context, rel, key string) {
 	ids := make(chan string, b.opt.Workers)
 	for i := range b.opt.Workers {
 		ids <- b.workerID(i)
@@ -50,11 +56,11 @@ func (b *backup) scanAll(ctx context.Context) {
 	if b.opt.Workers > 1 {
 		sem = make(chan struct{}, b.opt.Workers-1)
 	}
-	root := &scanned{}
-	b.scanTree(ctx, root, "", sem, ids)
+	root := &scanned{key: key}
+	b.scanTree(ctx, root, rel, sem, ids)
 	if root.pending {
-		// The whole tree is small enough to be packed as one unit.
-		b.commitWith(ctx, ids, "", "", root.entries, root.keep)
+		// The whole subtree is small enough to be packed as one unit.
+		b.commitWith(ctx, ids, rel, key, root.entries, root.keep)
 	}
 }
 
