@@ -10,6 +10,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -70,6 +71,10 @@ func (d *dest) put(ctx context.Context, remote string, size int64, modTime time.
 	return err
 }
 
+// putOnce makes one upload attempt.
+//
+// TODO: each attempt is a new transfer in the stats, so retried uploads
+// are counted more than once.
 func (d *dest) putOnce(ctx context.Context, remote string, size int64, modTime time.Time, md5sum, tier string, open func() (io.ReadCloser, error)) (err error) {
 	in, err := open()
 	if err != nil {
@@ -190,9 +195,9 @@ func (d *dest) readIndex(ctx context.Context, dirKey string) ([]Entry, error) {
 	return entries, nil
 }
 
-// writeIndex writes the index of the directory at dirKey.
-func (d *dest) writeIndex(ctx context.Context, dirKey string, entries []Entry) error {
-	objects, err := encodeIndex(entries, maxIndexRows)
+// writeIndex writes the index of the directory at dirKey for run runID.
+func (d *dest) writeIndex(ctx context.Context, dirKey string, entries []Entry, runID string) error {
+	objects, err := encodeIndex(entries, maxIndexRows, runID)
 	if err != nil {
 		return err
 	}
@@ -208,11 +213,32 @@ func (d *dest) writeIndex(ctx context.Context, dirKey string, entries []Entry) e
 	return d.putBytes(ctx, joinRemote(dirKey, IndexName), objects[IndexName], d.metaTier)
 }
 
-// writeEntries writes entries as a CSV object at remote.
-func (d *dest) writeEntries(ctx context.Context, remote string, entries []Entry) error {
+// writeEntries writes the columns cols of entries as a CSV object at remote.
+func (d *dest) writeEntries(ctx context.Context, remote string, entries []Entry, cols []string) error {
 	var buf bytes.Buffer
-	if err := WriteEntries(&buf, entries); err != nil {
+	if err := writeColumns(&buf, entries, cols); err != nil {
 		return err
 	}
 	return d.putBytes(ctx, remote, buf.Bytes(), d.metaTier)
+}
+
+// checkTier checks that the object at remote was stored with the storage
+// class want, for backends which report one. Remote configuration, such
+// as the s3 storage_class option, can override the class GDA asks for.
+func (d *dest) checkTier(ctx context.Context, remote, want string) error {
+	if d.dryRun || want == "" {
+		return nil
+	}
+	o, err := d.f.NewObject(ctx, remote)
+	if err != nil {
+		return err
+	}
+	tierer, ok := o.(fs.GetTierer)
+	if !ok || !d.f.Features().GetTier {
+		return nil
+	}
+	if got := tierer.GetTier(); !strings.EqualFold(got, want) {
+		return fmt.Errorf("%q was stored as %s, not %s: remove storage_class from the destination remote's configuration", remote, got, want)
+	}
+	return nil
 }

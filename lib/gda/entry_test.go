@@ -69,6 +69,10 @@ func TestEncodeName(t *testing.T) {
 	assert.Equal(t, "plain.txt", name)
 	assert.Equal(t, "", enc)
 
+	name, enc = encodeName("100%.txt")
+	assert.Equal(t, NameEncodingPercent, enc)
+	assert.NotEqual(t, "100%.txt", name)
+
 	raw := "bad\xffname%"
 	name, enc = encodeName(raw)
 	assert.Equal(t, NameEncodingPercent, enc)
@@ -87,7 +91,7 @@ func TestIsReserved(t *testing.T) {
 	}{
 		{"file.txt", false, false},
 		{IndexName, false, true},
-		{"gda-index.00001.csv", false, true},
+		{"gda-index.20260926T120000Z.00001.csv", false, true},
 		{"x.gda.20260926T120000Z.w01.001.tar", false, true},
 		{"x.gda.20260926T120000Z.csv", false, true},
 		{MetaDir, true, true},
@@ -102,19 +106,19 @@ func TestEncodeIndexSplit(t *testing.T) {
 	for _, name := range []string{"e", "a", "d", "b", "c"} {
 		entries = append(entries, NewEntry(name, TypeFile))
 	}
-	objects, err := encodeIndex(entries, 2)
+	objects, err := encodeIndex(entries, 2, "20260926T120000Z")
 	require.NoError(t, err)
 	require.Len(t, objects, 4)
 	assert.True(t, isTOC(objects[IndexName]))
 	parts, err := readTOC(bytes.NewReader(objects[IndexName]))
 	require.NoError(t, err)
 	assert.Equal(t, []indexPart{
-		{name: "gda-index.00001.csv", first: "a", last: "b", rows: 2},
-		{name: "gda-index.00002.csv", first: "c", last: "d", rows: 2},
-		{name: "gda-index.00003.csv", first: "e", last: "e", rows: 1},
+		{name: "gda-index.20260926T120000Z.00001.csv", first: "a", last: "b", rows: 2},
+		{name: "gda-index.20260926T120000Z.00002.csv", first: "c", last: "d", rows: 2},
+		{name: "gda-index.20260926T120000Z.00003.csv", first: "e", last: "e", rows: 1},
 	}, parts)
 
-	objects, err = encodeIndex(entries, 10)
+	objects, err = encodeIndex(entries, 10, "20260926T120000Z")
 	require.NoError(t, err)
 	require.Len(t, objects, 1)
 	assert.False(t, isTOC(objects[IndexName]))

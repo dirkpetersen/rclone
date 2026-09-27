@@ -12,11 +12,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/rclone/rclone/fs"
 )
@@ -97,7 +96,7 @@ type dirSummary struct {
 	treeFiles  int64 // non-directory entries
 	standalone bool  // holds a file of at least StandaloneMin
 	unreadable bool  // couldn't be read in full
-	badName    bool  // holds a name which is not valid UTF-8
+	badName    bool  // holds a name which needs encoding, so can't be rolled up
 }
 
 // backup is the state of one run.
@@ -110,9 +109,24 @@ type backup struct {
 	names     *idNames
 	summaries map[string]*dirSummary // by source path relative to srcRoot
 
-	mu     sync.Mutex
-	stats  Stats
-	errors []string
+	mu              sync.Mutex
+	stats           Stats
+	errors          []string
+	dataTierChecked bool // whether the storage class of data uploads was checked
+	stopped         bool // whether the run was stopped by a fatal error
+}
+
+// stop stops the run after the directory in progress.
+func (b *backup) stop() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stopped = true
+}
+
+func (b *backup) isStopped() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.stopped
 }
 
 // Backup backs up the directory tree at srcRoot to dst.
@@ -126,6 +140,7 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	if opt.Retries < 1 {
 		opt.Retries = 1
 	}
+	srcRoot = filepath.Clean(srcRoot)
 	info, err := os.Stat(srcRoot)
 	if err != nil {
 		return nil, err
@@ -151,9 +166,11 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		summaries: map[string]*dirSummary{},
 	}
 	if b.opt.RootLabel == "" {
+		// The last element of the destination path, or "root" when the
+		// destination is a bucket or file system root.
 		b.opt.RootLabel = "root"
-		if base := path.Base(b.rootKey); b.rootKey != "" && base != "." && base != "/" {
-			b.opt.RootLabel = base
+		if i := strings.LastIndexByte(b.rootKey, '/'); i >= 0 && i < len(b.rootKey)-1 {
+			b.opt.RootLabel = b.rootKey[i+1:]
 		}
 	}
 	host, _ := os.Hostname()
@@ -192,6 +209,9 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	b.summarize("")
 	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, fs.ConfigString(dst))
 	b.processDir(ctx, "", "", b.isRollupRoot(""))
+	if b.isStopped() {
+		fs.Errorf(nil, "gda: run %s stopped early", b.runID)
+	}
 
 	ledger.Finished = time.Now().UTC()
 	ledger.Stats = b.stats
@@ -260,7 +280,23 @@ func (b *backup) lock(ctx context.Context, host string) error {
 	if err != nil {
 		return err
 	}
-	return b.d.putBytes(ctx, lockKey, data, b.opt.MetaTier)
+	if err := b.d.putBytes(ctx, lockKey, data, b.opt.MetaTier); err != nil {
+		return err
+	}
+	if b.d.dryRun {
+		return nil
+	}
+	// Writing the lock isn't atomic, so check that another run which
+	// started at the same moment didn't overwrite it.
+	data, err = b.d.get(ctx, lockKey)
+	if err != nil {
+		return fmt.Errorf("read lock back: %w", err)
+	}
+	var held lockInfo
+	if err := json.Unmarshal(data, &held); err != nil || held.RunID != b.runID || held.Host != host {
+		return fmt.Errorf("destination lock was taken by run %s on %s", held.RunID, held.Host)
+	}
+	return b.d.checkTier(ctx, lockKey, b.opt.MetaTier)
 }
 
 // unlock removes the destination lock.
@@ -289,7 +325,7 @@ func (b *backup) summarize(rel string) *dirSummary {
 	}
 	for _, name := range names {
 		childRel := joinRemote(rel, name)
-		if !utf8.ValidString(name) {
+		if _, encoding := encodeName(name); encoding != "" {
 			s.badName = true
 		}
 		info, err := os.Lstat(sourcePath(b.srcRoot, childRel))
@@ -360,15 +396,15 @@ type childDir struct {
 // processDir backs up the directory at rel, whose destination key is key.
 // If rollup is set, the whole subtree is packed as one unit.
 func (b *backup) processDir(ctx context.Context, rel, key string, rollup bool) {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || b.isStopped() {
 		return
 	}
-	b.count(func(s *Stats) *int64 { return &s.IndexedDirs }, 1)
 	prevEntries, err := b.d.readIndex(ctx, key)
 	if err != nil {
 		b.errorf("%v", err)
 		return
 	}
+	b.count(func(s *Stats) *int64 { return &s.IndexedDirs }, 1)
 	prev := make(map[string]Entry, len(prevEntries))
 	for _, e := range prevEntries {
 		prev[e.Name] = e
@@ -379,11 +415,7 @@ func (b *backup) processDir(ctx context.Context, rel, key string, rollup bool) {
 		return
 	}
 	change := b.compare(key, prev, cur, keep)
-	if b.commitDir(ctx, rel, key, prevEntries, change) {
-		for _, childKey := range change.retire {
-			b.retireIndex(ctx, childKey)
-		}
-	}
+	b.commitDir(ctx, rel, key, prevEntries, change)
 	for _, child := range change.recurse {
 		b.processDir(ctx, child.rel, child.key, b.isRollupRoot(child.rel))
 	}
@@ -401,7 +433,9 @@ func (b *backup) collect(rel, key string, rollup bool) (cur []sourceEntry, keep 
 	for _, name := range names {
 		childRel := joinRemote(rel, name)
 		encName, encoding := encodeName(name)
-		if !rollup && isReserved(name, rel == "") {
+		// Checked inside rollups too, so that the same files are skipped
+		// whether or not their subtree is rolled up.
+		if isReserved(name, rel == "") {
 			fs.Logf(nil, "gda: skipping %q: name is reserved for GDA's own objects", childRel)
 			b.count(func(s *Stats) *int64 { return &s.Skipped }, 1)
 			continue
@@ -413,6 +447,7 @@ func (b *backup) collect(rel, key string, rollup bool) (cur []sourceEntry, keep 
 			continue
 		}
 		e.NameEncoding = encoding
+		e.rel = childRel
 		if !e.IsDir() {
 			cur = append(cur, e)
 			continue
@@ -442,7 +477,8 @@ func (b *backup) collect(rel, key string, rollup bool) (cur []sourceEntry, keep 
 			continue
 		}
 		childKey := joinRemote(key, encName)
-		if keyTooLong(b.rootKey, joinRemote(childKey, packName(dirLabel(childKey, b.opt.RootLabel), b.runID, b.opt.Worker, 999)+".csv")) {
+		// The longest key this directory produces is a pack's manifest name.
+		if keyTooLong(b.rootKey, joinRemote(childKey, packName(dirLabel(childKey, b.opt.RootLabel), b.runID, b.opt.Worker, 99999)+".csv")) {
 			b.errorf("skipping directory %q: its keys would be longer than %d bytes", childRel, maxKeyLength)
 			keep[encName] = true
 			continue
@@ -475,6 +511,14 @@ func changeRow(e Entry, action string) Entry {
 	return e
 }
 
+// dirMetaChanged returns true if a directory row differs from its
+// previous row in anything but its data location.
+func dirMetaChanged(cur, prev *Entry) bool {
+	return !sameMeta(cur, prev) || !cur.ModTime.Equal(prev.ModTime) ||
+		cur.TreeSize != prev.TreeSize || cur.TreeFiles != prev.TreeFiles ||
+		cur.Listing != prev.Listing
+}
+
 // compare works out what changed in a directory since its previous index.
 func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, keep map[string]bool) *dirChange {
 	c := &dirChange{}
@@ -483,34 +527,38 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 		e := &cur[i]
 		seen[e.Name] = true
 		p, had := prev[e.Name]
+		if had && p.IsDir() && !e.IsDir() && p.Listing == ListingIndex && isDirectChild(e.Name) {
+			// A directory with its own index was replaced by something else.
+			c.retire = append(c.retire, joinRemote(key, e.Name))
+		}
 		if e.IsDir() {
 			row := e.Entry
+			stored := false
 			switch {
-			case !had:
-				c.changes = append(c.changes, changeRow(row, ActionAdd))
-				b.count(func(s *Stats) *int64 { return &s.Added }, 1)
-				if row.Listing == ListingRollup {
-					c.store = append(c.store, e)
+			case !had || p.Type != TypeDir:
+				action := ActionAdd
+				if had {
+					action = ActionModify
 				}
-			case p.Type != TypeDir:
-				c.changes = append(c.changes, changeRow(row, ActionModify))
-				b.count(func(s *Stats) *int64 { return &s.Modified }, 1)
+				c.changes = append(c.changes, changeRow(row, action))
 				if row.Listing == ListingRollup {
+					// Packed so that plain tar recreates the directory.
 					c.store = append(c.store, e)
+					stored = true
 				}
 			default:
 				row.Location, row.Offset, row.Codec, row.Run = p.Location, p.Offset, p.Codec, p.Run
+				if dirMetaChanged(&row, &p) {
+					c.changes = append(c.changes, changeRow(row, ActionMeta))
+				}
 				if p.Listing == ListingIndex && row.Listing == ListingRollup {
 					c.retire = append(c.retire, joinRemote(key, e.Name))
 				}
 			}
 			if row.Listing == ListingIndex {
-				c.recurse = append(c.recurse, childDir{
-					rel: b.childRel(key, e),
-					key: joinRemote(key, e.Name),
-				})
+				c.recurse = append(c.recurse, childDir{rel: e.rel, key: joinRemote(key, e.Name)})
 			}
-			if len(c.store) == 0 || c.store[len(c.store)-1] != e {
+			if !stored {
 				c.index = append(c.index, row)
 			}
 			continue
@@ -519,11 +567,10 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 		case !had:
 			c.changes = append(c.changes, changeRow(e.Entry, ActionAdd))
 			c.store = append(c.store, e)
-			b.count(func(s *Stats) *int64 { return &s.Added }, 1)
-		case p.Type != e.Type || e.Size != p.Size || e.LinkTarget != p.LinkTarget:
+		case p.Type != e.Type || e.Size != p.Size || e.LinkTarget != p.LinkTarget ||
+			e.DevMajor != p.DevMajor || e.DevMinor != p.DevMinor:
 			c.changes = append(c.changes, changeRow(e.Entry, ActionModify))
 			c.store = append(c.store, e)
-			b.count(func(s *Stats) *int64 { return &s.Modified }, 1)
 		case e.Type == TypeFile && !e.ModTime.Equal(p.ModTime):
 			sum, err := hashFile(e.path)
 			if err != nil {
@@ -534,21 +581,17 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 			if sum != p.MD5 {
 				c.changes = append(c.changes, changeRow(e.Entry, ActionModify))
 				c.store = append(c.store, e)
-				b.count(func(s *Stats) *int64 { return &s.Modified }, 1)
 				continue
 			}
 			row := withMeta(p, &e.Entry)
 			c.changes = append(c.changes, changeRow(row, ActionMeta))
 			c.index = append(c.index, row)
-			b.count(func(s *Stats) *int64 { return &s.MetaOnly }, 1)
 		case !sameMeta(&e.Entry, &p) || !e.ModTime.Equal(p.ModTime):
 			row := withMeta(p, &e.Entry)
 			c.changes = append(c.changes, changeRow(row, ActionMeta))
 			c.index = append(c.index, row)
-			b.count(func(s *Stats) *int64 { return &s.MetaOnly }, 1)
 		default:
 			c.index = append(c.index, p)
-			b.count(func(s *Stats) *int64 { return &s.Unchanged }, 1)
 		}
 	}
 	for name, p := range prev {
@@ -560,7 +603,6 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 			continue
 		}
 		c.changes = append(c.changes, changeRow(p, ActionDelete))
-		b.count(func(s *Stats) *int64 { return &s.Deleted }, 1)
 		if p.IsDir() && p.Listing == ListingIndex && isDirectChild(name) {
 			c.retire = append(c.retire, joinRemote(key, name))
 		}
@@ -586,28 +628,6 @@ func nextSlash(s string, i int) int {
 	return i + 1 + j
 }
 
-// childRel returns the source path of the subdirectory e of the indexed
-// directory at key.
-func (b *backup) childRel(key string, e *sourceEntry) string {
-	rel, err := relFromPath(b.srcRoot, e.path)
-	if err != nil {
-		return joinRemote(key, e.Name)
-	}
-	return rel
-}
-
-// relFromPath returns p relative to root with "/" separators.
-func relFromPath(root, p string) (string, error) {
-	if p == root {
-		return "", nil
-	}
-	prefix := strings.TrimSuffix(root, "/") + "/"
-	if !strings.HasPrefix(p, prefix) {
-		return "", fmt.Errorf("%q is not below %q", p, root)
-	}
-	return strings.TrimPrefix(p, prefix), nil
-}
-
 // hashFile returns the hex MD5 of the file at p.
 func hashFile(p string) (sum string, err error) {
 	in, err := os.Open(p)
@@ -622,9 +642,11 @@ func hashFile(p string) (sum string, err error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// commitDir stores the data of a directory's changed entries, then writes
-// its changeset and index. It returns false if the directory couldn't be
-// committed, in which case its previous index stays in place.
+// commitDir stores the data of a directory's changed entries, writes its
+// changeset, retires the indexes of subdirectories which no longer have
+// one, and writes its index, in that order. It returns false if the
+// directory couldn't be committed, in which case its previous index stays
+// in place and the next run tries again.
 func (b *backup) commitDir(ctx context.Context, rel, key string, prevEntries []Entry, c *dirChange) bool {
 	label := dirLabel(key, b.opt.RootLabel)
 	stored, failed := b.storeData(ctx, key, label, c.store)
@@ -672,20 +694,50 @@ func (b *backup) commitDir(ctx context.Context, rel, key string, prevEntries []E
 	}
 	if len(changes) > 0 {
 		sortEntries(changes)
-		if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(label, b.runID)), changes); err != nil {
+		if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(label, b.runID, b.opt.Worker)), changes, columns); err != nil {
 			b.errorf("write changeset of %q: %v", rel, err)
 			return false
 		}
 		b.count(func(s *Stats) *int64 { return &s.MetaObjects }, 1)
 	}
+	// Retire before writing this index: if that fails, the previous index
+	// still lists the subdirectories, so the next run retires them again.
+	for _, childKey := range c.retire {
+		if !b.retireIndex(ctx, childKey) {
+			return false
+		}
+	}
 	if changed {
-		if err := b.d.writeIndex(ctx, key, index); err != nil {
+		if err := b.d.writeIndex(ctx, key, index, b.runID); err != nil {
 			b.errorf("write index of %q: %v", rel, err)
 			return false
 		}
 		b.count(func(s *Stats) *int64 { return &s.MetaObjects }, 1)
 	}
+	b.countChanges(changes, len(index))
 	return true
+}
+
+// countChanges adds a committed directory's changes to the stats.
+func (b *backup) countChanges(changes []Entry, indexRows int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	live := 0
+	for _, row := range changes {
+		switch row.Action {
+		case ActionAdd:
+			b.stats.Added++
+		case ActionModify:
+			b.stats.Modified++
+		case ActionMeta:
+			b.stats.MetaOnly++
+		case ActionDelete:
+			b.stats.Deleted++
+			continue
+		}
+		live++
+	}
+	b.stats.Unchanged += int64(indexRows - live)
 }
 
 // indexChanged returns true if the index would change.
@@ -712,7 +764,7 @@ func indexChanged(prev, next []Entry) (bool, error) {
 func (b *backup) storeData(ctx context.Context, key, label string, entries []*sourceEntry) (stored map[string]Entry, failed bool) {
 	stored = map[string]Entry{}
 	if b.d.dryRun {
-		b.planData(key, label, entries, stored)
+		b.planData(label, entries, stored)
 		return stored, false
 	}
 	var packed []*sourceEntry
@@ -781,7 +833,7 @@ func (b *backup) storeData(ctx context.Context, key, label string, entries []*so
 
 // planData fills in stored as storeData would, without reading or
 // uploading any data. It is used for --dry-run.
-func (b *backup) planData(key, label string, entries []*sourceEntry, stored map[string]Entry) {
+func (b *backup) planData(label string, entries []*sourceEntry, stored map[string]Entry) {
 	var packSize int64
 	part := 0
 	for _, e := range entries {
@@ -819,8 +871,30 @@ func removeMember(pw *packWriter, name string) {
 	}
 }
 
+// checkDataTier checks the storage class of the first data object the
+// run uploads. It returns false, and stops the run, if it is wrong.
+func (b *backup) checkDataTier(ctx context.Context, remote string) bool {
+	b.mu.Lock()
+	checked := b.dataTierChecked
+	b.dataTierChecked = true
+	b.mu.Unlock()
+	if checked {
+		return true
+	}
+	if err := b.d.checkTier(ctx, remote, b.opt.DataTier); err != nil {
+		b.errorf("%v", err)
+		b.stop()
+		return false
+	}
+	return true
+}
+
 // uploadPack finishes and uploads a pack, adding its members to stored.
+// A pack whose members were all dropped isn't uploaded.
 func (b *backup) uploadPack(ctx context.Context, key string, pw *packWriter, stored map[string]Entry) bool {
+	if len(pw.members) == 0 {
+		return true
+	}
 	size, sum, err := pw.finish(time.Now())
 	if err != nil {
 		b.errorf("finish pack %q: %v", pw.name, err)
@@ -829,6 +903,9 @@ func (b *backup) uploadPack(ctx context.Context, key string, pw *packWriter, sto
 	remote := joinRemote(key, pw.name)
 	if err := b.d.putFile(ctx, remote, pw.file.Name(), size, sum, b.opt.DataTier); err != nil {
 		b.errorf("upload pack %q: %v", remote, err)
+		return false
+	}
+	if !b.checkDataTier(ctx, remote) {
 		return false
 	}
 	b.count(func(s *Stats) *int64 { return &s.Packs }, 1)
@@ -850,7 +927,7 @@ func (b *backup) storeStandalone(ctx context.Context, key string, e *sourceEntry
 		return false
 	}
 	if exists {
-		name = versionedName(e.Name, b.runID)
+		name = versionedName(e.Name, b.runID, b.opt.Worker)
 		remote = joinRemote(key, name)
 	}
 	if keyTooLong(b.rootKey, remote) {
@@ -862,10 +939,20 @@ func (b *backup) storeStandalone(ctx context.Context, key string, e *sourceEntry
 		b.errorf("upload %q: %v", remote, err)
 		return false
 	}
+	if !b.checkDataTier(ctx, remote) {
+		return false
+	}
 	info, err := os.Lstat(e.path)
 	if err != nil || info.Size() != e.Size || !info.ModTime().Equal(e.ModTime) {
 		fs.Logf(e.path, "gda: changed while being uploaded, leaving it for the next run")
 		b.count(func(s *Stats) *int64 { return &s.Deferred }, 1)
+		// Nothing refers to the incomplete copy, and leaving it would
+		// take the file's own name for good.
+		if o, err := b.d.f.NewObject(ctx, remote); err == nil {
+			if err := o.Remove(ctx); err != nil {
+				fs.Errorf(remote, "gda: failed to remove incomplete copy: %v", err)
+			}
+		}
 		return true
 	}
 	row := e.Entry
@@ -883,31 +970,34 @@ func (b *backup) storeStandalone(ctx context.Context, key string, e *sourceEntry
 
 // retireIndex marks every entry in the index at key as deleted and
 // replaces the index with an empty one. It is used when a directory is
-// deleted or becomes part of a rollup. Subdirectories with their own
-// index are retired too.
-func (b *backup) retireIndex(ctx context.Context, key string) {
+// deleted, becomes part of a rollup or is replaced by a file.
+// Subdirectories with their own index are retired first. It returns
+// false if anything failed.
+func (b *backup) retireIndex(ctx context.Context, key string) bool {
 	entries, err := b.d.readIndex(ctx, key)
 	if err != nil {
 		b.errorf("%v", err)
-		return
+		return false
 	}
 	if len(entries) == 0 {
-		return
+		return true
 	}
 	changes := make([]Entry, 0, len(entries))
 	for _, e := range entries {
 		changes = append(changes, changeRow(e, ActionDelete))
 		if e.IsDir() && e.Listing == ListingIndex && isDirectChild(e.Name) {
-			b.retireIndex(ctx, joinRemote(key, e.Name))
+			if !b.retireIndex(ctx, joinRemote(key, e.Name)) {
+				return false
+			}
 		}
 	}
-	if len(changes) > 0 {
-		if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(dirLabel(key, b.opt.RootLabel), b.runID)), changes); err != nil {
-			b.errorf("write changeset of %q: %v", key, err)
-			return
-		}
+	if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(dirLabel(key, b.opt.RootLabel), b.runID, b.opt.Worker)), changes, columns); err != nil {
+		b.errorf("write changeset of %q: %v", key, err)
+		return false
 	}
-	if err := b.d.writeIndex(ctx, key, []Entry{}); err != nil {
+	if err := b.d.writeIndex(ctx, key, []Entry{}, b.runID); err != nil {
 		b.errorf("write index of %q: %v", key, err)
+		return false
 	}
+	return true
 }

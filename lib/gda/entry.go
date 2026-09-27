@@ -89,6 +89,9 @@ type Entry struct {
 	Listing      string    // directories: ListingIndex or ListingRollup
 	NameEncoding string    // "" or NameEncodingPercent
 	Action       string    // changesets only: one of the Action constants
+	DevMajor     int64     // device files: major device number
+	DevMinor     int64     // device files: minor device number
+	Target       string    // restore plans only: path below the restore target
 }
 
 // NewEntry returns an Entry with the integer fields that don't apply set to -1.
@@ -105,6 +108,8 @@ func NewEntry(name, typ string) Entry {
 		StoredSize:   -1,
 		TreeSize:     -1,
 		TreeFiles:    -1,
+		DevMajor:     -1,
+		DevMinor:     -1,
 	}
 }
 
@@ -117,6 +122,7 @@ func (e *Entry) IsDir() bool {
 type sourceEntry struct {
 	Entry
 	path string // full source path
+	rel  string // source path relative to the source root, "/" separated
 }
 
 // columns are the CSV columns in the order they are written. New columns
@@ -126,7 +132,11 @@ var columns = []string{
 	"md5", "link_target", "location", "offset", "codec", "stored_offset",
 	"stored_length", "stored_size", "stored_md5", "dedup_of", "version_id",
 	"run", "tree_size", "tree_files", "listing", "name_encoding", "action",
+	"dev_major", "dev_minor",
 }
+
+// planColumns are the columns of a restore plan.
+var planColumns = append(append([]string(nil), columns...), "target")
 
 func formatInt(i int64) string {
 	if i < 0 {
@@ -149,20 +159,72 @@ func formatTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-func (e *Entry) record() []string {
-	mode := ""
-	if e.Mode != 0 || e.Type != "" {
-		mode = fmt.Sprintf("%04o", e.Mode)
+// value returns the CSV value of column col.
+func (e *Entry) value(col string) string {
+	switch col {
+	case "name":
+		return e.Name
+	case "type":
+		return e.Type
+	case "size":
+		return formatInt(e.Size)
+	case "mtime":
+		return formatTime(e.ModTime)
+	case "mode":
+		if e.Type == "" {
+			return ""
+		}
+		return fmt.Sprintf("%04o", e.Mode)
+	case "owner":
+		return e.Owner
+	case "group":
+		return e.Group
+	case "uid":
+		return formatInt(e.UID)
+	case "gid":
+		return formatInt(e.GID)
+	case "md5":
+		return e.MD5
+	case "link_target":
+		return e.LinkTarget
+	case "location":
+		return e.Location
+	case "offset":
+		return formatInt(e.Offset)
+	case "codec":
+		return e.Codec
+	case "stored_offset":
+		return formatInt(e.StoredOffset)
+	case "stored_length":
+		return formatInt(e.StoredLength)
+	case "stored_size":
+		return formatInt(e.StoredSize)
+	case "stored_md5":
+		return e.StoredMD5
+	case "dedup_of":
+		return e.DedupOf
+	case "version_id":
+		return e.VersionID
+	case "run":
+		return e.Run
+	case "tree_size":
+		return formatInt(e.TreeSize)
+	case "tree_files":
+		return formatInt(e.TreeFiles)
+	case "listing":
+		return e.Listing
+	case "name_encoding":
+		return e.NameEncoding
+	case "action":
+		return e.Action
+	case "dev_major":
+		return formatInt(e.DevMajor)
+	case "dev_minor":
+		return formatInt(e.DevMinor)
+	case "target":
+		return e.Target
 	}
-	return []string{
-		e.Name, e.Type, formatInt(e.Size), formatTime(e.ModTime), mode,
-		e.Owner, e.Group, formatInt(e.UID), formatInt(e.GID),
-		e.MD5, e.LinkTarget, e.Location, formatInt(e.Offset), e.Codec,
-		formatInt(e.StoredOffset), formatInt(e.StoredLength), formatInt(e.StoredSize),
-		e.StoredMD5, e.DedupOf, e.VersionID, e.Run,
-		formatInt(e.TreeSize), formatInt(e.TreeFiles), e.Listing,
-		e.NameEncoding, e.Action,
-	}
+	return ""
 }
 
 // setField sets the field for column col from the CSV value v.
@@ -226,6 +288,12 @@ func (e *Entry) setField(col, v string) (err error) {
 		e.NameEncoding = v
 	case "action":
 		e.Action = v
+	case "dev_major":
+		e.DevMajor, err = parseInt(v)
+	case "dev_minor":
+		e.DevMinor, err = parseInt(v)
+	case "target":
+		e.Target = v
 	}
 	if err != nil {
 		return fmt.Errorf("column %q: %w", col, err)
@@ -235,12 +303,21 @@ func (e *Entry) setField(col, v string) (err error) {
 
 // WriteEntries writes entries as CSV with a header row.
 func WriteEntries(w io.Writer, entries []Entry) error {
+	return writeColumns(w, entries, columns)
+}
+
+// writeColumns writes the columns cols of entries as CSV with a header row.
+func writeColumns(w io.Writer, entries []Entry, cols []string) error {
 	cw := csv.NewWriter(w)
-	if err := cw.Write(columns); err != nil {
+	if err := cw.Write(cols); err != nil {
 		return err
 	}
+	record := make([]string, len(cols))
 	for i := range entries {
-		if err := cw.Write(entries[i].record()); err != nil {
+		for j, col := range cols {
+			record[j] = entries[i].value(col)
+		}
+		if err := cw.Write(record); err != nil {
 			return err
 		}
 	}
@@ -284,8 +361,11 @@ func ReadEntries(r io.Reader) ([]Entry, error) {
 }
 
 // encodeName returns name as valid UTF-8 and the name encoding used.
+//
+// Names which contain "%" are encoded too, so that an encoded name can
+// never equal a name which wasn't encoded.
 func encodeName(name string) (string, string) {
-	if utf8.ValidString(name) {
+	if utf8.ValidString(name) && !strings.Contains(name, "%") {
 		return name, ""
 	}
 	return url.PathEscape(name), NameEncodingPercent

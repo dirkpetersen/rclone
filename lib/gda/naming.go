@@ -44,19 +44,21 @@ func packName(label, runID, worker string, part int) string {
 }
 
 // changesetName returns the name of a changeset.
-func changesetName(label, runID string) string {
-	return fmt.Sprintf("%s.gda.%s.csv", label, runID)
+func changesetName(label, runID, worker string) string {
+	return fmt.Sprintf("%s.gda.%s.%s.csv", label, runID, worker)
 }
 
 // versionedName returns the key used for a new version of a standalone
 // file whose native name is already taken.
-func versionedName(name, runID string) string {
-	return fmt.Sprintf("%s.gda.%s", name, runID)
+func versionedName(name, runID, worker string) string {
+	return fmt.Sprintf("%s.gda.%s.%s", name, runID, worker)
 }
 
-// indexPartName returns the name of part n of a split index.
-func indexPartName(n int) string {
-	return fmt.Sprintf("gda-index.%05d.csv", n)
+// indexPartName returns the name of part n of a split index written by
+// run runID. Parts are never overwritten, so replacing the table of
+// contents switches readers from one complete index to the next.
+func indexPartName(runID string, n int) string {
+	return fmt.Sprintf("gda-index.%s.%05d.csv", runID, n)
 }
 
 // isReserved returns true if a source entry called name can't be stored
@@ -83,7 +85,8 @@ func joinRemote(elem ...string) string {
 }
 
 // keyTooLong returns true if remote, below the destination root prefix,
-// would exceed the S3 key length limit.
+// would exceed the S3 key length limit. The prefix includes the bucket
+// name for bucket based remotes, which makes the check conservative.
 func keyTooLong(rootPrefix, remote string) bool {
 	return len(joinRemote(rootPrefix, remote)) > maxKeyLength
 }
