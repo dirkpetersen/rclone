@@ -859,10 +859,111 @@ the job shows the table above:
 - a radio button for the retrieval speed, and "Start" disabled until one is
   chosen.
 
-Starting the job then runs in two steps, which Motuz already supports as
-Celery jobs: a restore job, which polls restore status until everything
-selected is available, followed by the copy job. The job list shows the
-estimate next to the job, so users can compare it with what actually
+Motuz doesn't compute any prices itself. It gets everything the dialog
+shows from GDA as JSON, and drives the restore with three calls.
+
+#### 1. Estimate: data for the dialog
+
+```text
+rclone gda restore --estimate --json <source paths...> <target>
+```
+
+returns one entry per restore option available for the selected data, with
+every cost component, so Motuz can render the options as a table of radio
+buttons:
+
+```json
+{
+  "prices": {"region": "us-west-2", "date": "2026-09-26", "currency": "USD"},
+  "egress": {"path": "internet", "waiver": true},
+  "selection": {
+    "files": 2340,
+    "bytes": 1319413953331,
+    "already_restored_files": 0,
+    "objects_to_restore": 6,
+    "bytes_to_restore": 1319413953331,
+    "bytes_to_download": 1319413953331
+  },
+  "options": [
+    {
+      "tier": "Bulk",
+      "label": "Bulk: ready within 48 hours",
+      "ready_within_hours": 48,
+      "costs": {
+        "retrieval": 3.07,
+        "restore_requests": 0.00,
+        "temporary_copy": 2.83,
+        "download_requests": 0.00,
+        "egress": 110.59
+      },
+      "total": 116.49,
+      "total_egress_waived": 5.90
+    },
+    {
+      "tier": "Standard",
+      "label": "Standard: ready within 12 hours",
+      "ready_within_hours": 12,
+      "costs": {
+        "retrieval": 24.58,
+        "restore_requests": 0.00,
+        "temporary_copy": 2.83,
+        "download_requests": 0.00,
+        "egress": 110.59
+      },
+      "total": 137.99,
+      "total_egress_waived": 27.40
+    }
+  ],
+  "warnings": []
+}
+```
+
+- **`options`** lists only the tiers the data's storage class allows:
+  Bulk and Standard for Deep Archive, plus Expedited for Glacier Flexible
+  Retrieval. If everything selected is already restored, there is a single
+  option with tier `None` and no retrieval cost.
+- **Amounts** are numbers in `prices.currency`, rounded to cents. Motuz shows
+  `total_egress_waived` as the headline when `egress.waiver` is true, and
+  `total` otherwise, with egress in its own column either way.
+- **`warnings`** carries anything the user should see before confirming,
+  for example files that are missing from the index.
+- The estimate needs no restore and costs nothing, so Motuz can re-run it
+  whenever the selection changes.
+
+#### 2. Start: the user's choice
+
+```text
+rclone gda restore --tier Bulk --yes --json <source paths...> <target>
+```
+
+requests the restores and returns at once with the restore ID and the
+estimate for the chosen tier, which Motuz stores with the job:
+
+```json
+{"restore_id": "20260926T190512Z-7f3a", "tier": "Bulk", "estimate": { "total": 116.49, "total_egress_waived": 5.90 }}
+```
+
+#### 3. Progress: polled by a Celery job
+
+```text
+rclone gda restore --resume <restore_id> --json
+```
+
+fetches whatever is ready and reports progress, so the Celery job just
+calls it every few minutes until `state` is `done`:
+
+```json
+{
+  "restore_id": "20260926T190512Z-7f3a",
+  "state": "restoring",
+  "objects": {"requested": 6, "restoring": 4, "ready": 2, "fetched": 2},
+  "files": {"total": 2340, "fetched": 781, "skipped_identical": 0, "failed": 0},
+  "ready_by": "2026-09-28T19:05:12Z"
+}
+```
+
+`state` is one of `restoring`, `fetching`, `done` or `failed`. The job
+list shows the estimate next to the job, so users can compare it with what
 happened.
 
 ## Browsing from Motuz and other front ends
