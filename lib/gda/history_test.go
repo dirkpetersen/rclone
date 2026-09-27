@@ -127,8 +127,21 @@ func (m *mutator) write(rel string) {
 	m.changed = append(m.changed, rel)
 }
 
+// dirTimes returns the modification times of the directories.
+func (m *mutator) dirTimes() map[string]time.Time {
+	times := map[string]time.Time{}
+	_, dirs := m.entries()
+	for _, d := range dirs {
+		if info, err := os.Lstat(m.path(d)); err == nil {
+			times[d] = info.ModTime()
+		}
+	}
+	return times
+}
+
 // mutate makes n random changes.
 func (m *mutator) mutate(n int) {
+	before := m.dirTimes()
 	for range n {
 		files, dirs := m.entries()
 		pick := func(list []string) string { return list[m.r.Intn(len(list))] }
@@ -206,13 +219,18 @@ func (m *mutator) mutate(n int) {
 			m.changed = append(m.changed, fifo)
 		}
 	}
-	// Directory times change as their contents do; settle them so the
-	// backup and the snapshot agree.
+	// Directory times change as their contents do; give the changed
+	// ones distinct times, which a change feed reports, and leave the
+	// rest alone, so change runs read only some directories.
+	after := m.dirTimes()
 	_, dirs := m.entries()
 	for i := len(dirs) - 1; i >= 0; i-- {
+		old, ok := before[dirs[i]]
+		if ok && old.Equal(after[dirs[i]]) {
+			continue
+		}
 		now := m.tick()
 		require.NoError(m.t, os.Chtimes(m.path(dirs[i]), now, now))
-		// A change feed reports directories whose times changed.
 		m.changed = append(m.changed, dirs[i])
 	}
 }

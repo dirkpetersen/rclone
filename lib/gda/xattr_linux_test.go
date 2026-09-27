@@ -2,6 +2,7 @@ package gda
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -17,6 +18,14 @@ func TestXattrs(t *testing.T) {
 	if err := unix.Lsetxattr(filepath.Join(src, "d/a.txt"), "user.gda.test", []byte("one"), 0); err != nil {
 		t.Skipf("no user extended attributes here: %v", err)
 	}
+	// Read only entries, and a second link to one, get theirs too.
+	writeFile(t, src, "ro/b.txt", 100)
+	require.NoError(t, unix.Lsetxattr(filepath.Join(src, "ro/b.txt"), "user.gda.test", []byte("ro"), 0))
+	require.NoError(t, unix.Lsetxattr(filepath.Join(src, "ro"), "user.gda.test", []byte("dir"), 0))
+	require.NoError(t, os.Link(filepath.Join(src, "ro/b.txt"), filepath.Join(src, "d/b-link.txt")))
+	require.NoError(t, os.Chmod(filepath.Join(src, "ro/b.txt"), 0o444))
+	require.NoError(t, os.Chmod(filepath.Join(src, "ro"), 0o555))
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(src, "ro"), 0o755) })
 	opt := testOptions()
 	opt.RollupMax = 0
 	opt.Xattrs = true
@@ -36,4 +45,11 @@ func TestXattrs(t *testing.T) {
 	n, err := unix.Lgetxattr(filepath.Join(target, "d/a.txt"), "user.gda.test", buf)
 	require.NoError(t, err)
 	assert.Equal(t, "two", string(buf[:n]))
+	assert.Empty(t, st.Errors)
+	for p, want := range map[string]string{"ro/b.txt": "ro", "ro": "dir", "d/b-link.txt": "ro"} {
+		n, err := unix.Lgetxattr(filepath.Join(target, p), "user.gda.test", buf)
+		require.NoError(t, err, p)
+		assert.Equal(t, want, string(buf[:n]), p)
+	}
+	require.NoError(t, os.Chmod(filepath.Join(target, "ro"), 0o755))
 }
