@@ -770,7 +770,10 @@ rerun takes 0.6 s; a single directory of 300,000 files takes 10 s and
 2 GB of memory, as a directory is held in memory while it is compared
 and committed, at about 3 KB per file plus 16 MiB of compression
 history per worker. Directories of tens of millions of files would need
-the comparison to stream instead.
+the comparison to stream instead. Against AWS S3 in us-west-2, the same
+100,000 files as 2,000 rolled up directories took 19 s split over four
+processes, an unchanged rerun 10 s reading every index, and under a
+second with the index cache.
 
 ### Initial upload
 
