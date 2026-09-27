@@ -3,12 +3,13 @@
 package gda
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/csv"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strconv"
@@ -163,12 +164,63 @@ func (idx *dedupIndex) find(md5sum string, size int64) (Entry, bool) {
 	if !ok {
 		return Entry{}, false
 	}
-	row := NewEntry(dedupName(md5sum, size), TypeFile)
-	row.Size, row.MD5 = size, md5sum
+	return copyRow(k, c), true
+}
+
+// copyRow returns the dedup index row of the copy c of content k.
+func copyRow(k dedupKey, c dedupCopy) Entry {
+	sum := hex.EncodeToString(k.md5[:])
+	row := NewEntry(dedupName(sum, k.size), TypeFile)
+	row.Size, row.MD5 = k.size, sum
 	row.Location, row.Codec, row.StoredMD5 = c.location, c.codec, c.storedMD5
 	row.Offset, row.StoredOffset, row.StoredLength, row.StoredStart = c.offset, c.storedOffset, c.storedLength, c.storedStart
 	row.StoredSize = c.storedSize
-	return row, true
+	return row
+}
+
+// write uploads every copy in the index to remote, through a temporary
+// file, as it can be large.
+func (idx *dedupIndex) write(ctx context.Context, d *dest, remote string) (err error) {
+	tmp, err := os.CreateTemp("", "gda-dedup-*.csv")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+	}()
+	h := md5.New()
+	cw := csv.NewWriter(io.MultiWriter(tmp, h))
+	if err := cw.Write(columns); err != nil {
+		return err
+	}
+	record := make([]string, len(columns))
+	idx.mu.Lock()
+	for k, c := range idx.bySum {
+		row := copyRow(k, c)
+		for i, col := range columns {
+			record[i] = row.value(col)
+		}
+		if err = cw.Write(record); err != nil {
+			break
+		}
+	}
+	idx.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		return err
+	}
+	size, err := tmp.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return d.putFile(ctx, remote, tmp.Name(), size, hex.EncodeToString(h.Sum(nil)), d.metaTier)
 }
 
 // add records the copy in row, stored in the directory at key.
@@ -297,29 +349,14 @@ func compactDedup(ctx context.Context, d *dest, runID string) error {
 	if len(files) <= dedupCompactAt {
 		return nil
 	}
-	merged := map[string]Entry{}
+	idx := newDedupIndex()
 	for _, o := range files {
-		data, err := d.get(ctx, o.Remote())
-		if err != nil {
-			return err
-		}
-		rows, err := ReadEntries(bytes.NewReader(data))
-		if err != nil {
-			return fmt.Errorf("parse dedup index %q: %w", o.Remote(), err)
-		}
-		for _, row := range rows {
-			if _, ok := merged[row.Name]; !ok {
-				merged[row.Name] = row
-			}
+		if err := idx.load(ctx, o); err != nil {
+			return fmt.Errorf("read dedup index %q: %w", o.Remote(), err)
 		}
 	}
-	rows := make([]Entry, 0, len(merged))
-	for _, row := range merged {
-		rows = append(rows, row)
-	}
-	sortEntries(rows)
 	target := joinRemote(dedupDir, "compact-"+runID+".csv")
-	if err := d.writeEntries(ctx, target, rows, columns); err != nil {
+	if err := idx.write(ctx, d, target); err != nil {
 		return err
 	}
 	for _, o := range files {
