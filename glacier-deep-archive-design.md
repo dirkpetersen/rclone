@@ -508,7 +508,8 @@ Two things accumulate when backups run for a decade:
   implemented, the trigger is the number of packs holding the directory's
   unchanged files: more than 20, and more than twice the packs those files
   would fill, so a big directory isn't repacked on every run; the dead
-  share would need a listing of the directory's packs. The changeset records each moved file as `rebase`.
+  share would need a listing of the directory's packs. The changeset
+  records each moved file as `rebase`.
 
 With "keep forever", history grows with every change: a 1 TB directory that
 is rewritten weekly adds about 52 TB of old versions a year, about $620 a
