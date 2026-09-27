@@ -45,6 +45,7 @@ type Options struct {
 	IndexCache    string        // directory for local copies of indexes; "" to read them all from the destination
 	Xattrs        bool          // keep extended attributes, which include ACLs
 	AllowEmpty    bool          // back up an empty source over a backup which isn't empty
+	Checksum      bool          // compare the MD5 of files whose size and time are unchanged too
 }
 
 // DefaultOptions returns the default options.
@@ -951,7 +952,7 @@ func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, 
 			e.DevMajor != p.DevMajor || e.DevMinor != p.DevMinor:
 			c.changes = append(c.changes, changeRow(e.Entry, ActionModify))
 			c.store = append(c.store, e)
-		case e.Type == TypeFile && !e.ModTime.Equal(p.ModTime):
+		case e.Type == TypeFile && (!e.ModTime.Equal(p.ModTime) || b.opt.Checksum && e.Size > 0):
 			sum, err := hashFile(e.path)
 			if err != nil {
 				b.errorf("hash %q: %v", e.path, err)
@@ -961,6 +962,10 @@ func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, 
 			if sum != p.MD5 {
 				c.changes = append(c.changes, changeRow(e.Entry, ActionModify))
 				c.store = append(c.store, e)
+				continue
+			}
+			if e.ModTime.Equal(p.ModTime) && sameMeta(&e.Entry, &p) {
+				c.index = append(c.index, p)
 				continue
 			}
 			row := withMeta(p, &e.Entry)
