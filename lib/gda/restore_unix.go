@@ -59,7 +59,8 @@ type RestoreStatus struct {
 	Files     FileCounts    `json:"files"`
 	ReadyBy   time.Time     `json:"ready_by"`
 	Errors    []string      `json:"errors,omitempty"`
-	Pending   []string      `json:"-"` // objects still being restored
+	Estimate  *Option       `json:"estimate,omitempty"` // estimate for the chosen tier, when starting
+	Pending   []string      `json:"-"`                  // objects still being restored
 	Record    RestoreRecord `json:"-"`
 }
 
