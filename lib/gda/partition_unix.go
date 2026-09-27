@@ -553,6 +553,7 @@ func (s *Stats) add(o *Stats) {
 	s.Standalone += o.Standalone
 	s.StandaloneBytes += o.StandaloneBytes
 	s.MetaObjects += o.MetaObjects
+	s.Rebased += o.Rebased
 	s.Deduplicated += o.Deduplicated
 	s.DeduplicatedBytes += o.DeduplicatedBytes
 	s.Skipped += o.Skipped

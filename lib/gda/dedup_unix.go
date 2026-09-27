@@ -144,7 +144,8 @@ func (b *backup) dedupEntries(key string, entries []*sourceEntry, stored map[str
 	}
 	var rest []*sourceEntry
 	for _, e := range entries {
-		if e.Type != TypeFile || e.Size < b.opt.DedupMin || !b.dedup.mayHave(e.Size) {
+		// A rebased file would find its own stored copy.
+		if e.Type != TypeFile || e.rebase || e.Size < b.opt.DedupMin || !b.dedup.mayHave(e.Size) {
 			rest = append(rest, e)
 			continue
 		}

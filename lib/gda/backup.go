@@ -79,6 +79,7 @@ type Stats struct {
 	Standalone        int64 // standalone objects uploaded
 	StandaloneBytes   int64 // bytes in standalone objects uploaded
 	MetaObjects       int64 // changesets and index objects written
+	Rebased           int64 // unchanged files packed again to gather a directory's files in fewer packs
 	Deduplicated      int64 // files which were copies of stored content, so weren't stored again
 	DeduplicatedBytes int64 // bytes in those files
 	Skipped           int64 // entries skipped, for example because of reserved names
@@ -907,7 +908,51 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 			c.retire = append(c.retire, joinRemote(key, name))
 		}
 	}
+	rebase(c, cur)
 	return c
+}
+
+// rebaseMaxPacks is the number of packs a directory's unchanged files
+// may be spread over before a run packs them again. Tests lower it.
+var rebaseMaxPacks = 20
+
+// rebase moves the unchanged packed files of a directory whose files are
+// spread over more than rebaseMaxPacks packs to c.store, so they are
+// packed again from the source and restoring the directory needs fewer
+// objects. The old packs are kept, as history refers to them.
+func rebase(c *dirChange, cur []sourceEntry) {
+	isPacked := func(row *Entry) bool {
+		return row.Type == TypeFile && row.Size > 0 && row.Offset >= 0 && row.DedupOf == "" && row.Location != ""
+	}
+	packs := map[string]bool{}
+	for i := range c.index {
+		if isPacked(&c.index[i]) {
+			packs[c.index[i].Location] = true
+		}
+	}
+	if len(packs) <= rebaseMaxPacks {
+		return
+	}
+	source := make(map[string]*sourceEntry, len(cur))
+	for i := range cur {
+		source[cur[i].Name] = &cur[i]
+	}
+	changed := make(map[string]bool, len(c.changes))
+	for _, row := range c.changes {
+		changed[row.Name] = true
+	}
+	kept := c.index[:0]
+	for _, row := range c.index {
+		e := source[row.Name]
+		if !isPacked(&row) || e == nil || changed[row.Name] {
+			kept = append(kept, row)
+			continue
+		}
+		e.rebase = true
+		c.store = append(c.store, e)
+		c.changes = append(c.changes, changeRow(e.Entry, ActionRebase))
+	}
+	c.index = kept
 }
 
 // keepsPrefix returns true if name is inside a directory in keep.
@@ -961,13 +1006,22 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 			skip[e.Name] = true
 		}
 	}
+	prevByName := make(map[string]Entry, len(prevEntries))
+	for _, p := range prevEntries {
+		prevByName[p.Name] = p
+	}
 	var changes []Entry
 	for _, row := range c.changes {
 		if skip[row.Name] {
 			continue
 		}
 		if e, ok := stored[row.Name]; ok {
-			row = changeRow(e, row.Action)
+			action := row.Action
+			if action == ActionRebase && e.MD5 != prevByName[row.Name].MD5 {
+				// Changed without its size or time changing.
+				action = ActionModify
+			}
+			row = changeRow(e, action)
 		}
 		changes = append(changes, row)
 	}
@@ -977,10 +1031,6 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 			s.Action = ""
 			index = append(index, s)
 		}
-	}
-	prevByName := make(map[string]Entry, len(prevEntries))
-	for _, p := range prevEntries {
-		prevByName[p.Name] = p
 	}
 	for name := range skip {
 		if p, ok := prevByName[name]; ok {
@@ -1082,6 +1132,8 @@ func (b *backup) countChanges(changes []Entry, indexRows int) {
 			b.stats.Modified++
 		case ActionMeta:
 			b.stats.MetaOnly++
+		case ActionRebase:
+			b.stats.Rebased++
 		case ActionDelete:
 			b.stats.Deleted++
 			continue
