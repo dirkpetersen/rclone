@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // idNames caches user and group name lookups.
@@ -110,6 +112,10 @@ func entryFromInfo(p, name string, info fs.FileInfo, names *idNames) (sourceEntr
 		e.GID = int64(st.Gid)
 		e.Owner = names.user(e.UID)
 		e.Group = names.group(e.GID)
+		if e.Type == TypeCharDev || e.Type == TypeBlockDev {
+			rdev := uint64(st.Rdev) //nolint:unconvert // Rdev isn't uint64 on every platform
+			e.DevMajor, e.DevMinor = int64(unix.Major(rdev)), int64(unix.Minor(rdev))
+		}
 	}
 	if e.Type == TypeSymlink {
 		target, err := os.Readlink(p)

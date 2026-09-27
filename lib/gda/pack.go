@@ -124,8 +124,10 @@ func (p *packWriter) add(e *sourceEntry) error {
 		hdr.Typeflag = tar.TypeFifo
 	case TypeCharDev:
 		hdr.Typeflag = tar.TypeChar
+		hdr.Devmajor, hdr.Devminor = e.DevMajor, e.DevMinor
 	case TypeBlockDev:
 		hdr.Typeflag = tar.TypeBlock
+		hdr.Devmajor, hdr.Devminor = e.DevMajor, e.DevMinor
 	default:
 		return fmt.Errorf("pack %s: can't store %q of type %s", p.name, e.Name, e.Type)
 	}

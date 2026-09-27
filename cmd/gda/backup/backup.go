@@ -58,7 +58,12 @@ subdirectories.
 Packs and standalone files are uploaded with the storage class
 !--data-tier! (default DEEP_ARCHIVE), CSV files with !--meta-tier!
 (default STANDARD). Don't set !storage_class! on the destination remote,
-as it would override these.
+as it would override these; the run stops if it finds objects stored
+with the wrong class.
+
+For S3, set !--s3-upload-cutoff! above !--pack-size! so that each pack
+is uploaded in one request checked against its MD5, and consider
+!--s3-no-check-bucket! when the bucket exists.
 
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose

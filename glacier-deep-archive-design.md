@@ -642,8 +642,13 @@ At the end of the run, write the run ledger.
 
 - **A crash before step 5** leaves orphan packs, which the next run ignores
   and garbage collection removes.
-- **A crash between steps 5 and 6** leaves a stale index. The next run
-  detects a changeset newer than the index and rebuilds the index.
+- **A crash between steps 5 and 6** leaves a stale index. In milestone 1
+  the next run compares against the stale index and stores the changed
+  files again, which is safe but uploads them twice; detecting the newer
+  changeset and rebuilding the index from it comes later.
+- **Retiring indexes** of subdirectories that were deleted, rolled up or
+  replaced by files happens between steps 5 and 6. If it fails, the
+  previous index still lists them, so the next run retires them again.
 - **One writer per directory:** the coordinator assigns each partition to
   exactly one worker for the run (see
   [Scale and parallel workers](#scale-and-parallel-workers)). A lock object

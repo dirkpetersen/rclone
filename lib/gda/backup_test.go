@@ -196,7 +196,7 @@ func TestBackupIncremental(t *testing.T) {
 	// Second run with no changes writes nothing but its ledger.
 	before := objects(t, dst)
 	l2 := runBackup(t, src, dst, opt)
-	assert.Equal(t, int64(6), l2.Stats.Unchanged+l2.Stats.Added)
+	assert.Equal(t, int64(7), l2.Stats.Unchanged) // 2 rows in the root index and 5 in results
 	assert.Equal(t, int64(0), l2.Stats.Added+l2.Stats.Modified+l2.Stats.MetaOnly+l2.Stats.Deleted)
 	assert.Equal(t, before, objects(t, dst))
 
@@ -207,7 +207,7 @@ func TestBackupIncremental(t *testing.T) {
 	assert.Equal(t, int64(0), l3.Stats.Packs)
 	results3 := readIndexFile(t, dst, "results")
 	assert.Equal(t, results["a.dat"].Location, results3["a.dat"].Location)
-	changes := readCSV(t, filepath.Join(dst, "results", changesetName("results", l3.RunID)))
+	changes := readCSV(t, filepath.Join(dst, "results", changesetName("results", l3.RunID, "w01")))
 	assert.Equal(t, ActionMeta, changes["a.dat"].Action)
 
 	// Changing two small files puts just those in a new pack; the old
@@ -231,7 +231,7 @@ func TestBackupIncremental(t *testing.T) {
 	writeFile(t, src, "results/big.bin", 9001)
 	l5 := runBackup(t, src, dst, opt)
 	results5 := readIndexFile(t, dst, "results")
-	assert.Equal(t, versionedName("big.bin", l5.RunID), results5["big.bin"].Location)
+	assert.Equal(t, versionedName("big.bin", l5.RunID, "w01"), results5["big.bin"].Location)
 	assert.FileExists(t, filepath.Join(dst, "results", "big.bin"))
 	checkStored(t, dst, "results", results5)
 
@@ -241,7 +241,7 @@ func TestBackupIncremental(t *testing.T) {
 	l6 := runBackup(t, src, dst, opt)
 	assert.Equal(t, int64(1), l6.Stats.Deleted)
 	assert.NotContains(t, readIndexFile(t, dst, "results"), "a.dat")
-	changes = readCSV(t, filepath.Join(dst, "results", changesetName("results", l6.RunID)))
+	changes = readCSV(t, filepath.Join(dst, "results", changesetName("results", l6.RunID, "w01")))
 	assert.Equal(t, ActionDelete, changes["a.dat"].Action)
 	for _, o := range before {
 		assert.FileExists(t, filepath.Join(dst, o))
@@ -287,7 +287,7 @@ func TestBackupRollup(t *testing.T) {
 	assert.Contains(t, a, "y.txt")
 	assert.Contains(t, a, "grown.dat")
 	checkStored(t, dst, "tiny/a", a)
-	changes := readCSV(t, filepath.Join(dst, "tiny", changesetName("tiny", l2.RunID)))
+	changes := readCSV(t, filepath.Join(dst, "tiny", changesetName("tiny", l2.RunID, "w01")))
 	assert.Equal(t, ActionDelete, changes["a/y.txt"].Action)
 
 	// When it shrinks again, the directories' own indexes are retired.
@@ -315,7 +315,7 @@ func TestBackupDeletedDirectory(t *testing.T) {
 	assert.NotContains(t, readIndexFile(t, dst, ""), "gone")
 	assert.Empty(t, readIndexFile(t, dst, "gone"))
 	assert.Empty(t, readIndexFile(t, dst, "gone/sub"))
-	changes := readCSV(t, filepath.Join(dst, "gone/sub", changesetName("sub", l2.RunID)))
+	changes := readCSV(t, filepath.Join(dst, "gone/sub", changesetName("sub", l2.RunID, "w01")))
 	assert.Equal(t, ActionDelete, changes["file.txt"].Action)
 }
 
@@ -379,25 +379,176 @@ func TestBackupLock(t *testing.T) {
 
 func TestBackupSplitIndex(t *testing.T) {
 	fakeClock(t)
+	old := maxIndexRows
+	maxIndexRows = 2
+	t.Cleanup(func() { maxIndexRows = old })
 	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
-	f, err := fs.NewFs(context.Background(), dst)
-	require.NoError(t, err)
-	d := &dest{f: f, metaTier: "STANDARD", retries: 1}
-	var entries []Entry
-	for _, name := range []string{"c", "a", "b"} {
-		entries = append(entries, NewEntry(name, TypeFile))
+	opt := testOptions()
+	opt.RollupMax = 0
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		writeFile(t, src, name, 5)
 	}
-	objects, err := encodeIndex(entries, 2)
+	l1 := runBackup(t, src, dst, opt)
+	toc, err := os.ReadFile(filepath.Join(dst, IndexName))
 	require.NoError(t, err)
-	for name, data := range objects {
-		require.NoError(t, d.putBytes(context.Background(), joinRemote("dir", name), data, d.metaTier))
-	}
-	got, err := d.readIndex(context.Background(), "dir")
+	assert.True(t, isTOC(toc))
+	assert.FileExists(t, filepath.Join(dst, indexPartName(l1.RunID, 3)))
+	f := newDst(t, dst)
+	d := &dest{f: f, retries: 1}
+	entries, err := d.readIndex(context.Background(), "")
 	require.NoError(t, err)
-	var names []string
-	for _, e := range got {
-		names = append(names, e.Name)
+	assert.Len(t, entries, 5)
+
+	// A later run writes new parts rather than overwriting the old ones.
+	writeFile(t, src, "f", 5)
+	l2 := runBackup(t, src, dst, opt)
+	assert.FileExists(t, filepath.Join(dst, indexPartName(l1.RunID, 1)))
+	assert.FileExists(t, filepath.Join(dst, indexPartName(l2.RunID, 3)))
+	entries, err = d.readIndex(context.Background(), "")
+	require.NoError(t, err)
+	assert.Len(t, entries, 6)
+}
+
+// hookFs wraps an Fs so tests can watch and fail uploads.
+type hookFs struct {
+	fs.Fs
+	put func(remote, tier string) error
+}
+
+func (h *hookFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	tier := ""
+	if t, ok := src.(fs.GetTierer); ok {
+		tier = t.GetTier()
 	}
-	assert.Equal(t, []string{"a", "b", "c"}, names)
-	_ = src
+	if err := h.put(src.Remote(), tier); err != nil {
+		return nil, err
+	}
+	return h.Fs.Put(ctx, in, src, options...)
+}
+
+func TestBackupTiers(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	writeFile(t, src, "big.bin", 9000)
+	writeFile(t, src, "dir/small.txt", 100)
+	tiers := map[string]string{}
+	h := &hookFs{Fs: newDst(t, dst), put: func(remote, tier string) error {
+		tiers[remote] = tier
+		return nil
+	}}
+	_, err := Backup(context.Background(), src, h, opt)
+	require.NoError(t, err)
+	require.NotEmpty(t, tiers)
+	for remote, tier := range tiers {
+		want := opt.MetaTier
+		if strings.HasSuffix(remote, ".tar") || remote == "big.bin" {
+			want = opt.DataTier
+		}
+		assert.Equal(t, want, tier, remote)
+	}
+	assert.Equal(t, opt.DataTier, tiers["big.bin"])
+}
+
+func TestBackupFailedIndexWrite(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	writeFile(t, src, "dir/a.txt", 100)
+	runBackup(t, src, dst, opt)
+	before, err := os.ReadFile(filepath.Join(dst, "dir", IndexName))
+	require.NoError(t, err)
+
+	// The index write fails after the pack and changeset are stored.
+	writeFile(t, src, "dir/b.txt", 100)
+	h := &hookFs{Fs: newDst(t, dst), put: func(remote, tier string) error {
+		if remote == "dir/"+IndexName {
+			return errors.New("injected failure")
+		}
+		return nil
+	}}
+	_, err = Backup(context.Background(), src, h, opt)
+	assert.Error(t, err)
+	after, err := os.ReadFile(filepath.Join(dst, "dir", IndexName))
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+
+	// The next run records the change.
+	runBackup(t, src, dst, opt)
+	index := readIndexFile(t, dst, "dir")
+	assert.Contains(t, index, "b.txt")
+	checkStored(t, dst, "dir", index)
+}
+
+func TestBackupNameEncoding(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	// Both names encode to "x%FF" unless names containing "%" are
+	// encoded too.
+	writeFile(t, src, "x\xff", 5)
+	writeFile(t, src, "x%FF", 6)
+	writeFile(t, src, "bad\xffdir/inner.txt", 7)
+	l := runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(0), l.Stats.Errors)
+	root := readIndexFile(t, dst, "")
+	names := map[string]bool{}
+	for _, e := range root {
+		decoded, err := e.DecodeName()
+		require.NoError(t, err)
+		names[decoded] = true
+	}
+	assert.True(t, names["x\xff"])
+	assert.True(t, names["x%FF"])
+	assert.True(t, names["bad\xffdir"])
+
+	// Both files come back under their original names.
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), newDst(t, dst), target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	for name, size := range map[string]int{"x\xff": 5, "x%FF": 6, "bad\xffdir/inner.txt": 7} {
+		info, err := os.Stat(filepath.Join(target, name))
+		require.NoError(t, err, name)
+		assert.Equal(t, int64(size), info.Size(), name)
+	}
+}
+
+func TestBackupRelativeSource(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	writeFile(t, src, "bad\xffdir/inner.txt", 7)
+	t.Chdir(src)
+	l := runBackup(t, "./", dst, opt)
+	assert.Equal(t, int64(0), l.Stats.Errors)
+	assert.Equal(t, int64(2), l.Stats.IndexedDirs)
+}
+
+func TestBackupDirectoryChanges(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	writeFile(t, src, "thing/inner.txt", 5)
+	writeFile(t, src, "keep.txt", 5)
+	runBackup(t, src, dst, opt)
+
+	// A permission change on a directory is a changeset row.
+	require.NoError(t, os.Chmod(filepath.Join(src, "thing"), 0o700))
+	l2 := runBackup(t, src, dst, opt)
+	changes := readCSV(t, filepath.Join(dst, changesetName("lab", l2.RunID, "w01")))
+	assert.Equal(t, ActionMeta, changes["thing"].Action)
+	assert.Equal(t, uint32(0o700), changes["thing"].Mode)
+
+	// A directory replaced by a file has its index retired.
+	require.NoError(t, os.RemoveAll(filepath.Join(src, "thing")))
+	writeFile(t, src, "thing", 5)
+	l3 := runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(0), l3.Stats.Errors)
+	assert.Equal(t, TypeFile, readIndexFile(t, dst, "")["thing"].Type)
+	assert.Empty(t, readIndexFile(t, dst, "thing"))
 }

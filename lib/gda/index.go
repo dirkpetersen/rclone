@@ -12,8 +12,8 @@ import (
 )
 
 // maxIndexRows is the number of rows above which an index is split into
-// parts, with gda-index.csv holding a table of contents.
-const maxIndexRows = 100000
+// parts, with gda-index.csv holding a table of contents. Tests lower it.
+var maxIndexRows = 100000
 
 // tocColumns are the columns of the table of contents of a split index.
 var tocColumns = []string{"part", "first", "last", "rows"}
@@ -37,7 +37,7 @@ func sortEntries(entries []Entry) {
 // encodeIndex returns the objects making up the index for entries, keyed
 // by name. Up to maxIndexRows it is just gda-index.csv; above that the
 // entries are split into parts and gda-index.csv is a table of contents.
-func encodeIndex(entries []Entry, maxRows int) (map[string][]byte, error) {
+func encodeIndex(entries []Entry, maxRows int, runID string) (map[string][]byte, error) {
 	sortEntries(entries)
 	objects := map[string][]byte{}
 	if len(entries) <= maxRows {
@@ -60,7 +60,7 @@ func encodeIndex(entries []Entry, maxRows int) (map[string][]byte, error) {
 		if err := WriteEntries(&buf, part); err != nil {
 			return nil, err
 		}
-		name := indexPartName(n)
+		name := indexPartName(runID, n)
 		objects[name] = buf.Bytes()
 		if err := cw.Write([]string{name, part[0].Name, part[len(part)-1].Name, strconv.Itoa(len(part))}); err != nil {
 			return nil, err
