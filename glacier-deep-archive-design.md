@@ -661,6 +661,12 @@ moves their `location`, then deletes the old pack.
 - **Orphan packs** (a pack with no changeset, left by a crashed run) are
   deleted by garbage collection. They are rare, and the early-deletion charge
   on them is small.
+- **Implemented so far:** `rclone gda gc` reads every changeset and index
+  and reports stored, live and historical data, orphans and the packs worth
+  compacting; `--delete-orphans` removes orphans older than `--min-age`
+  while holding the destination lock. Objects listed in the dedup index
+  count as referenced, and objects without GDA names are only reported.
+  Compaction itself is left.
 
 ## Commit protocol and crash safety
 
@@ -1222,7 +1228,7 @@ the local and memory backends and production uses S3 or Ceph.
 | 5. Parallel workers | `--workers` on one host; `rclone gda plan`, `--run`/`--partition` and `rclone gda finish` across hosts | Done; resource limits per host left |
 | 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done, including `rclone gda prices` to refresh the table |
 | 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz | Done |
-| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; local index cache, catalog compaction, rebasing and garbage collection left |
+| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; orphan removal and the compaction report done; local index cache, catalog compaction, rebasing and compaction left |
 
 Milestone 1 limits, each lifted by a later milestone:
 
