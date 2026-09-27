@@ -17,7 +17,6 @@ import (
 	"sort"
 	"strings"
 	gosync "sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -26,6 +25,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // fakeClock makes each run start a minute after the previous one.
@@ -335,7 +335,7 @@ func TestBackupSpecialFiles(t *testing.T) {
 	opt := testOptions()
 	opt.RollupMax = 0
 	writeFile(t, src, "file.txt", 5)
-	require.NoError(t, syscall.Mkfifo(filepath.Join(src, "fifo"), 0o600))
+	require.NoError(t, unix.Mkfifo(filepath.Join(src, "fifo"), 0o600))
 	require.NoError(t, os.Chmod(filepath.Join(src, "file.txt"), os.ModeSetuid|0o755))
 	writeFile(t, src, IndexName, 5)
 	writeFile(t, src, "x.gda.clash.csv", 5)

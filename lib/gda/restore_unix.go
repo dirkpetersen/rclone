@@ -385,8 +385,8 @@ func runFetch(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, tar
 		return nil, err
 	}
 	defer func() { _ = lock.Close() }()
-	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		if errors.Is(err, unix.EWOULDBLOCK) {
+	if err := tryLock(lock.Fd()); err != nil {
+		if errors.Is(err, errLocked) {
 			return &RestoreStatus{
 				RestoreID: rec.ID, Tier: rec.Tier, State: StateRestoring, ReadyBy: rec.ReadyBy, Record: rec,
 				Errors: []string{"another run of this restore is fetching; try again later"},
@@ -1187,13 +1187,13 @@ func createSpecial(e *Entry, p string, overwrite bool) error {
 	case TypeSymlink:
 		return os.Symlink(e.LinkTarget, p)
 	case TypeFifo:
-		return syscall.Mkfifo(p, e.Mode&0o777)
+		return unix.Mkfifo(p, e.Mode&0o777)
 	default:
 		kind := uint32(unix.S_IFCHR)
 		if e.Type == TypeBlockDev {
 			kind = unix.S_IFBLK
 		}
-		return unix.Mknod(p, kind|e.Mode&0o777, int(unix.Mkdev(uint32(e.DevMajor), uint32(e.DevMinor))))
+		return mknod(p, kind|e.Mode&0o777, e.DevMajor, e.DevMinor)
 	}
 }
 

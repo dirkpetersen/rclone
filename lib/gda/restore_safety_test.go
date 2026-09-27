@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +18,6 @@ import (
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 )
 
 // pendingFs reports every object as DEEP_ARCHIVE and makes the pending
@@ -329,11 +329,13 @@ func TestRestoreConcurrentResume(t *testing.T) {
 	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
 	require.NoError(t, err)
 
+	if runtime.GOOS == "aix" {
+		t.Skip("fcntl locks don't exclude the same process")
+	}
 	// Hold the lock another run would hold.
 	lock, err := os.OpenFile(filepath.Join(target, ".gda-restore-"+st.RestoreID+".lock"), os.O_RDWR, 0)
 	require.NoError(t, err)
-	defer func() { _ = lock.Close() }()
-	require.NoError(t, unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB))
+	require.NoError(t, tryLock(lock.Fd()))
 	f.pending = nil
 	st2, err := ResumeRestore(context.Background(), f, st.RestoreID, target, false)
 	require.NoError(t, err)
@@ -342,7 +344,7 @@ func TestRestoreConcurrentResume(t *testing.T) {
 	assert.Contains(t, st2.Errors[0], "another run")
 	assert.NoFileExists(t, filepath.Join(target, "results/a.dat"))
 
-	require.NoError(t, unix.Flock(int(lock.Fd()), unix.LOCK_UN))
+	require.NoError(t, lock.Close())
 	st3, err := ResumeRestore(context.Background(), f, st.RestoreID, target, false)
 	require.NoError(t, err)
 	assert.Equal(t, StateDone, st3.State)
