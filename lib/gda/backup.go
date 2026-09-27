@@ -720,9 +720,9 @@ func (b *backup) processDir(ctx context.Context, w, rel, key string, rollup bool
 		return nil
 	}
 	b.count(func(s *Stats) *int64 { return &s.IndexedDirs }, 1)
-	prev := make(map[string]Entry, len(prevEntries))
-	for _, e := range prevEntries {
-		prev[e.Name] = e
+	prev := make(map[string]*Entry, len(prevEntries))
+	for i := range prevEntries {
+		prev[prevEntries[i].Name] = &prevEntries[i]
 	}
 	cur, keep, err := b.collect(w, rel, key, rollup)
 	if err != nil {
@@ -839,13 +839,17 @@ func dirMetaChanged(cur, prev *Entry) bool {
 }
 
 // compare works out what changed in a directory since its previous index.
-func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, keep map[string]bool) *dirChange {
+func (b *backup) compare(key string, prev map[string]*Entry, cur []sourceEntry, keep map[string]bool) *dirChange {
 	c := &dirChange{}
 	seen := make(map[string]bool, len(cur))
 	for i := range cur {
 		e := &cur[i]
 		seen[e.Name] = true
-		p, had := prev[e.Name]
+		var p Entry
+		prevRow, had := prev[e.Name]
+		if had {
+			p = *prevRow
+		}
 		if had && p.IsDir() && !e.IsDir() && p.Listing == ListingIndex && isDirectChild(e.Name) {
 			// A directory with its own index was replaced by something else.
 			c.retire = append(c.retire, joinRemote(key, e.Name))
@@ -914,10 +918,11 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 			c.index = append(c.index, p)
 		}
 	}
-	for name, p := range prev {
+	for name, prevRow := range prev {
 		if seen[name] {
 			continue
 		}
+		p := *prevRow
 		if keep[name] || keepsPrefix(keep, name) {
 			c.index = append(c.index, p)
 			continue
@@ -1030,18 +1035,21 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 			skip[e.Name] = true
 		}
 	}
-	prevByName := make(map[string]Entry, len(prevEntries))
-	for _, p := range prevEntries {
-		prevByName[p.Name] = p
+	// Points into prevEntries, which indexChanged sorts, so it must not
+	// be used after that.
+	prevByName := make(map[string]*Entry, len(prevEntries))
+	for i := range prevEntries {
+		prevByName[prevEntries[i].Name] = &prevEntries[i]
 	}
-	var changes []Entry
+	// Filtered in place, as a directory may have millions of rows.
+	changes := c.changes[:0]
 	for _, row := range c.changes {
 		if skip[row.Name] {
 			continue
 		}
 		if e, ok := stored[row.Name]; ok {
 			action := row.Action
-			if action == ActionRebase && e.MD5 != prevByName[row.Name].MD5 {
+			if p := prevByName[row.Name]; action == ActionRebase && p != nil && e.MD5 != p.MD5 {
 				// Changed without its size or time changing.
 				action = ActionModify
 			}
@@ -1058,7 +1066,7 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 	}
 	for name := range skip {
 		if p, ok := prevByName[name]; ok {
-			index = append(index, p)
+			index = append(index, *p)
 		}
 	}
 	changed, err := indexChanged(prevEntries, index)
