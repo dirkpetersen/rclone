@@ -912,6 +912,10 @@ total monthly AWS bill.
     Those files don't list Deep Archive restore request fees or Direct
     Connect egress, so those keep their table values.
   - Each estimate states the date of the prices it used.
+  - The same table has storage and upload rates per storage class, and
+    each backup run logs what it cost in uploads and adds to the monthly
+    storage bill; with `--dry-run` that estimates a backup before making
+    it (implemented).
 - **The network path defaults to internet egress** (decided 2026-09-26). A
   destination can override it with Direct Connect or same-region AWS, and
   the matching rates in the price table.

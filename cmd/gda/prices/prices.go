@@ -34,10 +34,12 @@ and prints them as a price table for !rclone gda restore --prices!:
     rclone gda restore s3:bucket/lab /restore --estimate --prices prices.json
 
 It updates the retrieval rates per GB, the Flexible Retrieval request
-fees, the rate of the temporary restored copy, GET requests and egress
-to the internet. The Price List doesn't list Deep Archive restore
-request fees, nor Direct Connect egress, which depends on the location,
-so those keep their built in values; edit the file to change them.
+fees, the rate of the temporary restored copy, GET requests, egress to
+the internet, and the storage and upload rates of STANDARD and GLACIER,
+which !rclone gda backup --prices! uses for its cost estimate. The
+Price List doesn't list Deep Archive storage, upload or restore request
+fees, nor Direct Connect egress, which depends on the location, so
+those keep their built in values; edit the file to change them.
 `, "!", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",
