@@ -247,22 +247,30 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 	if err := b.putLedger(ctx, ledger); err != nil {
 		return nil, fmt.Errorf("write run ledger: %w", err)
 	}
-	var items []childDir
-	sem := make(chan struct{}, max(b.opt.Workers-1, 0))
+	// A shallow partition takes its subdirectories' totals from the plan;
+	// a whole subtree is read once, as a full run reads the tree.
+	var shallow, trees []partition
 	for _, p := range parts {
-		if p.worker != index {
-			continue
+		switch {
+		case p.worker != index:
+		case p.shallow:
+			shallow = append(shallow, p)
+		default:
+			trees = append(trees, p)
 		}
-		if !p.shallow {
-			b.summarize(p.rel, sem)
-		}
-		items = append(items, childDir{rel: p.rel, key: p.key, shallow: p.shallow})
 	}
 	if err := b.loadDedup(ctx); err != nil {
 		return nil, err
 	}
-	fs.Infof(nil, "gda: run %s: worker %d backing up %d partitions", runID, index, len(items))
+	fs.Infof(nil, "gda: run %s: worker %d backing up %d partitions", runID, index, len(shallow)+len(trees))
+	var items []childDir
+	for _, p := range shallow {
+		items = append(items, childDir{rel: p.rel, key: p.key, shallow: true})
+	}
 	b.processItems(ctx, items)
+	for _, p := range trees {
+		b.scanFrom(ctx, p.rel, p.key)
+	}
 	if err := b.checkClaim(ctx, index); err != nil {
 		b.errorf("%v", err)
 	}

@@ -1297,8 +1297,8 @@ Milestone 1 limits, each lifted by a later milestone:
   the tree once, depth first, committing each directory after its
   subdirectories, which also means only the directories being read and
   subtrees which may still be rolled up are held in memory, rather than
-  totals for every directory. Planned runs still scan once to plan and
-  again in the workers.
+  totals for every directory. Planned runs still scan once to plan; the
+  workers then read their subtrees once each.
 
 ## Alternatives considered
 
