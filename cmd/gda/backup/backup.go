@@ -211,7 +211,12 @@ from any change feed: one path per line, absolute or relative to the
 source, or the output of !zfs diff -H! with !--changes-format zfs!:
 
     zfs diff -H pool/data@yesterday pool/data@today | \
-        rclone gda backup /pool/data s3:bucket/lab --changes-from - --changes-format zfs
+        rclone gda backup /pool/data/.zfs/snapshot/today s3:bucket/lab \
+        --changes-from - --changes-format zfs
+
+Backing up the snapshot rather than the live file system means the
+files don't change while they are read. zfs diff names paths where the
+file system is mounted, which a source in a snapshot is taken to be.
 
 GPFS policy lists and Lustre changelogs can be turned into a list of
 paths. A change run needs a full run first, and full runs should still
