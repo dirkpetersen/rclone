@@ -13,12 +13,16 @@ import (
 
 // rcloneArgs are the first arguments which are passed to rclone itself
 // rather than to 'rclone gda', so remotes can be set up and the version
-// shown without a separate rclone binary.
+// shown without a separate rclone binary. Only the first argument is
+// looked at, so global flags go after these commands.
 var rcloneArgs = map[string]bool{
-	"config":    true,
-	"version":   true,
-	"--version": true,
-	"-V":        true,
+	"completion":  true,
+	"config":      true,
+	"listremotes": true,
+	"obscure":     true,
+	"version":     true,
+	"--version":   true,
+	"-V":          true,
 }
 
 func main() {
@@ -33,7 +37,12 @@ func gdaArgs(args []string) []string {
 		return args
 	}
 	out := append([]string{args[0], "gda"}, args[1:]...)
-	if len(args) == 1 {
+	switch {
+	case len(args) == 1:
+		out = append(out, "--help")
+	case args[1] == "help":
+		// 'rclone gda' has no help command.
+		out = append([]string{args[0], "gda"}, args[2:]...)
 		out = append(out, "--help")
 	}
 	return out

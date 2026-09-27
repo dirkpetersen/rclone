@@ -76,6 +76,8 @@ func TestBackupWithoutDelete(t *testing.T) {
 	var held lockInfo
 	require.NoError(t, json.Unmarshal(data, &held))
 	assert.True(t, held.Released)
+	assert.True(t, held.Refreshed.IsZero() && held.Started.IsZero(), "no times, for older versions to take it over")
+	assert.Error(t, (&backup{d: &dest{f: f}, runID: held.RunID}).checkRunLock(ctx), "a released lock isn't held")
 	assert.FileExists(t, filepath.Join(dst, filepath.FromSlash(dedupGCKey)))
 	assert.Equal(t, 6, dedupCSVs(), "5 runs and one merge")
 	marks, err := readRebase(ctx, &dest{f: f})

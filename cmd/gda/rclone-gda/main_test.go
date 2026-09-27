@@ -18,6 +18,9 @@ func TestGdaArgs(t *testing.T) {
 		{[]string{"rclone-gda", "version"}, []string{"rclone-gda", "version"}},
 		{[]string{"rclone-gda", "--version"}, []string{"rclone-gda", "--version"}},
 		{[]string{"rclone-gda", "config"}, []string{"rclone-gda", "config"}},
+		{[]string{"rclone-gda", "listremotes"}, []string{"rclone-gda", "listremotes"}},
+		{[]string{"rclone-gda", "help"}, []string{"rclone-gda", "gda", "--help"}},
+		{[]string{"rclone-gda", "help", "restore"}, []string{"rclone-gda", "gda", "restore", "--help"}},
 	} {
 		assert.Equal(t, test.want, gdaArgs(test.in), test.in)
 	}

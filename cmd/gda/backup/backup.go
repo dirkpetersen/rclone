@@ -4,10 +4,12 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -82,25 +84,45 @@ func writeReport(outcome string, ledger *libgda.Ledger, runErr error) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(ledgerFile, append(data, '\n'), 0o666); err != nil {
+	// Written whole, so that a script polling for it never reads part.
+	tmp := ledgerFile + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o666); err != nil {
+		return fmt.Errorf("write ledger file: %w", err)
+	}
+	if err := os.Rename(tmp, ledgerFile); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write ledger file: %w", err)
 	}
 	return nil
 }
 
 // readChanges reads the change list given with --changes-from, returning
-// only the paths below src.
-func readChanges(src string) ([]string, error) {
-	in := os.Stdin
+// the paths below src and the number of lines read.
+func readChanges(src string) (changes []string, lines int, err error) {
+	var in io.Reader = os.Stdin
 	if changesFrom != "-" {
 		f, err := os.Open(changesFrom)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		defer func() { _ = f.Close() }()
 		in = f
 	}
-	return libgda.ParseChanges(in, changesFormat, src)
+	counter := &lineCounter{r: in}
+	changes, err = libgda.ParseChanges(counter, changesFormat, src)
+	return changes, counter.lines, err
+}
+
+// lineCounter counts the lines read through it.
+type lineCounter struct {
+	r     io.Reader
+	lines int
+}
+
+func (c *lineCounter) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.lines += bytes.Count(p[:n], []byte{'\n'})
+	return n, err
 }
 
 // addFlags adds the options which shape a backup to flagSet.
@@ -351,14 +373,16 @@ and the user's rights allow.
 			if runID != "" {
 				return errors.New("--changes-from can't be used with --run")
 			}
-			changes, err := readChanges(src)
+			changes, lines, err := readChanges(src)
 			if err != nil {
 				return err
 			}
 			if len(changes) == 0 {
 				// A change list may cover a whole file system with
-				// several sources on it, not all of them changed.
-				fs.Logf(nil, "gda: the change list has no paths below %s, so there is nothing to back up", src)
+				// several sources on it, not all of them changed. The
+				// count shows a source given by another path than the
+				// list's, such as through a symlink.
+				fs.Logf(nil, "gda: none of the %d lines of the change list is below %s, so there is nothing to back up", lines, src)
 				return writeReport(outcomeNoChanges, nil, nil)
 			}
 			opt.Changes = changes

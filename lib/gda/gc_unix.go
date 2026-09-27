@@ -207,7 +207,9 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 	if opt.DeleteOrphans || opt.DeleteExpired {
 		var err error
 		if versioned, err = isVersioned(ctx, dst); err != nil {
-			return r.GCReport, fmt.Errorf("check bucket versioning: %w", err)
+			// Deleting keys only leaves the data of a versioned bucket
+			// billed, which is no worse than not deleting it.
+			fs.Logf(nil, "gda: can't check bucket versioning, so deleting keys rather than versions: %v", err)
 		}
 	}
 	if opt.DeleteOrphans {
@@ -243,7 +245,7 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 					err = obj.Remove(ctx)
 				}
 			} else {
-				err = removeData(ctx, dst, versioned, o.Key)
+				err = removeData(ctx, dst, versioned, o.Key, nil)
 			}
 			if err != nil {
 				r.errorf("remove %q: %v", o.Key, err)
@@ -302,13 +304,28 @@ func (r *gcScan) deleteExpired(ctx context.Context, d *dest, b *backup, versione
 		r.errorf("record kept history: %v", err)
 		return
 	}
+	// Versions of keys which rows still refer to, which a reference to
+	// the same key without a version mustn't remove.
+	inUse := map[string]map[string]bool{}
+	for ref := range r.needed {
+		key, version := splitVersionKey(ref)
+		if inUse[key] == nil {
+			inUse[key] = map[string]bool{}
+		}
+		inUse[key][version] = true
+	}
 	removed := map[string]bool{}
 	for _, o := range r.Expired {
 		if b.isStopped() {
 			r.errorf("stopped removing expired data as the destination lock was lost")
 			break
 		}
-		err := removeData(ctx, d.f, versioned, o.Key)
+		key, _ := splitVersionKey(o.Key)
+		err := removeData(ctx, d.f, versioned, o.Key, inUse[key])
+		if errors.Is(err, errVersionsInUse) {
+			fs.Logf(o.Key, "gda: not removing expired data, as %v", err)
+			continue
+		}
 		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
 			r.errorf("remove %q: %v", o.Key, err)
 			continue
@@ -492,6 +509,9 @@ func (r *gcScan) scanDir(ctx context.Context, d *dest, dir string, entries fs.Di
 	r.Directories++
 	for ref := range neededElsewhere {
 		r.needed[ref] = true
+	}
+	for ref := range neededHere {
+		r.needed[joinRemote(dir, ref)] = true
 	}
 	if r.HistoryFrom != "" {
 		for _, o := range objects {

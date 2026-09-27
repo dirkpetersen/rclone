@@ -48,6 +48,8 @@ func TestWriteReport(t *testing.T) {
 	got = read()
 	assert.Equal(t, map[string]any{"Outcome": "no changes"}, got)
 
+	assert.NoFileExists(t, ledgerFile+".tmp")
+
 	ledgerFile = filepath.Join(dir, "missing", "ledger.json")
 	assert.Error(t, writeReport(outcomeOK, nil, nil))
 }
@@ -58,11 +60,12 @@ func TestReadChangesOutsideSource(t *testing.T) {
 	changesFrom = filepath.Join(dir, "changes")
 	require.NoError(t, os.WriteFile(changesFrom, []byte("/other/a\n/data/lab1/b\n"), 0o666))
 
-	changes, err := readChanges("/data/lab2")
+	changes, lines, err := readChanges("/data/lab2")
 	require.NoError(t, err)
 	assert.Empty(t, changes)
+	assert.Equal(t, 2, lines)
 
-	changes, err = readChanges("/data/lab1")
+	changes, _, err = readChanges("/data/lab1")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"b"}, changes)
 }

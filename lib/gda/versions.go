@@ -89,14 +89,23 @@ func isVersioned(ctx context.Context, f fs.Fs) (bool, error) {
 	return vf.IsVersioned(ctx)
 }
 
+// errVersionsInUse is returned by removeData for a reference without a
+// version to a key whose versions are all in use.
+var errVersionsInUse = errors.New("other versions of it are in use")
+
 // removeData deletes the data a reference made by versionKey refers to.
 // Deleting a key in a versioned bucket only hides its data behind a
 // delete marker, so there the version itself is deleted: the one the
-// reference names, or else the key's only version, or else the one
-// stored before versioning was enabled, which is the one a reference
-// without a version refers to when a key has several.
-func removeData(ctx context.Context, f fs.Fs, versioned bool, ref string) error {
+// reference names, or else the one stored before versioning was
+// enabled, which is the one a reference without a version refers to if
+// the key has it, or else the key's only version. inUse holds the IDs of
+// the key's versions which rows still refer to, which are never
+// deleted.
+func removeData(ctx context.Context, f fs.Fs, versioned bool, ref string, inUse map[string]bool) error {
 	key, version := splitVersionKey(ref)
+	if inUse[version] {
+		return errVersionsInUse
+	}
 	if version == "" && versioned {
 		vl, ok := f.(versionLister)
 		if !ok {
@@ -109,12 +118,17 @@ func removeData(ctx context.Context, f fs.Fs, versioned bool, ref string) error 
 		switch {
 		case len(ids) == 0:
 			return fs.ErrorObjectNotFound
-		case len(ids) == 1:
-			version = ids[0]
 		case slices.Contains(ids, "null"):
 			version = "null"
+		case len(inUse) > 0:
+			return errVersionsInUse
+		case len(ids) == 1:
+			version = ids[0]
 		default:
 			return fmt.Errorf("not removing it, as it has %d versions and none was stored before versioning was enabled", len(ids))
+		}
+		if inUse[version] {
+			return errVersionsInUse
 		}
 	}
 	o, err := newDataObject(ctx, f, versionKey(key, version))

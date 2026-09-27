@@ -84,7 +84,7 @@ superseded and deleted files stay, as all history is kept.
 
 In a bucket with versioning enabled, removing data deletes the stored
 version itself, as deleting the key would only hide it behind a delete
-marker and leave it billed.
+marker and leave it billed. Versions which rows still need are kept.
 
 When removing anything, gc also merges the dedup index files if backups
 left that to it, as they do when their credentials can't delete.

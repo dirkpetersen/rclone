@@ -381,7 +381,7 @@ func (b *backup) checkRunLock(ctx context.Context) error {
 		return fmt.Errorf("run %s: read lock: %w", b.runID, err)
 	}
 	var held lockInfo
-	if err := json.Unmarshal(data, &held); err != nil || held.RunID != b.runID {
+	if err := json.Unmarshal(data, &held); err != nil || held.RunID != b.runID || held.Released {
 		return fmt.Errorf("the destination lock isn't held by run %s", b.runID)
 	}
 	return nil

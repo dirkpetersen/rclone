@@ -92,6 +92,10 @@ jobs:
               echo "::error::tag $version isn't a fork release of $base, the VERSION it was tagged on"
               exit 1
             fi
+            if ! git branch -r --contains "$GITHUB_SHA" | grep -q 'origin/gda-v'; then
+              echo "::error::tag $version isn't on a gda-vX.Y release branch"
+              exit 1
+            fi
           elif ! version=$(git describe --tags --match 'v*.*.*.*' 2>/dev/null); then
             version="$base-beta.$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
           fi
