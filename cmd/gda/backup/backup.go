@@ -30,11 +30,11 @@ var (
 	dedupMin      = fs.SizeSuffix(opt.DedupMin)
 	compressMax   = fs.SizeSuffix(opt.CompressMax)
 	pricesFile    = ""
+	indexCache    = ""
 )
 
 func init() {
 	opt.Workers = min(runtime.NumCPU(), 15)
-	opt.IndexCache = filepath.Join(config.GetCacheDir(), "gda")
 	addFlags(Command.Flags())
 	flagSet := Command.Flags()
 	flags.StringVarP(flagSet, &runID, "run", "", runID, "Back up a partition of this planned run (see rclone gda plan)", "")
@@ -90,7 +90,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.FVarP(flagSet, &compressMax, "compress-max", "", "Store standalone files bigger than this uncompressed", "")
 	flags.BoolVarP(flagSet, &opt.Xattrs, "xattrs", "", opt.Xattrs, "Keep extended attributes, including ACLs (Linux only)", "")
 	flags.StringVarP(flagSet, &pricesFile, "prices", "", pricesFile, "JSON file with the prices to use for the cost estimate (default built in)", "")
-	flags.StringVarP(flagSet, &opt.IndexCache, "index-cache-dir", "", opt.IndexCache, "Directory for local copies of the destination's indexes (\"\" to disable)", "")
+	flags.StringVarP(flagSet, &indexCache, "index-cache-dir", "", indexCache, "Directory for local copies of the destination's indexes, or off (default gda in rclone's cache directory)", "")
 	flags.IntVarP(flagSet, &opt.Workers, "workers", "", opt.Workers, "Directories to back up in parallel (default one per CPU, up to 15)", "")
 }
 
@@ -101,6 +101,14 @@ func setSizes() {
 	opt.RollupMax = int64(rollupMax)
 	opt.DedupMin = int64(dedupMin)
 	opt.CompressMax = int64(compressMax)
+	switch indexCache {
+	case "off":
+		opt.IndexCache = ""
+	case "":
+		opt.IndexCache = filepath.Join(config.GetCacheDir(), "gda")
+	default:
+		opt.IndexCache = indexCache
+	}
 }
 
 // logLedger logs what a run did.
@@ -214,26 +222,26 @@ the stored copy instead of being uploaded again. Only files of a size
 some stored copy has are read to check.
 
 A run keeps a copy of every index it reads or writes in
-!--index-cache-dir!. The next run uses the copies instead of reading the
-indexes again if no other run has written to the destination since,
-which saves a request per directory; otherwise it starts the cache
-afresh. Runs split over several hosts don't use it. Don't edit indexes
-by hand while a cache holds them.
+!--index-cache-dir! (!off! to disable). The next run uses the copies
+instead of reading the indexes again if no other run has written to the
+destination since, which saves a request per directory; otherwise it
+starts the cache afresh. Runs split over several hosts don't use it.
+Don't edit indexes by hand while a cache holds them.
 
 When a directory's unchanged files are spread over more than 20 packs,
 and over more than twice the packs they would fill, as happens after
-many small changes, the run packs them again from the
-source, so restoring the directory needs fewer objects. The old packs
-are kept for the history.
+many small changes, the run packs them again from the source, so
+restoring the directory needs fewer objects. The old packs are kept for
+the history.
 
 Each run logs an estimate of what it cost in upload requests and adds
 to the monthly storage bill, from the built in prices or !--prices!
 (see !rclone gda prices!); with !--dry-run! this estimates a backup
-before making it, counting data before compression and
-deduplication, so as an upper bound. Uploads are counted as one request
-per object, which they are for packs when !--s3-upload-cutoff! is above
-!--pack-size!; each part of a multipart upload is charged too. Metadata storage and the requests of reading indexes
-are small and not counted.
+before making it, counting data before compression and deduplication,
+so as an upper bound. Uploads are counted as one request per object,
+which they are for packs when !--s3-upload-cutoff! is above
+!--pack-size!; each part of a multipart upload is charged too. Metadata
+storage and the requests of reading indexes are small and not counted.
 
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose
