@@ -380,15 +380,23 @@ func ReadEntries(r io.Reader) ([]Entry, error) {
 	return entries, nil
 }
 
-// encodeName returns name as valid UTF-8 and the name encoding used.
+// encodeName returns name as valid UTF-8 without control characters,
+// and the name encoding used. Backends map control characters in object
+// names differently, so names holding them are encoded to keep keys the
+// same whichever backend lists them.
 //
 // Names which contain "%" are encoded too, so that an encoded name can
 // never equal a name which wasn't encoded.
 func encodeName(name string) (string, string) {
-	if utf8.ValidString(name) && !strings.Contains(name, "%") {
+	if utf8.ValidString(name) && !strings.Contains(name, "%") && !strings.ContainsFunc(name, isControl) {
 		return name, ""
 	}
 	return url.PathEscape(name), NameEncodingPercent
+}
+
+// isControl returns true for the ASCII control characters.
+func isControl(r rune) bool {
+	return r < 0x20 || r == 0x7f
 }
 
 // DecodeName returns the original bytes of an entry's name.

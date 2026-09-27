@@ -73,6 +73,10 @@ func TestEncodeName(t *testing.T) {
 	assert.Equal(t, NameEncodingPercent, enc)
 	assert.NotEqual(t, "100%.txt", name)
 
+	name, enc = encodeName("new\nline")
+	assert.Equal(t, NameEncodingPercent, enc)
+	assert.Equal(t, "new%0Aline", name)
+
 	raw := "bad\xffname%"
 	name, enc = encodeName(raw)
 	assert.Equal(t, NameEncodingPercent, enc)

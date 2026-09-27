@@ -21,6 +21,7 @@ import (
 	"time"
 
 	_ "github.com/rclone/rclone/backend/local"
+	_ "github.com/rclone/rclone/backend/memory"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/stretchr/testify/assert"
