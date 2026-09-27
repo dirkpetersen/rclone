@@ -215,8 +215,13 @@ func (d *dest) get(ctx context.Context, remote string) (data []byte, err error) 
 // exists returns true if an object exists at remote.
 func (d *dest) exists(ctx context.Context, remote string) (bool, error) {
 	_, err := d.f.NewObject(ctx, remote)
-	if errors.Is(err, fs.ErrorObjectNotFound) {
+	switch {
+	case errors.Is(err, fs.ErrorObjectNotFound):
 		return false, nil
+	case errors.Is(err, fs.ErrorIsDir):
+		// On a file system destination, a directory of the same name
+		// takes the name as surely as an object does.
+		return true, nil
 	}
 	return err == nil, err
 }
