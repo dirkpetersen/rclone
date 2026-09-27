@@ -1143,22 +1143,41 @@ func (b *backup) countChanges(changes []Entry, indexRows int) {
 	b.stats.Unchanged += int64(indexRows - live)
 }
 
-// indexChanged returns true if the index would change.
+// indexChanged returns true if the index would change. It sorts both
+// slices.
 func indexChanged(prev, next []Entry) (bool, error) {
-	if prev == nil {
+	if prev == nil || len(prev) != len(next) {
 		return true, nil
 	}
-	prev = append([]Entry(nil), prev...)
 	sortEntries(prev)
 	sortEntries(next)
-	var a, b bytes.Buffer
-	if err := WriteEntries(&a, prev); err != nil {
+	for i := range prev {
+		same, err := sameRow(&prev[i], &next[i])
+		if err != nil || !same {
+			return !same, err
+		}
+	}
+	return false, nil
+}
+
+// sameRow returns true if a and b are written as the same index row.
+func sameRow(a, b *Entry) (bool, error) {
+	// Most rows are equal field by field. Times needn't be, as their
+	// locations differ, and fields can differ in ways the row doesn't
+	// show, so compare the written rows before saying they differ.
+	ac, bc := *a, *b
+	ac.ModTime, bc.ModTime = time.Time{}, time.Time{}
+	if ac == bc && a.ModTime.Equal(b.ModTime) {
+		return true, nil
+	}
+	var aRow, bRow bytes.Buffer
+	if err := WriteEntries(&aRow, []Entry{*a}); err != nil {
 		return false, err
 	}
-	if err := WriteEntries(&b, next); err != nil {
+	if err := WriteEntries(&bRow, []Entry{*b}); err != nil {
 		return false, err
 	}
-	return !bytes.Equal(a.Bytes(), b.Bytes()), nil
+	return bytes.Equal(aRow.Bytes(), bRow.Bytes()), nil
 }
 
 // storeData stores the data of entries in packs and standalone objects.
