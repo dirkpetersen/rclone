@@ -437,6 +437,9 @@ func TestBackupLockRefresh(t *testing.T) {
 	done()
 	assert.Equal(t, "20260926T000000Z", readLock().RunID)
 	assert.Equal(t, int64(1), b.stats.Errors)
+	// Nor does it remove the lock the other run holds.
+	b.unlock(context.Background())
+	assert.Equal(t, "20260926T000000Z", readLock().RunID)
 }
 
 func TestBackupSplitIndex(t *testing.T) {

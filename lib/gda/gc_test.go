@@ -34,8 +34,15 @@ func TestGC(t *testing.T) {
 
 	// A pack left by a crashed run, one listed only in the dedup index,
 	// and a file which isn't GDA's.
-	orphan := filepath.Join(dst, "results", "results.gda.20200101T000000Z.w09.001.tar")
+	orphanName := "results.gda." + NewRunID(time.Now()) + ".w09.001.tar"
+	orphan := filepath.Join(dst, "results", orphanName)
 	require.NoError(t, os.WriteFile(orphan, []byte("orphan"), 0o644))
+	// Its modification time is the source file's, as for standalone
+	// objects, so it can't tell the age.
+	old := time.Now().Add(-365 * 24 * time.Hour)
+	require.NoError(t, os.Chtimes(orphan, old, old))
+	noRun := filepath.Join(dst, "results", "big.bin.gda.zst")
+	require.NoError(t, os.WriteFile(noRun, []byte("no run"), 0o644))
 	kept := filepath.Join(dst, "results", "results.gda.20200101T000000Z.w09.002.tar")
 	require.NoError(t, os.WriteFile(kept, []byte("kept"), 0o644))
 	require.NoError(t, os.MkdirAll(filepath.Join(dst, MetaDir, "dedup"), 0o755))
@@ -46,9 +53,10 @@ func TestGC(t *testing.T) {
 
 	r, err = GC(context.Background(), f, GCOptions{})
 	require.NoError(t, err)
-	require.Len(t, r.Orphans, 1)
-	assert.Equal(t, "results/results.gda.20200101T000000Z.w09.001.tar", r.Orphans[0].Key)
-	assert.Equal(t, int64(6), r.OrphanBytes)
+	require.Len(t, r.Orphans, 2)
+	assert.Equal(t, "results/big.bin.gda.zst", r.Orphans[0].Key)
+	assert.Equal(t, "results/"+orphanName, r.Orphans[1].Key)
+	assert.Equal(t, int64(12), r.OrphanBytes)
 	require.Len(t, r.Unknown, 1)
 	assert.Equal(t, "results/notes.txt", r.Unknown[0].Key)
 	assert.FileExists(t, orphan)
@@ -63,6 +71,9 @@ func TestGC(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), r.Deleted)
 	assert.NoFileExists(t, orphan)
+	// Without a run in its name, an orphan's age isn't known.
+	assert.FileExists(t, noRun)
+	require.NoError(t, os.Remove(noRun))
 	assert.FileExists(t, kept)
 	assert.FileExists(t, foreign)
 	assert.NoFileExists(t, filepath.Join(dst, MetaDir, "lock"))
@@ -72,6 +83,11 @@ func TestGC(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dst, MetaDir, "lock"), []byte(lock), 0o644))
 	_, err = GC(context.Background(), f, GCOptions{DeleteOrphans: true, LockTimeout: time.Hour})
 	assert.ErrorContains(t, err, "locked by run")
+	require.NoError(t, os.Remove(filepath.Join(dst, MetaDir, "lock")))
+
+	// Below the root it can't see the lock or the dedup index.
+	_, err = GC(context.Background(), newDst(t, filepath.Join(dst, "results")), GCOptions{})
+	assert.ErrorContains(t, err, "isn't the root of a GDA tree")
 
 	// Everything still restores.
 	require.NoError(t, os.Remove(foreign))

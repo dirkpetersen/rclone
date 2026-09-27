@@ -84,7 +84,7 @@ func Plan(ctx context.Context, srcRoot string, dst fs.Fs, opt Options, workers i
 	sw := csv.NewWriter(&sums)
 	_ = sw.Write([]string{"rel", "tree_size", "tree_files", "standalone", "unreadable", "bad_name"})
 	for _, p := range parts {
-		s := b.summaries[p.rel]
+		s := b.summary(p.rel)
 		_ = sw.Write([]string{p.rel, strconv.FormatInt(s.treeSize, 10), strconv.FormatInt(s.treeFiles, 10),
 			strconv.FormatBool(s.standalone), strconv.FormatBool(s.unreadable), strconv.FormatBool(s.badName)})
 	}
@@ -121,7 +121,7 @@ func Plan(ctx context.Context, srcRoot string, dst fs.Fs, opt Options, workers i
 // subtree holds more than its share of files, then assigns them to
 // workers largest first.
 func (b *backup) partition(workers int) []partition {
-	total := b.summaries[""].treeFiles
+	total := b.summary("").treeFiles
 	// Several partitions per worker even out their sizes.
 	limit := max(total/int64(workers*4), 1)
 	var parts []partition
@@ -129,7 +129,7 @@ func (b *backup) partition(workers int) []partition {
 	for len(queue) > 0 {
 		p := queue[0]
 		queue = queue[1:]
-		s := b.summaries[p.rel]
+		s := b.summary(p.rel)
 		children := b.childDirs(p.rel, p.key)
 		if s.treeFiles <= limit || b.rollupEligible(p.rel) || len(children) == 0 {
 			p.files = s.treeFiles
@@ -140,7 +140,7 @@ func (b *backup) partition(workers int) []partition {
 		p.shallow = true
 		p.files = s.treeFiles
 		for _, c := range children {
-			p.files -= b.summaries[c.rel].treeFiles
+			p.files -= b.summary(c.rel).treeFiles
 		}
 		p.files = max(p.files, 1)
 		parts = append(parts, p)
@@ -175,7 +175,7 @@ func (b *backup) childDirs(rel, key string) []partition {
 			continue
 		}
 		info, err := os.Lstat(sourcePath(b.srcRoot, childRel))
-		if err != nil || !info.IsDir() || b.summaries[childRel] == nil {
+		if err != nil || !info.IsDir() || b.summary(childRel) == nil {
 			continue
 		}
 		encName, _ := encodeName(name)
@@ -405,7 +405,7 @@ func (b *backup) readPlan(ctx context.Context) ([]partition, error) {
 		s.treeSize, err1 = strconv.ParseInt(r[1], 10, 64)
 		s.treeFiles, err2 = strconv.ParseInt(r[2], 10, 64)
 		s.standalone, s.unreadable, s.badName = r[3] == "true", r[4] == "true", r[5] == "true"
-		b.summaries[r[0]] = s
+		b.setSummary(r[0], s)
 		return errors.Join(err1, err2)
 	})
 	if err != nil {

@@ -554,9 +554,16 @@ func (b *backup) refreshLock(ctx context.Context) error {
 	return nil
 }
 
-// unlock removes the destination lock.
+// unlock removes the destination lock, unless another run has taken it
+// over.
 func (b *backup) unlock(ctx context.Context) {
 	if b.d.dryRun {
+		return
+	}
+	data, err := b.d.get(ctx, lockKey)
+	var held lockInfo
+	if err == nil && json.Unmarshal(data, &held) == nil && held.RunID != b.runID {
+		fs.Errorf(nil, "gda: not removing the lock, which run %s on %s holds now", held.RunID, held.Host)
 		return
 	}
 	o, err := b.d.f.NewObject(ctx, lockKey)
@@ -639,10 +646,18 @@ func (b *backup) setSummary(rel string, s *dirSummary) {
 	b.summaries[rel] = s
 }
 
+// summary returns the summary of the subtree at rel, or nil. Change runs
+// add summaries while directories are being processed.
+func (b *backup) summary(rel string) *dirSummary {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.summaries[rel]
+}
+
 // rollupEligible returns true if the subtree at rel could be packed as
 // one unit.
 func (b *backup) rollupEligible(rel string) bool {
-	s := b.summaries[rel]
+	s := b.summary(rel)
 	return b.opt.RollupMax > 0 && s != nil && s.treeSize < b.opt.RollupMax &&
 		!s.standalone && !s.unreadable && !s.badName && !s.noRollup
 }
@@ -730,7 +745,7 @@ func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, ke
 			cur = append(cur, e)
 			continue
 		}
-		s := b.summaries[childRel]
+		s := b.summary(childRel)
 		if s == nil {
 			// Created since the scan; the next run backs it up.
 			keep[encName] = true
