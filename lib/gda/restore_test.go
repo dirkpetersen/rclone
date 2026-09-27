@@ -5,6 +5,7 @@ package gda
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -251,4 +252,46 @@ func TestParseAt(t *testing.T) {
 	assert.Equal(t, "20260926T120000Z", got)
 	_, err = ParseAt("yesterday")
 	assert.Error(t, err)
+}
+
+func TestCheckpoints(t *testing.T) {
+	fakeClock(t)
+	old := checkpointEvery
+	checkpointEvery = 3 * time.Minute // the fake clock moves a minute a run
+	t.Cleanup(func() { checkpointEvery = old })
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	var runs []string
+	var contents []string
+	for i := range 6 {
+		writeFile(t, src, "d/f.txt", 10+i)
+		writeFile(t, src, fmt.Sprintf("d/new%d.txt", i), 5)
+		l := runBackup(t, src, dst, opt)
+		runs = append(runs, l.RunID)
+		data, err := os.ReadFile(filepath.Join(src, "d/f.txt"))
+		require.NoError(t, err)
+		contents = append(contents, string(data))
+	}
+	checkpoints, err := filepath.Glob(filepath.Join(dst, "d", "gda-checkpoint.*.csv"))
+	require.NoError(t, err)
+	assert.NotEmpty(t, checkpoints)
+	assert.Less(t, len(checkpoints), 6)
+
+	// Every past run reads back the same, with or without checkpoints.
+	f := newDst(t, dst)
+	for i, run := range runs {
+		entries, err := List(context.Background(), f, "d", run)
+		require.NoError(t, err)
+		assert.Len(t, entries, i+2, run)
+		target := t.TempDir()
+		at := restoreOptions("d/f.txt")
+		at.At = run
+		_, err = StartRestore(context.Background(), f, target, at)
+		require.NoError(t, err)
+		got, err := os.ReadFile(filepath.Join(target, "d/f.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, contents[i], string(got), run)
+	}
 }

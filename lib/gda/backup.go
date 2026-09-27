@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -825,9 +826,55 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 			return false
 		}
 		b.count(func(s *Stats) *int64 { return &s.MetaObjects }, 1)
+		if err := b.checkpoint(ctx, key, index); err != nil {
+			// Checkpoints only speed up replaying history.
+			fs.Errorf(nil, "gda: checkpoint %q: %v", rel, err)
+		}
 	}
 	b.countChanges(changes, len(index))
 	return true
+}
+
+// checkpointEvery is how often a directory's index is saved as a
+// checkpoint, from which its history can be replayed rather than from
+// its first changeset.
+var checkpointEvery = 30 * 24 * time.Hour
+
+// checkpoint saves a copy of the directory's new index once
+// checkpointEvery has passed since its latest checkpoint, or, if it has
+// none, since its first changeset, so a directory's first runs don't
+// write one.
+func (b *backup) checkpoint(ctx context.Context, key string, index []Entry) error {
+	if b.d.dryRun {
+		return nil
+	}
+	entries, err := b.d.f.List(ctx, key)
+	if err != nil && !errors.Is(err, fs.ErrorDirNotFound) {
+		return err
+	}
+	latest, first := "", ""
+	for _, e := range entries {
+		name := path.Base(e.Remote())
+		if m := checkpointRe.FindStringSubmatch(name); m != nil && m[1] > latest {
+			latest = m[1]
+		}
+		if m := changesetRe.FindStringSubmatch(name); m != nil && (first == "" || m[1] < first) {
+			first = m[1]
+		}
+	}
+	since := latest
+	if since == "" {
+		since = first
+	}
+	start, err := ParseRunID(since)
+	if err != nil {
+		return nil
+	}
+	now, err := ParseRunID(b.runID)
+	if err != nil || now.Sub(start) < checkpointEvery {
+		return err
+	}
+	return b.d.writeEntries(ctx, joinRemote(key, checkpointName(b.runID)), index, columns)
 }
 
 // countChanges adds a committed directory's changes to the stats.

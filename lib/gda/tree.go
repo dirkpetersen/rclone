@@ -17,6 +17,9 @@ import (
 // changesetRe matches changeset names and captures their run ID.
 var changesetRe = regexp.MustCompile(`\.gda\.(\d{8}T\d{6}Z)\.[^./]+\.csv$`)
 
+// checkpointRe matches checkpoint names and captures their run ID.
+var checkpointRe = regexp.MustCompile(`^gda-checkpoint\.(\d{8}T\d{6}Z)\.csv$`)
+
 // tree reads the entries of a GDA destination, as they are now or as
 // they were at the end of a past run.
 type tree struct {
@@ -81,17 +84,25 @@ func (t *tree) replay(ctx context.Context, key string) ([]Entry, error) {
 		remote string
 	}
 	var changesets []changeset
+	var checkpoint changeset
 	for _, de := range dirEntries {
 		if _, ok := de.(fs.Object); !ok {
 			continue
 		}
-		m := changesetRe.FindStringSubmatch(path.Base(de.Remote()))
+		name := path.Base(de.Remote())
+		if m := checkpointRe.FindStringSubmatch(name); m != nil {
+			if m[1] <= t.at && m[1] > checkpoint.run {
+				checkpoint = changeset{run: m[1], remote: de.Remote()}
+			}
+			continue
+		}
+		m := changesetRe.FindStringSubmatch(name)
 		if m == nil || m[1] > t.at {
 			continue
 		}
 		changesets = append(changesets, changeset{run: m[1], remote: de.Remote()})
 	}
-	if len(changesets) == 0 {
+	if len(changesets) == 0 && checkpoint.run == "" {
 		return nil, nil
 	}
 	sort.Slice(changesets, func(i, j int) bool {
@@ -101,7 +112,25 @@ func (t *tree) replay(ctx context.Context, key string) ([]Entry, error) {
 		return changesets[i].remote < changesets[j].remote
 	})
 	state := map[string]Entry{}
+	// Start from the latest checkpoint, and apply only the changesets of
+	// later runs.
+	if checkpoint.run != "" {
+		data, err := t.d.get(ctx, checkpoint.remote)
+		if err != nil {
+			return nil, fmt.Errorf("read checkpoint %q: %w", checkpoint.remote, err)
+		}
+		rows, err := ReadEntries(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("parse checkpoint %q: %w", checkpoint.remote, err)
+		}
+		for _, row := range rows {
+			state[row.Name] = row
+		}
+	}
 	for _, c := range changesets {
+		if c.run <= checkpoint.run {
+			continue
+		}
 		data, err := t.d.get(ctx, c.remote)
 		if err != nil {
 			return nil, fmt.Errorf("read changeset %q: %w", c.remote, err)
