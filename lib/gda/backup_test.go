@@ -791,3 +791,27 @@ func TestBackupRebase(t *testing.T) {
 	l = runBackup(t, src, dst, opt)
 	assert.Zero(t, l.Stats.Rebased)
 }
+
+func TestBackupLedgerAtStart(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	writeFile(t, src, "dir/a.txt", 100)
+	// When data is uploaded, the run's ledger is already there, so a
+	// run which doesn't finish still shows it wrote here.
+	var ledger *Ledger
+	h := &hookFs{Fs: newDst(t, dst), put: func(remote, tier string) error {
+		if strings.HasSuffix(remote, ".tar") && ledger == nil {
+			matches, _ := filepath.Glob(filepath.Join(dst, MetaDir, "runs", "*", "w01.json"))
+			require.Len(t, matches, 1)
+			data, err := os.ReadFile(matches[0])
+			require.NoError(t, err)
+			ledger = &Ledger{}
+			require.NoError(t, json.Unmarshal(data, ledger))
+		}
+		return nil
+	}}
+	_, err := Backup(context.Background(), src, h, testOptions())
+	require.NoError(t, err)
+	require.NotNil(t, ledger)
+	assert.True(t, ledger.Finished.IsZero())
+}
