@@ -77,9 +77,11 @@ unless !--overwrite! is given.
 Permissions and modification times are always restored, also on files
 which were already identical. Owner, group, setuid, setgid and device
 files are restored only when running as root, by name where the name
-exists and by numeric ID otherwise. Nothing is written through symlinks
-in the target directory: a symlink or file where the backup has a
-directory is a conflict like any other.
+exists and by numeric ID otherwise. Files which were links to the same
+file are linked again, and extended attributes backed up with
+!--xattrs! are set where the user may set them. Nothing is written
+through symlinks in the target directory: a symlink or file where the
+backup has a directory is a conflict like any other.
 
 If restored copies expire before they are fetched, !--resume! requests
 them again. !--resume! always takes the target directory and
@@ -95,8 +97,8 @@ restore requests, the temporary restored copy, download requests and
 egress. !--egress-path! and !--egress-waiver! say how downloads are
 charged, and !--prices! replaces the built in price table, which holds
 AWS list prices as of the date it shows; !rclone gda prices! writes a
-current one. !--max-cost! refuses to start a
-restore whose estimate is higher, counting egress only without a waiver.
+current one. !--max-cost! refuses to start a restore whose estimate is
+higher, counting egress only without a waiver.
 
 With !--json! the estimate and the progress are printed as JSON for
 other programs, such as Motuz.
