@@ -210,7 +210,8 @@ modification time changed but whose content didn't are recorded without
 uploading them again.
 
 The source must be a local path, as it is read directly with POSIX
-calls to keep owners, permissions, symlinks and special files.
+calls to keep owners, permissions, symlinks, hard links and special
+files. Extended attributes and ACLs aren't kept.
 `, "!", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",
