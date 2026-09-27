@@ -20,10 +20,15 @@ import (
 )
 
 var (
-	opt      = libgda.DefaultRestoreOptions()
-	resumeID = ""
-	jsonOut  = false
-	yes      = false
+	opt        = libgda.DefaultRestoreOptions()
+	resumeID   = ""
+	jsonOut    = false
+	yes        = false
+	estimate   = false
+	pricesFile = ""
+	egressPath = libgda.EgressInternet
+	waiver     = false
+	maxCost    = 0.0
 )
 
 func init() {
@@ -35,6 +40,11 @@ func init() {
 	flags.StringVarP(flagSet, &resumeID, "resume", "", resumeID, "Fetch what is ready of an earlier restore with this ID", "")
 	flags.BoolVarP(flagSet, &jsonOut, "json", "", jsonOut, "Print the progress as JSON", "")
 	flags.BoolVarP(flagSet, &yes, "yes", "", yes, "Don't ask for confirmation before requesting restores", "")
+	flags.BoolVarP(flagSet, &estimate, "estimate", "", estimate, "Show the cost of each retrieval tier and exit", "")
+	flags.StringVarP(flagSet, &pricesFile, "prices", "", pricesFile, "JSON file with the prices to use for estimates (default built in)", "")
+	flags.StringVarP(flagSet, &egressPath, "egress-path", "", egressPath, "Network path data is downloaded over: internet, direct-connect or same-region", "")
+	flags.BoolVarP(flagSet, &waiver, "egress-waiver", "", waiver, "Egress is waived under a data egress waiver", "")
+	flags.Float64VarP(flagSet, &maxCost, "max-cost", "", maxCost, "Refuse to start if the estimated cost is higher (0 for no limit)", "")
 	gda.Command.AddCommand(Command)
 }
 
@@ -68,8 +78,16 @@ Permissions and modification times are always restored. Owner, group,
 setuid and setgid are restored only when running as root, by name where
 the name exists and by numeric ID otherwise.
 
-With !--json! the progress is printed as JSON for other programs, such
-as Motuz.
+With !--estimate! nothing is restored: it prints what each retrieval
+tier would cost and how long it would take, broken down into retrieval,
+restore requests, the temporary restored copy, download requests and
+egress. !--egress-path! and !--egress-waiver! say how downloads are
+charged, and !--prices! replaces the built in price table, which holds
+AWS list prices as of the date it shows. !--max-cost! refuses to start a
+restore whose estimate is higher, counting egress only without a waiver.
+
+With !--json! the estimate and the progress are printed as JSON for
+other programs, such as Motuz.
 `, "!", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",
@@ -89,21 +107,49 @@ as Motuz.
 		dst := cmd.NewFsDir(args[0:1])
 		cmd.Run(false, false, command, func() error {
 			ctx := context.Background()
-			var st *libgda.RestoreStatus
-			var err error
 			if resumeID != "" {
-				st, err = libgda.ResumeRestore(ctx, dst, resumeID, target)
-			} else {
-				if !yes && !jsonOut && !fs.GetConfig(ctx).DryRun {
-					if err := confirm(opt); err != nil {
-						return err
-					}
+				st, err := libgda.ResumeRestore(ctx, dst, resumeID, target)
+				if err != nil {
+					return err
 				}
-				st, err = libgda.StartRestore(ctx, dst, target, opt)
+				return report(st)
 			}
+			eopt := libgda.EstimateOptions{Prices: libgda.DefaultPrices(), EgressPath: egressPath, Waiver: waiver}
+			if pricesFile != "" {
+				prices, err := libgda.LoadPrices(pricesFile)
+				if err != nil {
+					return err
+				}
+				eopt.Prices = prices
+			}
+			est, err := libgda.EstimateRestore(ctx, dst, target, opt, eopt)
 			if err != nil {
 				return err
 			}
+			if estimate {
+				return reportEstimate(est)
+			}
+			chosen, ok := est.Option(opt.Tier)
+			if !ok {
+				return fmt.Errorf("tier %s isn't available for this data", opt.Tier)
+			}
+			cost := chosen.Total
+			if waiver {
+				cost = chosen.TotalWaived
+			}
+			if maxCost > 0 && float64(cost) > maxCost {
+				return fmt.Errorf("estimated cost %.2f %s is more than --max-cost %.2f", float64(cost), est.Prices.Currency, maxCost)
+			}
+			if !yes && !jsonOut && !fs.GetConfig(ctx).DryRun {
+				if err := confirm(chosen, float64(cost), est.Prices.Currency); err != nil {
+					return err
+				}
+			}
+			st, err := libgda.StartRestore(ctx, dst, target, opt)
+			if err != nil {
+				return err
+			}
+			st.Estimate = &chosen
 			return report(st)
 		})
 		return nil
@@ -111,8 +157,8 @@ as Motuz.
 }
 
 // confirm asks before requesting restores, which cost money.
-func confirm(opt libgda.RestoreOptions) error {
-	fmt.Fprintf(os.Stderr, "Request %s restores of the objects needed? This is charged by AWS. [y/N] ", opt.Tier)
+func confirm(o libgda.Option, cost float64, currency string) error {
+	fmt.Fprintf(os.Stderr, "%s, estimated cost %.2f %s. Start the restore? [y/N] ", o.Label, cost, currency)
 	var answer string
 	_, _ = fmt.Scanln(&answer)
 	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
@@ -135,6 +181,38 @@ func report(st *libgda.RestoreStatus) error {
 	}
 	if st.State == libgda.StateFailed {
 		return fmt.Errorf("%d files failed to restore", st.Files.Failed)
+	}
+	return nil
+}
+
+// reportEstimate prints the cost of each retrieval tier.
+func reportEstimate(est *libgda.Estimate) error {
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(est)
+	}
+	sel := est.Selection
+	fmt.Printf("Restore %d files (%s), %d objects to restore (%s), %s to download\n",
+		sel.Files, fs.SizeSuffix(sel.Bytes), sel.ObjectsToRestore, fs.SizeSuffix(sel.BytesToRestore), fs.SizeSuffix(sel.BytesToDownload))
+	fmt.Printf("Prices: %s, %s, %s. Egress path: %s. Egress waiver: %v\n\n",
+		est.Prices.Region, est.Prices.Date, est.Prices.Currency, est.Egress.Path, est.Egress.Waiver)
+	fmt.Printf("%-10s %-10s %10s %10s %10s %10s %10s %10s %10s\n", "Option", "Ready in", "Retrieval", "Requests", "Temp copy", "Downloads", "Egress", "Total", "No egress")
+	for _, o := range est.Options {
+		ready := "now"
+		if o.ReadyWithinHours > 0 {
+			ready = fmt.Sprintf("%d hours", o.ReadyWithinHours)
+		}
+		c := o.Costs
+		fmt.Printf("%-10s %-10s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n", o.Tier, ready,
+			float64(c.Retrieval), float64(c.RestoreRequests), float64(c.TemporaryCopy), float64(c.DownloadRequests), float64(c.Egress),
+			float64(o.Total), float64(o.TotalWaived))
+	}
+	if sel.NoRetrievalFiles > 0 {
+		fmt.Printf("\n%d files need no retrieval.\n", sel.NoRetrievalFiles)
+	}
+	for _, w := range est.Warnings {
+		fmt.Printf("Warning: %s\n", w)
 	}
 	return nil
 }
