@@ -44,6 +44,7 @@ type Options struct {
 	CompressMax   int64         // standalone files bigger than this are stored uncompressed
 	IndexCache    string        // directory for local copies of indexes; "" to read them all from the destination
 	Xattrs        bool          // keep extended attributes, which include ACLs
+	AllowEmpty    bool          // back up an empty source over a backup which isn't empty
 }
 
 // DefaultOptions returns the default options.
@@ -102,6 +103,7 @@ type Ledger struct {
 	Started       time.Time
 	Finished      time.Time
 	Options       Options
+	Changes       int  `json:",omitempty"` // number of paths in the change list of a change run
 	Partition     *int `json:",omitempty"` // index of the partition of a planned run
 	Attempt       int  `json:",omitempty"` // attempt at the partition, from 2 when it is run again
 	Stats         Stats
@@ -294,6 +296,13 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 		DryRun:        ci.DryRun,
 		Started:       started,
 		Options:       b.opt,
+		Changes:       len(b.opt.Changes),
+	}
+	// A change list can hold millions of paths, too many for a ledger.
+	ledger.Options.Changes = nil
+	if err := b.checkNotEmpty(ctx); err != nil {
+		b.close()
+		return nil, nil, err
 	}
 	return b, ledger, nil
 }
@@ -350,6 +359,27 @@ func (b *backup) runsDigest(ctx context.Context) (string, error) {
 	sort.Strings(runs)
 	sum := sha256.Sum256([]byte(strings.Join(runs, "\n")))
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// checkNotEmpty returns an error if the source is empty but the backup
+// isn't, as happens when a network file system isn't mounted, since
+// backing it up would record the whole tree as deleted.
+func (b *backup) checkNotEmpty(ctx context.Context) error {
+	if b.opt.AllowEmpty {
+		return nil
+	}
+	names, err := readDir(b.srcRoot)
+	if err != nil || len(names) > 0 {
+		return nil
+	}
+	index, err := b.d.readIndex(ctx, "")
+	if err != nil {
+		return err
+	}
+	if len(index) > 0 {
+		return fmt.Errorf("source %q is empty but the backup at %s isn't; check the source is mounted, or allow it with --allow-empty", b.srcRoot, fs.ConfigString(b.d.f))
+	}
+	return nil
 }
 
 // loadDedup reads the dedup index if deduplicating.
@@ -780,6 +810,11 @@ func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, ke
 			continue
 		}
 		s := b.summary(childRel)
+		if s == nil && !rollup && b.dirKeysTooLong(joinRemote(key, encName)) {
+			// A planned run leaves such directories out of its
+			// partitions, as they are packed with their parent.
+			s = b.summarize(childRel, nil)
+		}
 		if s == nil {
 			// Created since the scan; the next run backs it up.
 			keep[encName] = true
@@ -1121,9 +1156,13 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 			return false
 		}
 		b.count(func(s *Stats) *int64 { return &s.MetaObjects }, 1)
-		if err := b.checkpoint(ctx, key, index); err != nil {
-			// Checkpoints only speed up replaying history.
-			fs.Errorf(nil, "gda: checkpoint %q: %v", rel, err)
+		// A directory's first index is never due for a checkpoint, which
+		// saves listing every directory of a first run.
+		if prevEntries != nil {
+			if err := b.checkpoint(ctx, key, index); err != nil {
+				// Checkpoints only speed up replaying history.
+				fs.Errorf(nil, "gda: checkpoint %q: %v", rel, err)
+			}
 		}
 	}
 	b.countChanges(changes, len(index))

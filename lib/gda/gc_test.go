@@ -4,6 +4,7 @@ package gda
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -123,4 +124,37 @@ func TestGCCompactable(t *testing.T) {
 	assert.Equal(t, int64(1000), u.Live)
 	assert.False(t, u.Shared)
 	assert.Equal(t, int64(2000), r.DeadPackData)
+}
+
+func TestGCStaleIndexParts(t *testing.T) {
+	fakeClock(t)
+	old := maxIndexRows
+	maxIndexRows = 2
+	t.Cleanup(func() { maxIndexRows = old })
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	for i := range 5 {
+		writeFile(t, src, fmt.Sprintf("d/f%d", i), 10)
+	}
+	first := runBackup(t, src, dst, opt)
+	writeFile(t, src, "d/f5", 10)
+	runBackup(t, src, dst, opt)
+	f := newDst(t, dst)
+
+	r, err := GC(context.Background(), f, GCOptions{})
+	require.NoError(t, err)
+	require.Len(t, r.StaleIndexes, 3)
+	for _, o := range r.StaleIndexes {
+		assert.Contains(t, o.Key, first.RunID)
+	}
+	r, err = GC(context.Background(), f, GCOptions{DeleteOrphans: true, LockTimeout: time.Hour})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), r.Deleted)
+	entries, err := List(context.Background(), f, "d", "")
+	require.NoError(t, err)
+	assert.Len(t, entries, 6)
+	r, err = GC(context.Background(), f, GCOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, r.StaleIndexes)
 }

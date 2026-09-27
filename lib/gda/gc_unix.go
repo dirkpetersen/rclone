@@ -53,9 +53,10 @@ type GCReport struct {
 	DeadPackData int64       `json:"dead_pack_data"` // bytes of pack members only in history, before compression
 	Orphans      []GCObject  `json:"orphans"`        // data objects nothing refers to
 	OrphanBytes  int64       `json:"orphan_bytes"`
-	Deleted      int64       `json:"deleted"`     // orphans removed
-	Unknown      []GCObject  `json:"unknown"`     // other objects no changeset refers to, never removed
-	Compactable  []PackUsage `json:"compactable"` // packs worth rewriting
+	Deleted      int64       `json:"deleted"`       // orphans removed
+	Unknown      []GCObject  `json:"unknown"`       // other objects no changeset refers to, never removed
+	StaleIndexes []GCObject  `json:"stale_indexes"` // parts of split indexes which a later index replaced
+	Compactable  []PackUsage `json:"compactable"`   // packs worth rewriting
 	Errors       []string    `json:"errors"`
 	mu           sync.Mutex
 	referenced   map[string]bool // keys referenced from other directories
@@ -107,7 +108,7 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		defer b.unlock(ctx)
 		defer b.keepLock(ctx)()
 	}
-	r := &GCReport{Orphans: []GCObject{}, Unknown: []GCObject{}, Compactable: []PackUsage{}, Errors: []string{},
+	r := &GCReport{Orphans: []GCObject{}, Unknown: []GCObject{}, StaleIndexes: []GCObject{}, Compactable: []PackUsage{}, Errors: []string{},
 		referenced: map[string]bool{}, sharedPacks: map[string]bool{}}
 	if err := r.loadDedupRefs(ctx, d); err != nil {
 		return nil, err
@@ -157,6 +158,7 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 	}
 	sort.Slice(r.Orphans, func(i, j int) bool { return r.Orphans[i].Key < r.Orphans[j].Key })
 	sort.Slice(r.Unknown, func(i, j int) bool { return r.Unknown[i].Key < r.Unknown[j].Key })
+	sort.Slice(r.StaleIndexes, func(i, j int) bool { return r.StaleIndexes[i].Key < r.StaleIndexes[j].Key })
 	sort.Slice(r.Compactable, func(i, j int) bool { return r.Compactable[i].Key < r.Compactable[j].Key })
 	if !opt.DeleteOrphans {
 		return r, nil
@@ -165,7 +167,7 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		// A directory that couldn't be read may hold references.
 		return r, errors.New("not removing orphans as the tree couldn't be read in full")
 	}
-	for _, o := range r.Orphans {
+	for _, o := range append(r.Orphans, r.StaleIndexes...) {
 		if b.isStopped() {
 			// Another run may be writing objects which look like orphans.
 			return r, errors.New("stopped removing orphans as the destination lock was lost")
@@ -207,13 +209,16 @@ func orphanRun(key string) (time.Time, bool) {
 	if m == nil {
 		return time.Time{}, false
 	}
-	t, err := ParseRunID(m[1])
+	t, err := ParseRunID(m[1] + m[4])
 	return t, err == nil
 }
 
-// runInNameRe finds the run ID in the name of a pack or of a standalone
-// file stored under a versioned name.
-var runInNameRe = regexp.MustCompile(`\.gda\.(\d{8}T\d{6}Z)\.[^./]+(\.\d+\.tar)?(\.zst)?$`)
+// runInNameRe finds the run ID in the name of a pack, of a standalone
+// file stored under a versioned name, or of a part of a split index.
+var runInNameRe = regexp.MustCompile(`\.gda\.(\d{8}T\d{6}Z)\.[^./]+(\.\d+\.tar)?(\.zst)?$|^gda-index\.(\d{8}T\d{6}Z)\.\d+\.csv$`)
+
+// indexPartRe matches the name of a part of a split index.
+var indexPartRe = regexp.MustCompile(`^gda-index\.\d{8}T\d{6}Z\.\d+\.csv$`)
 
 // errorf records an error.
 func (r *GCReport) errorf(format string, args ...any) {
@@ -308,6 +313,23 @@ func (r *GCReport) scanDir(ctx context.Context, d *dest, dir string, entries fs.
 	if err != nil {
 		return err
 	}
+	// The parts of split indexes which the current one doesn't use.
+	var stale []GCObject
+	current := map[string]bool{}
+	if data, err := d.get(ctx, joinRemote(dir, IndexName)); err == nil && isTOC(data) {
+		parts, err := readTOC(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		for _, part := range parts {
+			current[part.name] = true
+		}
+	}
+	for _, o := range objects {
+		if name := path.Base(o.Remote()); indexPartRe.MatchString(name) && !current[name] {
+			stale = append(stale, GCObject{Key: o.Remote(), Size: o.Size(), ModTime: o.ModTime(ctx)})
+		}
+	}
 	live := map[string]map[int64]bool{}
 	var shared []string
 	for i := range index {
@@ -327,6 +349,7 @@ func (r *GCReport) scanDir(ctx context.Context, d *dest, dir string, entries fs.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.Directories++
+	r.StaleIndexes = append(r.StaleIndexes, stale...)
 	for _, key := range remote {
 		r.referenced[key] = true
 	}
