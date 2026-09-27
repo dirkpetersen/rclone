@@ -45,9 +45,9 @@ func TestBackupDedup(t *testing.T) {
 	assert.Equal(t, int64(1), l.Stats.Packs) // small.txt
 	b := readIndexFile(t, dst, "b")
 	a := readIndexFile(t, dst, "a")
-	assert.Equal(t, "a/"+a["data.bin"].Location, b["copy.bin"].DedupOf)
+	assert.Equal(t, "../a/"+a["data.bin"].Location, b["copy.bin"].DedupOf)
 	assert.Equal(t, a["data.bin"].Offset, b["copy.bin"].Offset)
-	assert.Equal(t, "a/big.bin", b["bigcopy.bin"].DedupOf)
+	assert.Equal(t, "../a/big.bin", b["bigcopy.bin"].DedupOf)
 	assert.Equal(t, "", b["copy.bin"].Location)
 	assert.Equal(t, "", b["small.txt"].DedupOf)
 	var newData []string
@@ -113,4 +113,22 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func TestRelKey(t *testing.T) {
+	for _, test := range []struct{ from, to, want string }{
+		{"", "a/x.tar", "a/x.tar"},
+		{"b", "a/x.tar", "../a/x.tar"},
+		{"a", "a/x.tar", "x.tar"},
+		{"a/b/c", "a/d/x.tar", "../../d/x.tar"},
+		{"a/b", "x.tar", "../../x.tar"},
+	} {
+		got := relKey(test.from, test.to)
+		assert.Equal(t, test.want, got, "%+v", test)
+		l := Located{IndexKey: test.from, Entry: Entry{DedupOf: got}}
+		assert.Equal(t, test.to, l.ObjectKey())
+		// And from above the tree's root.
+		l = Located{IndexKey: joinRemote("bucket/lab", test.from), Entry: Entry{DedupOf: got}}
+		assert.Equal(t, "bucket/lab/"+test.to, l.ObjectKey())
+	}
 }

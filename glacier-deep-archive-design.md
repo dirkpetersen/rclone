@@ -336,7 +336,7 @@ manifests.
 | `codec` | `zstd` | `none` or `zstd` |
 | `stored_offset`, `stored_length` | `1048576`, `2097152` | Byte range of the compressed frames holding this file, for a ranged GET |
 | `stored_size`, `stored_md5` | | Standalone objects only: size and MD5 of the bytes actually stored |
-| `dedup_of` | | Set when this file is stored once elsewhere: the `location` it points to is another directory's pack or object |
+| `dedup_of` | `../a/a.gda.20260926T120000Z.w01.001.tar` | Set when this file is stored once elsewhere: the object holding the copy, relative to this index's directory like `location`, with the copy's offsets in the offset columns |
 | `version_id` | | S3 version ID for standalone files in a versioned bucket |
 | `run` | `20260926T120000Z` | Run that wrote this version |
 | `tree_size`, `tree_files` | `52428800`, `913` | Directory rows only: total bytes and files in the whole subtree, so a browser can show folder sizes without walking |

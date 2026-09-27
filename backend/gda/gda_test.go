@@ -45,6 +45,7 @@ func backup(t *testing.T, src, dst string) string {
 	opt.PackSize = 10 * 1024
 	opt.StandaloneMin = 8 * 1024
 	opt.RollupMax = 64
+	opt.DedupMin = 1000
 	ledger, err := libgda.Backup(context.Background(), src, f, opt)
 	require.NoError(t, err)
 	// Run IDs have a resolution of one second.
@@ -379,5 +380,32 @@ func TestBrowseConcurrent(t *testing.T) {
 	}
 	for range 20 {
 		assert.NoError(t, <-errs)
+	}
+}
+
+func TestBrowseDedupFromAbove(t *testing.T) {
+	ctx := context.Background()
+	src := t.TempDir()
+	writeFile(t, src, "a/data.bin", 3000)
+	writeFile(t, src, "a/big.bin", 9000)
+	root := t.TempDir()
+	dst := filepath.Join(root, "lab")
+	backup(t, src, dst)
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "b"), 0o755))
+	for _, name := range []string{"data.bin", "big.bin"} {
+		data, err := os.ReadFile(filepath.Join(src, "a", name))
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(src, "b", name), data, 0o644))
+	}
+	backup(t, src, dst)
+
+	// Read the copies through a remote rooted above the GDA root.
+	f, err := fs.NewFs(ctx, ":gda:"+root)
+	require.NoError(t, err)
+	for _, name := range []string{"data.bin", "big.bin"} {
+		o, err := f.NewObject(ctx, "lab/b/"+name)
+		require.NoError(t, err)
+		want, _ := os.ReadFile(filepath.Join(src, "b", name))
+		assert.Equal(t, want, readAll(t, o), name)
 	}
 }

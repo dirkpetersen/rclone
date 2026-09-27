@@ -873,7 +873,7 @@ func (b *backup) storeData(ctx context.Context, w, key, label string, entries []
 		b.planData(w, label, entries, stored)
 		return stored, false
 	}
-	entries = b.dedupEntries(entries, stored)
+	entries = b.dedupEntries(key, entries, stored)
 	defer func() {
 		if !failed {
 			b.recordCopies(key, stored)

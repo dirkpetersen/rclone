@@ -114,13 +114,15 @@ func (idx *dedupIndex) save(ctx context.Context, d *dest, runID, worker string) 
 	return d.writeEntries(ctx, joinRemote(dedupDir, runID+"-"+worker+".csv"), added, columns)
 }
 
-// dedupRow returns the index row for e which refers to the stored copy
-// in copyRow.
-func dedupRow(e *sourceEntry, copyRow Entry, runID string) Entry {
+// dedupRow returns the index row for e, in the index at key, which
+// refers to the stored copy in copyRow. dedup_of is relative to the
+// index's directory, like location, so it resolves wherever the tree is
+// read from.
+func dedupRow(key string, e *sourceEntry, copyRow Entry, runID string) Entry {
 	row := e.Entry
 	row.MD5 = copyRow.MD5
 	row.Location = ""
-	row.DedupOf = copyRow.Location
+	row.DedupOf = relKey(key, copyRow.Location)
 	row.Offset = copyRow.Offset
 	row.Codec = copyRow.Codec
 	row.StoredOffset = copyRow.StoredOffset
@@ -135,7 +137,7 @@ func dedupRow(e *sourceEntry, copyRow Entry, runID string) Entry {
 // dedupEntries takes the files in entries which are copies of stored
 // content out of entries, adding their index rows to stored. Only files
 // of a size some stored copy has are hashed.
-func (b *backup) dedupEntries(entries []*sourceEntry, stored map[string]Entry) []*sourceEntry {
+func (b *backup) dedupEntries(key string, entries []*sourceEntry, stored map[string]Entry) []*sourceEntry {
 	if b.dedup == nil || b.d.dryRun {
 		return entries
 	}
@@ -156,7 +158,7 @@ func (b *backup) dedupEntries(entries []*sourceEntry, stored map[string]Entry) [
 			rest = append(rest, e)
 			continue
 		}
-		stored[e.Name] = dedupRow(e, copyRow, b.runID)
+		stored[e.Name] = dedupRow(key, e, copyRow, b.runID)
 		b.count(func(s *Stats) *int64 { return &s.Deduplicated }, 1)
 		b.count(func(s *Stats) *int64 { return &s.DeduplicatedBytes }, e.Size)
 	}
