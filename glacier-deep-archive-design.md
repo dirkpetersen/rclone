@@ -888,18 +888,23 @@ Backups delete only their own bookkeeping, and cope without the right to:
 - merging the dedup index files is left to the next `gc` which deletes
   anything, as merged files which can't be removed would pile up;
 - an upload which fails its check, or of a file which changed while it
-  was read, stays behind for `gc --delete-orphans`, or in a versioned
-  bucket as the key's current version, which no index refers to.
+  was read, stays behind: `gc --delete-orphans` removes it, except in a
+  versioned bucket under a file's own name, where it stays as the key's
+  current version, which no index refers to, until a later version
+  replaces it and the lifecycle rule below expires it.
 
 So backups can run with credentials which can't delete anything, and
 `gc` with separate ones. Set `no_check_bucket = true` on the remote for
 credentials which can't create buckets.
 
-In a versioned bucket, deleting a key only hides its data behind a
-delete marker, still billed. So `gc` deletes versions: the one a row
-names, or else the key's only version, or else the one stored before
-versioning was enabled. It leaves a key with several later versions and
-no row naming one alone, and reports it.
+In a bucket with versioning enabled (not suspended), deleting a key only
+hides its data behind a delete marker, still billed. So `gc` deletes
+versions: the one a row names, or for a row without one, the version
+stored before versioning was enabled, or else the key's only version. It
+never deletes a version which a row still needs, such as the current
+version of a file whose earliest version has expired, or one another
+directory's copy refers to. If it can't read the versioning status, it
+deletes keys.
 
 Bucket rules which suit GDA:
 

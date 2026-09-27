@@ -115,25 +115,30 @@ func (s *versionStore) ObjectVersionIDs(ctx context.Context, remote string) ([]s
 func TestRemoveData(t *testing.T) {
 	ctx := context.Background()
 	s := &versionStore{versions: map[string][]string{
-		"pack.tar": {"v1"},
-		"old.bin":  {"v3", "v2", "null"},
-		"new.bin":  {"v5", "v4"},
+		"pack.tar":  {"v1"},
+		"old.bin":   {"v3", "v2", "null"},
+		"new.bin":   {"v5", "v4"},
+		"moved.bin": {"v6"},
 	}}
 
 	// Without versioning a key is deleted.
-	require.NoError(t, removeData(ctx, s, false, "pack.tar"))
+	require.NoError(t, removeData(ctx, s, false, "pack.tar", nil))
 	assert.Equal(t, []string{"pack.tar"}, s.markers)
 	s.markers = nil
 
-	// With versioning the version is deleted: the one named, the only
-	// one, or the one stored before versioning.
-	require.NoError(t, removeData(ctx, s, true, versionKey("new.bin", "v4")))
-	require.NoError(t, removeData(ctx, s, true, "pack.tar"))
-	require.NoError(t, removeData(ctx, s, true, "old.bin"))
+	// With versioning the version is deleted: the one named, the one
+	// stored before versioning, or the only one.
+	require.NoError(t, removeData(ctx, s, true, versionKey("new.bin", "v4"), nil))
+	require.NoError(t, removeData(ctx, s, true, "pack.tar", nil))
+	require.NoError(t, removeData(ctx, s, true, "old.bin", map[string]bool{"v3": true}))
 	assert.Equal(t, []string{versionKey("new.bin", "v4"), versionKey("pack.tar", "v1"), versionKey("old.bin", "null")}, s.removed)
 
-	// A key with several versions, none from before versioning, is kept.
-	assert.ErrorContains(t, removeData(ctx, s, true, "new.bin"), "2 versions")
-	assert.ErrorIs(t, removeData(ctx, s, true, "gone.bin"), fs.ErrorObjectNotFound)
+	// Versions rows refer to are kept, and so is a key with several
+	// versions, none from before versioning.
+	assert.ErrorIs(t, removeData(ctx, s, true, "moved.bin", map[string]bool{"v6": true}), errVersionsInUse)
+	assert.ErrorIs(t, removeData(ctx, s, true, versionKey("new.bin", "v5"), map[string]bool{"v5": true}), errVersionsInUse)
+	assert.ErrorContains(t, removeData(ctx, s, true, "new.bin", nil), "2 versions")
+	assert.ErrorIs(t, removeData(ctx, s, true, "gone.bin", nil), fs.ErrorObjectNotFound)
+	assert.Len(t, s.removed, 3)
 	assert.Empty(t, s.markers)
 }

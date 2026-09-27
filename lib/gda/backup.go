@@ -640,7 +640,7 @@ func (b *backup) refreshLock(ctx context.Context) error {
 		fs.Errorf(nil, "gda: refresh lock: %v", err)
 		return nil
 	}
-	if held.RunID != b.runID {
+	if held.RunID != b.runID || held.Released {
 		return fmt.Errorf("run %s lost the destination lock, now held by run %q on %q", b.runID, held.RunID, held.Host)
 	}
 	held.Refreshed = time.Now().UTC()
@@ -679,9 +679,11 @@ func (b *backup) unlock(ctx context.Context) {
 	if err == nil {
 		return
 	}
-	// Credentials for backups may not be allowed to delete anything.
+	// Credentials for backups may not be allowed to delete anything. The
+	// marker has no times, so versions which don't know it take it over
+	// as a lock which timed out.
 	fs.Infof(nil, "gda: can't remove the lock, so marking it released: %v", err)
-	held = lockInfo{RunID: b.runID, Refreshed: time.Now().UTC(), Released: true}
+	held = lockInfo{RunID: b.runID, Released: true}
 	if data, err = json.Marshal(held); err == nil {
 		err = b.d.putBytes(ctx, lockKey, data, b.opt.MetaTier)
 	}
