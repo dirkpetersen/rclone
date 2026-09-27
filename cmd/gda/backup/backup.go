@@ -33,13 +33,38 @@ func init() {
 	flagSet := Command.Flags()
 	flags.StringVarP(flagSet, &runID, "run", "", runID, "Back up a partition of this planned run (see rclone gda plan)", "")
 	flags.IntVarP(flagSet, &partitionIndex, "partition", "", partitionIndex, "Index of the worker whose partitions to back up with --run", "")
+	flags.StringVarP(flagSet, &changesFrom, "changes-from", "", changesFrom, "Back up only the directories of the paths in this file (- for stdin)", "")
+	flags.StringVarP(flagSet, &changesFormat, "changes-format", "", changesFormat, "Format of --changes-from: lines, or zfs for zfs diff -H output", "")
 	gda.Command.AddCommand(Command)
 }
 
 var (
 	runID          = ""
 	partitionIndex = -1
+	changesFrom    = ""
+	changesFormat  = libgda.ChangesLines
 )
+
+// readChanges reads the change list given with --changes-from.
+func readChanges(src string) ([]string, error) {
+	in := os.Stdin
+	if changesFrom != "-" {
+		f, err := os.Open(changesFrom)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = f.Close() }()
+		in = f
+	}
+	changes, err := libgda.ParseChanges(in, changesFormat, src)
+	if err != nil {
+		return nil, err
+	}
+	if len(changes) == 0 {
+		return nil, errors.New("the change list has no paths below the source")
+	}
+	return changes, nil
+}
 
 // addFlags adds the options which shape a backup to flagSet.
 func addFlags(flagSet *pflag.FlagSet) {
@@ -126,6 +151,19 @@ gda finish!. For example with a Slurm job array:
         --run $RUN --partition \$SLURM_ARRAY_TASK_ID --worker p\$SLURM_ARRAY_TASK_ID"
     rclone gda finish s3:bucket/lab --run $RUN   # once all tasks are done
 
+With !--changes-from! a run looks only at the directories holding the
+listed paths, and their parents, reading the rest from the previous
+indexes, so it doesn't have to scan the whole source. The list can come
+from any change feed: one path per line, absolute or relative to the
+source, or the output of !zfs diff -H! with !--changes-format zfs!:
+
+    zfs diff -H pool/data@yesterday pool/data@today | \
+        rclone gda backup /pool/data s3:bucket/lab --changes-from - --changes-format zfs
+
+GPFS policy lists and Lustre changelogs can be turned into a list of
+paths. A change run needs a full run first, and full runs should still
+be made now and then to catch anything a change feed missed.
+
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose
 modification time changed but whose content didn't are recorded without
@@ -147,6 +185,16 @@ calls to keep owners, permissions, symlinks and special files.
 		setSizes()
 		if (runID == "") != (partitionIndex < 0) {
 			return errors.New("--run and --partition go together")
+		}
+		if changesFrom != "" {
+			if runID != "" {
+				return errors.New("--changes-from can't be used with --run")
+			}
+			changes, err := readChanges(src)
+			if err != nil {
+				return err
+			}
+			opt.Changes = changes
 		}
 		cmd.Run(false, true, command, func() error {
 			var ledger *libgda.Ledger

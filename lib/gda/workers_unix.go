@@ -55,7 +55,9 @@ func (b *backup) processItems(ctx context.Context, items []childDir) {
 				children := b.processDir(ctx, w, item.rel, item.key, b.isRollupRoot(item.rel))
 				if !item.shallow {
 					for _, child := range children {
-						q.push(child)
+						if b.wanted(child.rel) {
+							q.push(child)
+						}
 					}
 				}
 				q.done()
