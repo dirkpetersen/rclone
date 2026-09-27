@@ -1021,6 +1021,35 @@ Pieces that could go upstream independently, all from the analysis:
 - the `StorageClass` fix for `--s3-versions` listings;
 - the Intelligent-Tiering case in the `SetModTime` guard.
 
+## Implementation plan
+
+Code lives in the fork: the format and engine in `lib/gda`, the commands in
+`cmd/gda` (`rclone gda ...`). Sources are read with direct POSIX calls
+(decided 2026-09-26); destinations are any rclone remote, so tests can use
+the local and memory backends and production uses S3 or Ceph.
+
+| Milestone | Delivers |
+|---|---|
+| **1. Core backup, single process** | `rclone gda backup`: two-pass scan (subtree totals, then per-directory processing), standalone/packed/rollup planning, PAX tar packs with offsets, member MD5s and an embedded manifest, changesets and `gda-index.csv` (split above 100,000 rows), commit protocol, incremental runs by scan, the destination lock, the run ledger, dry-run. All CSV columns exist, including those for compression, deduplication and workers |
+| 2. Restore | `rclone gda restore` and `rclone gda ls`: plan from indexes, restore requests, wait, ranged or whole fetch, extract, verify; point-in-time with `--at` |
+| 3. Compression | zstd in independent frames, skip heuristics, `stored_*` columns filled |
+| 4. Deduplication | Hash index per bucket for files of 1 MiB or more |
+| 5. Parallel workers | Coordinator, partitions, per-worker outputs, Slurm plan, resource budget |
+| 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz |
+| 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz |
+| 8. Change feeds and scale | ZFS, GPFS and Lustre change feeds, local index cache, Parquet catalog, checkpoints, rebasing, garbage collection |
+
+Milestone 1 limits, each lifted by a later milestone:
+
+- changed standalone files always get `<name>.gda.<run>` keys; using bucket
+  versioning when it is enabled comes later;
+- hard links are stored as separate files, and extended attributes are not
+  stored;
+- paths whose S3 key would exceed 1,024 bytes are reported and skipped rather
+  than moved into an ancestor's pack;
+- the scan reads file metadata twice (once for subtree totals, once to
+  process each directory).
+
 ## Alternatives considered
 
 - **restic, Kopia, Borg.** Chunk-level deduplication and snapshots, but the
