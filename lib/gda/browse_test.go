@@ -25,6 +25,11 @@ func (f *bucketFs) Features() *fs.Features {
 	return &features
 }
 
+// Root is "" as the Fs is above the buckets.
+func (f *bucketFs) Root() string {
+	return ""
+}
+
 func (f *bucketFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if remote == IndexName {
 		return nil, errors.New("input member Key must not be empty")
