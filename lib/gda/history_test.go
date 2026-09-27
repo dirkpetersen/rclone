@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -235,6 +236,7 @@ func TestRandomHistory(t *testing.T) {
 			f := newDst(t, dst)
 			var runs []string
 			var states []map[string]string
+			cache := t.TempDir()
 			for run := range 8 {
 				opt := testOptions()
 				opt.RollupMax = []int64{0, 64, 4096}[r.Intn(3)]
@@ -245,6 +247,16 @@ func TestRandomHistory(t *testing.T) {
 				}
 				if run > 0 && r.Intn(3) == 0 {
 					opt.Changes = append([]string(nil), m.changed...)
+				}
+				if r.Intn(2) == 0 {
+					opt.IndexCache = cache
+				}
+				if r.Intn(4) == 0 {
+					// A dry run changes nothing.
+					ctx, ci := fs.AddConfig(context.Background())
+					ci.DryRun = true
+					_, err := Backup(ctx, src, f, opt)
+					require.NoError(t, err, "dry run %d", run)
 				}
 				m.changed = nil
 				states = append(states, treeState(t, src))
@@ -281,6 +293,20 @@ func TestRandomHistory(t *testing.T) {
 				assert.Equal(t, StateDone, st.State, "restore at run %d", i)
 				assert.Equal(t, states[i], treeState(t, target), "restore at run %d", i)
 			}
+			// The indexes list the files the source held at the last run.
+			var walked, want []string
+			require.NoError(t, Walk(context.Background(), f, "", runs[len(runs)-1], func(l *Located) error {
+				if l.Type == TypeFile {
+					walked = append(walked, l.LocalPath)
+				}
+				return nil
+			}))
+			for p, desc := range states[len(states)-1] {
+				if strings.HasPrefix(desc, "-") {
+					want = append(want, p)
+				}
+			}
+			assert.ElementsMatch(t, want, walked)
 			report, err := Check(context.Background(), f, "", "", CheckOptions{Download: true})
 			require.NoError(t, err)
 			assert.False(t, report.Failed(), "%+v", report)
