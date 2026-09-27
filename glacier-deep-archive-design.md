@@ -971,7 +971,7 @@ shows from GDA as JSON, and drives the restore with three calls.
 #### 1. Estimate: data for the dialog
 
 ```text
-rclone gda restore --estimate --json <source paths...> <target>
+rclone gda restore --estimate --json <gda root> <target> [paths...]
 ```
 
 returns one entry per restore option available for the selected data, with
@@ -988,7 +988,9 @@ buttons:
     "already_restored_files": 0,
     "objects_to_restore": 6,
     "bytes_to_restore": 1319413953331,
-    "bytes_to_download": 1319413953331
+    "bytes_to_download": 1319413953331,
+    "download_requests": 6,
+    "temporary_copy_days": 3
   },
   "options": [
     {
@@ -1039,7 +1041,7 @@ buttons:
 #### 2. Start: the user's choice
 
 ```text
-rclone gda restore --tier Bulk --yes --json <source paths...> <target>
+rclone gda restore --tier Bulk --yes --json <gda root> <target> [paths...]
 ```
 
 requests the restores and returns at once with the restore ID and the
