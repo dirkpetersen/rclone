@@ -179,7 +179,7 @@ func (b *backup) childDirs(rel, key string) []partition {
 			continue
 		}
 		info, err := os.Lstat(sourcePath(b.srcRoot, childRel))
-		if err != nil || !info.IsDir() || b.summary(childRel) == nil {
+		if err != nil || !info.IsDir() || b.summary(childRel) == nil || b.excluded(childRel, true, 0, info.ModTime()) {
 			continue
 		}
 		encName, _ := encodeName(name)
