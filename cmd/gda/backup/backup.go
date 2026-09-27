@@ -36,6 +36,8 @@ func init() {
 	flags.StringVarP(flagSet, &opt.RootLabel, "root-label", "", opt.RootLabel, "Name used for the top directory in pack names (default last element of the destination)", "")
 	flags.DurationVarP(flagSet, &opt.LockTimeout, "lock-timeout", "", opt.LockTimeout, "Take over a destination lock older than this", "")
 	flags.IntVarP(flagSet, &opt.Retries, "upload-retries", "", opt.Retries, "Upload attempts per object", "")
+	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
+	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
 	gda.Command.AddCommand(Command)
 }
 
@@ -65,6 +67,14 @@ For S3, set !--s3-upload-cutoff! above !--pack-size! so that each pack
 is uploaded in one request checked against its MD5, and consider
 !--s3-no-check-bucket! when the bucket exists.
 
+Data is compressed with zstd where it helps: a pack is compressed when
+a trial compression of its files' data saves at least 10%, and a
+standalone file when its name doesn't show a compressed format (such as
+.gz, .bam or .jpg) and its first MiB compresses by 10%. Compressed data
+is written as independent frames, so a single file can still be read
+without the rest of its pack, and a compressed pack is a normal
+!.tar.zst! file. !--compression none! turns this off.
+
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose
 modification time changed but whose content didn't are recorded without
@@ -90,9 +100,9 @@ calls to keep owners, permissions, symlinks and special files.
 			ledger, err := libgda.Backup(context.Background(), src, dst, opt)
 			if ledger != nil {
 				s := ledger.Stats
-				fs.Logf(nil, "gda: run %s: %d dirs indexed, %d added, %d modified, %d metadata only, %d deleted, %d unchanged; %d packs (%s), %d standalone (%s); %d skipped, %d deferred, %d errors",
+				fs.Logf(nil, "gda: run %s: %d dirs indexed, %d added, %d modified, %d metadata only, %d deleted, %d unchanged; %d packs (%s), %d standalone (%s), %s compressed; %d skipped, %d deferred, %d errors",
 					ledger.RunID, s.IndexedDirs, s.Added, s.Modified, s.MetaOnly, s.Deleted, s.Unchanged,
-					s.Packs, fs.SizeSuffix(s.PackBytes), s.Standalone, fs.SizeSuffix(s.StandaloneBytes),
+					s.Packs, fs.SizeSuffix(s.PackBytes), s.Standalone, fs.SizeSuffix(s.StandaloneBytes), fs.SizeSuffix(s.CompressedFrom),
 					s.Skipped, s.Deferred, s.Errors)
 			}
 			return err

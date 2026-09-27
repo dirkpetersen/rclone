@@ -93,6 +93,13 @@ func (d *dest) putOnce(ctx context.Context, remote string, size int64, modTime t
 	}()
 	acc := tr.Account(ctx, in)
 	defer fs.CheckClose(acc, &err)
+	if size < 0 {
+		putStream := d.f.Features().PutStream
+		if putStream == nil {
+			return nil, errors.New("destination can't take uploads of unknown size")
+		}
+		return putStream(ctx, acc, d.info(remote, size, modTime, md5sum, tier))
+	}
 	return d.f.Put(ctx, acc, d.info(remote, size, modTime, md5sum, tier))
 }
 
@@ -152,6 +159,41 @@ func (d *dest) putSourceFile(ctx context.Context, remote string, e *sourceEntry,
 		return "", fmt.Errorf("stored object has MD5 %s but %s was uploaded", stored, sum)
 	}
 	return sum, nil
+}
+
+// putCompressed uploads a source file to remote compressed with zstd, in
+// a single read. It returns the MD5 of the file, and the MD5 and size of
+// what was stored, checking them against the stored object where the
+// backend reports them.
+func (d *dest) putCompressed(ctx context.Context, remote string, e *sourceEntry, tier string, level int) (sum, storedSum string, storedSize int64, err error) {
+	var cr *compressingReader
+	o, err := d.putObject(ctx, remote, -1, e.ModTime, "", tier, func() (io.ReadCloser, error) {
+		in, err := os.Open(e.path)
+		if err != nil {
+			return nil, err
+		}
+		cr, err = newCompressingReader(in, level)
+		return cr, err
+	})
+	if err != nil || d.dryRun {
+		return "", "", 0, err
+	}
+	sum = hex.EncodeToString(cr.src.Sum(nil))
+	storedSum = hex.EncodeToString(cr.stored.Sum(nil))
+	storedSize = cr.storedN
+	bad := ""
+	if size := o.Size(); size >= 0 && size != storedSize {
+		bad = fmt.Sprintf("stored object has %d bytes but %d were uploaded", size, storedSize)
+	} else if got, err := o.Hash(ctx, hashpkg.MD5); err == nil && got != "" && !strings.EqualFold(got, storedSum) {
+		bad = fmt.Sprintf("stored object has MD5 %s but %s was uploaded", got, storedSum)
+	}
+	if bad != "" {
+		if err := o.Remove(ctx); err != nil {
+			fs.Errorf(remote, "gda: failed to remove corrupt upload: %v", err)
+		}
+		return "", "", 0, errors.New(bad)
+	}
+	return sum, storedSum, storedSize, nil
 }
 
 // get reads the whole object at remote. It returns fs.ErrorObjectNotFound

@@ -584,6 +584,21 @@ well.
   `zstd -d pack.tar.zst | tar x` works without GDA.
 - **Never convert formats**, for example gzip to zstd. A restore must return
   exactly the original bytes, verified against the original `md5`.
+- **How it is stored** (implemented in milestone 3):
+  - packs are built as plain tar, then compressed in a second pass into
+    frames cut at member boundaries once a frame reaches 1 MiB, and at
+    16 MiB at the latest;
+  - the trial compresses up to 1 MiB of the members' data (the first
+    64 KiB of each), leaving out tar headers and the manifest, which
+    always compress well;
+  - each compressed member records `stored_offset` and `stored_length`
+    (the frames holding it) and `stored_start`, the uncompressed offset
+    where those frames start, so a reader decompresses them and skips
+    `offset - stored_start` bytes;
+  - the manifest embedded in a pack describes the uncompressed tar;
+  - standalone files are streamed through zstd in 16 MiB frames. They
+    have no frame index yet, so reading part of one decompresses it from
+    the start.
 - **Rough ratios** (from general experience, not measured on our data):
   about 3 to 4 times for plain FASTQ and SAM, more for VCF, CSV and logs, and
   none for already-compressed formats. If a third of the bytes shrink 3
@@ -1167,7 +1182,7 @@ the local and memory backends and production uses S3 or Ceph.
 |---|---|
 | **1. Core backup, single process** | `rclone gda backup`: two-pass scan (subtree totals, then per-directory processing), standalone/packed/rollup planning, PAX tar packs with offsets, member MD5s and an embedded manifest, changesets and `gda-index.csv` (split above 100,000 rows), commit protocol, incremental runs by scan, the destination lock, the run ledger, dry-run. All CSV columns exist, including those for compression, deduplication and workers |
 | 2. Restore | `rclone gda restore` and `rclone gda ls`: plan from indexes, restore requests, wait, ranged or whole fetch, extract, verify; point-in-time with `--at` |
-| 3. Compression | zstd in independent frames, skip heuristics, `stored_*` columns filled |
+| 3. Compression | zstd in independent frames, skip heuristics, `stored_*` columns filled (done) |
 | 4. Deduplication | Hash index per bucket for files of 1 MiB or more |
 | 5. Parallel workers | Coordinator, partitions, per-worker outputs, Slurm plan, resource budget |
 | 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz |

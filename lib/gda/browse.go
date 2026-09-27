@@ -156,44 +156,61 @@ func (b *Browser) Tiers(ctx context.Context, key string) (map[string]string, err
 }
 
 // Open opens the file l, honouring fs.RangeOption and fs.SeekOption.
-// For a file in a pack it reads only the file's bytes. Data which must be
-// restored first gives the underlying backend's error.
+// For a file in a pack it reads only the frames or bytes holding it.
+// Data which must be restored first gives the underlying backend's error.
 func (b *Browser) Open(ctx context.Context, l *Located, options ...fs.OpenOption) (io.ReadCloser, error) {
 	if l.Type != TypeFile {
 		return nil, fs.ErrorNotAFile
 	}
-	if l.Size == 0 {
+	start, end, others := fileRange(l.Size, options)
+	if l.Size == 0 || start >= l.Size || start > end {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
 	o, err := b.f.NewObject(ctx, l.ObjectKey())
 	if err != nil {
 		return nil, err
 	}
-	if l.Offset < 0 {
+	switch {
+	case l.Offset < 0 && l.Codec != CodecZstd:
 		// A standalone object holds exactly the file.
 		return o.Open(ctx, options...)
+	case l.Offset < 0:
+		// Compressed frames can't be entered in the middle.
+		in, err := o.Open(ctx, others...)
+		if err != nil {
+			return nil, err
+		}
+		return decompressRange(in, start, end-start+1)
+	case l.Codec == CodecZstd:
+		in, err := o.Open(ctx, append(others, &fs.RangeOption{Start: l.StoredOffset, End: l.StoredOffset + l.StoredLength - 1})...)
+		if err != nil {
+			return nil, err
+		}
+		return decompressRange(in, l.Offset-l.StoredStart+start, end-start+1)
+	default:
+		return o.Open(ctx, append(others, &fs.RangeOption{Start: l.StoredOffset + start, End: l.StoredOffset + end})...)
 	}
-	start, end := int64(0), l.Size-1
-	var others []fs.OpenOption
+}
+
+// fileRange returns the first and last byte of a file of size bytes
+// which options ask for, and the options other than ranges and seeks.
+func fileRange(size int64, options []fs.OpenOption) (start, end int64, others []fs.OpenOption) {
+	start, end = 0, size-1
 	for _, option := range options {
 		switch x := option.(type) {
 		case *fs.RangeOption:
-			offset, limit := x.Decode(l.Size)
-			start, end = offset, l.Size-1
+			offset, limit := x.Decode(size)
+			start, end = offset, size-1
 			if limit >= 0 {
-				end = min(offset+limit-1, l.Size-1)
+				end = min(offset+limit-1, size-1)
 			}
 		case *fs.SeekOption:
-			start, end = x.Offset, l.Size-1
+			start, end = x.Offset, size-1
 		default:
 			others = append(others, option)
 		}
 	}
-	if start >= l.Size || start > end {
-		return io.NopCloser(strings.NewReader("")), nil
-	}
-	others = append(others, &fs.RangeOption{Start: l.StoredOffset + start, End: l.StoredOffset + end})
-	return o.Open(ctx, others...)
+	return start, end, others
 }
 
 // Find returns the entry at remote, which is relative to the root of the

@@ -925,6 +925,11 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 		if err != nil {
 			return fetched, err
 		}
+		if first.Codec == CodecZstd {
+			if in, err = decompressRange(in, 0, -1); err != nil {
+				return fetched, err
+			}
+		}
 		err = writeVerified(in, first, localPath(first), pattern)
 		if err == nil {
 			fetched[todo[0]] = true
@@ -941,6 +946,14 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 			in, err := o.Open(ctx, &fs.RangeOption{Start: e.StoredOffset, End: e.StoredOffset + e.StoredLength - 1})
 			if err != nil {
 				return fetched, err
+			}
+			if e.Codec == CodecZstd {
+				// The stored range starts at a frame, which holds the
+				// end of earlier members before this one's data.
+				if in, err = decompressRange(in, e.Offset-e.StoredStart, e.Size); err != nil {
+					errorf("%q: %v", e.Target, err)
+					continue
+				}
 			}
 			if err := writeVerified(in, e, localPath(e), pattern); err != nil {
 				errorf("%v", err)
@@ -964,6 +977,11 @@ func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, loc
 	in, err := o.Open(ctx)
 	if err != nil {
 		return err
+	}
+	if plan[todo[0]].Codec == CodecZstd {
+		if in, err = decompressRange(in, 0, -1); err != nil {
+			return err
+		}
 	}
 	defer fs.CheckClose(in, &err)
 	tr := tar.NewReader(in)

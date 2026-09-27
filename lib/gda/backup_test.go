@@ -41,6 +41,8 @@ func testOptions() Options {
 	opt.StandaloneMin = 8 * 1024
 	opt.RollupMax = 64
 	opt.TempDir = os.TempDir()
+	// Compression has its own tests; the test data compresses well.
+	opt.Compression = CodecNone
 	return opt
 }
 
