@@ -25,6 +25,7 @@ var (
 	packSize      = fs.SizeSuffix(opt.PackSize)
 	standaloneMin = fs.SizeSuffix(opt.StandaloneMin)
 	rollupMax     = fs.SizeSuffix(opt.RollupMax)
+	dedupMin      = fs.SizeSuffix(opt.DedupMin)
 )
 
 func init() {
@@ -71,6 +72,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.FVarP(flagSet, &packSize, "pack-size", "", "Maximum size of a pack of small files", "")
 	flags.FVarP(flagSet, &standaloneMin, "standalone-min", "", "Store files at least this big as their own objects", "")
 	flags.FVarP(flagSet, &rollupMax, "rollup-max", "", "Pack whole subtrees smaller than this as one unit (0 to disable)", "")
+	flags.FVarP(flagSet, &dedupMin, "dedup-min", "", "Store identical files at least this big once (off to disable)", "")
 	flags.StringVarP(flagSet, &opt.DataTier, "data-tier", "", opt.DataTier, "Storage class for packs and standalone files", "")
 	flags.StringVarP(flagSet, &opt.MetaTier, "meta-tier", "", opt.MetaTier, "Storage class for changesets, indexes and run files", "")
 	flags.StringVarP(flagSet, &opt.Worker, "worker", "", opt.Worker, "Worker ID used in pack names", "")
@@ -88,6 +90,7 @@ func setSizes() {
 	opt.PackSize = int64(packSize)
 	opt.StandaloneMin = int64(standaloneMin)
 	opt.RollupMax = int64(rollupMax)
+	opt.DedupMin = int64(dedupMin)
 }
 
 // logLedger logs what a run did.
@@ -96,10 +99,10 @@ func logLedger(ledger *libgda.Ledger) {
 		return
 	}
 	s := ledger.Stats
-	fs.Logf(nil, "gda: run %s: %d dirs indexed, %d added, %d modified, %d metadata only, %d deleted, %d unchanged; %d packs (%s), %d standalone (%s), %s compressed; %d skipped, %d deferred, %d errors",
+	fs.Logf(nil, "gda: run %s: %d dirs indexed, %d added, %d modified, %d metadata only, %d deleted, %d unchanged; %d packs (%s), %d standalone (%s), %s compressed, %d deduplicated (%s); %d skipped, %d deferred, %d errors",
 		ledger.RunID, s.IndexedDirs, s.Added, s.Modified, s.MetaOnly, s.Deleted, s.Unchanged,
 		s.Packs, fs.SizeSuffix(s.PackBytes), s.Standalone, fs.SizeSuffix(s.StandaloneBytes), fs.SizeSuffix(s.CompressedFrom),
-		s.Skipped, s.Deferred, s.Errors)
+		s.Deduplicated, fs.SizeSuffix(s.DeduplicatedBytes), s.Skipped, s.Deferred, s.Errors)
 }
 
 // Command is 'rclone gda backup'.
@@ -163,6 +166,12 @@ source, or the output of !zfs diff -H! with !--changes-format zfs!:
 GPFS policy lists and Lustre changelogs can be turned into a list of
 paths. A change run needs a full run first, and full runs should still
 be made now and then to catch anything a change feed missed.
+
+Identical files of at least !--dedup-min! (default 1 MiB) are stored
+once per destination: a copy of content already stored, for example in
+a renamed or copied directory, is recorded in the index as referring to
+the stored copy instead of being uploaded again. Only files of a size
+some stored copy has are read to check.
 
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose

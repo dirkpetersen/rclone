@@ -545,9 +545,14 @@ Identical files of **at least 1 MiB** are stored once (decided 2026-09-26).
   files of 1 MiB or more keeps the hash index to an estimated few hundred
   million entries (about 10 GB) instead of 10 billion (about 400 GB).
 - **The hash index** maps size plus MD5 to the `location` (and `offset`) of
-  the stored copy. It is split into shards by hash prefix,
-  `_gda/dedup/<prefix>.parquet`, and is derived from the catalog, so it can
-  always be rebuilt.
+  the stored copy. As implemented in milestone 4, each run writes the
+  copies it stored to `_gda/dedup/<run>-<worker>.csv` (index rows with the
+  object key as `location`), and the index is the union of those files,
+  loaded at the start of a run. Compacting them into shards by hash
+  prefix is left for milestone 8.
+- **Only files of a size some stored copy has are hashed** before storing,
+  so files with unique sizes, which are most of them, are still read
+  once.
 - **Workers read a snapshot of the index** at the start of a run, and write
   the hashes they store to their own per-run file, which the coordinator
   merges at the end.

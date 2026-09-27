@@ -221,6 +221,9 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 		}
 		items = append(items, childDir{rel: p.rel, key: p.key, shallow: p.shallow})
 	}
+	if err := b.loadDedup(ctx); err != nil {
+		return nil, err
+	}
 	fs.Infof(nil, "gda: run %s: worker %d backing up %d partitions", runID, index, len(items))
 	b.processItems(ctx, items)
 	return b.finishLedger(ctx, ledger)
@@ -382,6 +385,8 @@ func (s *Stats) add(o *Stats) {
 	s.Standalone += o.Standalone
 	s.StandaloneBytes += o.StandaloneBytes
 	s.MetaObjects += o.MetaObjects
+	s.Deduplicated += o.Deduplicated
+	s.DeduplicatedBytes += o.DeduplicatedBytes
 	s.Skipped += o.Skipped
 	s.Deferred += o.Deferred
 	s.Errors += o.Errors

@@ -449,7 +449,7 @@ func buildPlan(ctx context.Context, t *tree, paths []string) ([]Entry, error) {
 			}
 			e := l.Entry
 			e.Target = name
-			if e.Location != "" {
+			if e.Location != "" || e.DedupOf != "" {
 				e.Location = l.ObjectKey()
 			}
 			e.Action = ""
@@ -930,11 +930,24 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 				return fetched, err
 			}
 		}
-		err = writeVerified(in, first, localPath(first), pattern)
-		if err == nil {
-			fetched[todo[0]] = true
+		if err := writeVerified(in, first, localPath(first), pattern); err != nil {
+			return fetched, err
 		}
-		return fetched, err
+		fetched[todo[0]] = true
+		// Duplicates of the same file refer to the same object.
+		for _, i := range todo[1:] {
+			e := &plan[i]
+			copyIn, err := os.Open(localPath(first))
+			if err == nil {
+				err = writeVerified(copyIn, e, localPath(e), pattern)
+			}
+			if err != nil {
+				errorf("%v", err)
+				continue
+			}
+			fetched[i] = true
+		}
+		return fetched, nil
 	}
 	var want int64
 	for _, i := range todo {
@@ -967,12 +980,14 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 }
 
 // extractPack reads the whole pack o and writes the members at todo.
-// Members are matched by their index name, so tar member names are never
-// used as paths.
+// Members are found by the offset of their data, which the index
+// records, so tar member names are never used as paths, and a duplicate
+// recorded under another name finds the copy it refers to. Several plan
+// entries can share one member.
 func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, localPath func(*Entry) string, fetched map[int]bool, errorf func(string, ...any), pattern string) (err error) {
-	wanted := make(map[string]int, len(todo))
+	wanted := make(map[int64][]int, len(todo))
 	for _, i := range todo {
-		wanted[plan[i].Name] = i
+		wanted[plan[i].Offset] = append(wanted[plan[i].Offset], i)
 	}
 	in, err := o.Open(ctx)
 	if err != nil {
@@ -984,31 +999,60 @@ func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, loc
 		}
 	}
 	defer fs.CheckClose(in, &err)
-	tr := tar.NewReader(in)
+	// archive/tar reads headers a block at a time, so once Next returns,
+	// the bytes read so far end where the member's data starts.
+	counter := &readCounter{r: in}
+	tr := tar.NewReader(counter)
 	for len(wanted) > 0 {
-		hdr, err := tr.Next()
+		_, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("read pack: %w", err)
 		}
-		i, ok := wanted[hdr.Name]
+		indexes, ok := wanted[counter.n]
 		if !ok {
 			continue
 		}
-		delete(wanted, hdr.Name)
-		e := &plan[i]
-		if err := writeVerified(io.NopCloser(tr), e, localPath(e), pattern); err != nil {
+		delete(wanted, counter.n)
+		first := &plan[indexes[0]]
+		if err := writeVerified(io.NopCloser(tr), first, localPath(first), pattern); err != nil {
 			errorf("%v", err)
 			continue
 		}
-		fetched[i] = true
+		fetched[indexes[0]] = true
+		for _, i := range indexes[1:] {
+			e := &plan[i]
+			copyIn, err := os.Open(localPath(first))
+			if err == nil {
+				err = writeVerified(copyIn, e, localPath(e), pattern)
+			}
+			if err != nil {
+				errorf("%v", err)
+				continue
+			}
+			fetched[i] = true
+		}
 	}
-	for name := range wanted {
-		errorf("%q not found in pack %q", name, o.Remote())
+	for _, indexes := range wanted {
+		for _, i := range indexes {
+			errorf("%q not found in pack %q", plan[i].Target, o.Remote())
+		}
 	}
 	return nil
+}
+
+// readCounter counts the bytes read through it.
+type readCounter struct {
+	r io.Reader
+	n int64
+}
+
+func (c *readCounter) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // writeVerified writes in to p through a temporary file named by pattern
