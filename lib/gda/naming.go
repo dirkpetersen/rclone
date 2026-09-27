@@ -90,3 +90,11 @@ func joinRemote(elem ...string) string {
 func keyTooLong(rootPrefix, remote string) bool {
 	return len(joinRemote(rootPrefix, remote)) > maxKeyLength
 }
+
+// parentRel returns the parent of the "/" separated path rel, or "".
+func parentRel(rel string) string {
+	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
+		return rel[:i]
+	}
+	return ""
+}

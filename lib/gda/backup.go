@@ -371,14 +371,6 @@ func (b *backup) isRollupRoot(rel string) bool {
 	return rel == "" || !b.rollupEligible(parentRel(rel))
 }
 
-// parentRel returns the parent of rel.
-func parentRel(rel string) string {
-	if i := strings.LastIndexByte(rel, '/'); i >= 0 {
-		return rel[:i]
-	}
-	return ""
-}
-
 // dirChange is the outcome of comparing a directory with its previous index.
 type dirChange struct {
 	index   []Entry        // new index
