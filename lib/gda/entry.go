@@ -39,6 +39,9 @@ const (
 	ActionModify = "modify"
 	ActionMeta   = "meta"
 	ActionDelete = "delete"
+	// ActionRebase records a file whose unchanged content was packed
+	// again, so that the directory's files are in fewer packs.
+	ActionRebase = "rebase"
 )
 
 // Listing values for directory rows.
@@ -123,8 +126,9 @@ func (e *Entry) IsDir() bool {
 // sourceEntry is an entry read from the source file system.
 type sourceEntry struct {
 	Entry
-	path string // full source path
-	rel  string // source path relative to the source root, "/" separated
+	path   string // full source path
+	rel    string // source path relative to the source root, "/" separated
+	rebase bool   // packed again although unchanged, so never a dedup copy
 }
 
 // columns are the CSV columns in the order they are written. New columns

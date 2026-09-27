@@ -732,3 +732,51 @@ func TestBackupIndexCache(t *testing.T) {
 	l = runBackup(t, src, dst, opt)
 	assert.Equal(t, int64(1), l.Stats.Added)
 }
+
+func TestBackupRebase(t *testing.T) {
+	fakeClock(t)
+	old := rebaseMaxPacks
+	rebaseMaxPacks = 2
+	t.Cleanup(func() { rebaseMaxPacks = old })
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	opt.DedupMin = 100
+	opt.PackSize = 64 * 1024
+	for _, name := range []string{"a", "b", "c"} {
+		writeFile(t, src, "d/"+name, 1000)
+	}
+	runBackup(t, src, dst, opt)
+	// Each change adds a pack, spreading the directory's files.
+	writeFile(t, src, "d/a", 1001)
+	runBackup(t, src, dst, opt)
+	writeFile(t, src, "d/b", 1002)
+	l := runBackup(t, src, dst, opt)
+	assert.Zero(t, l.Stats.Rebased)
+	packs := func() map[string]bool {
+		out := map[string]bool{}
+		for _, e := range readIndexFile(t, dst, "d") {
+			out[e.Location] = true
+		}
+		return out
+	}
+	require.Len(t, packs(), 3)
+
+	// The next run packs the unchanged files again into one pack.
+	l = runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(3), l.Stats.Rebased)
+	assert.Zero(t, l.Stats.Deduplicated)
+	assert.Len(t, packs(), 1)
+	index := readIndexFile(t, dst, "d")
+	checkStored(t, dst, "d", index)
+	changes := readCSV(t, filepath.Join(dst, "d", "d.gda."+l.RunID+".w01.csv"))
+	assert.Equal(t, ActionRebase, changes["c"].Action)
+
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), newDst(t, dst), target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+	l = runBackup(t, src, dst, opt)
+	assert.Zero(t, l.Stats.Rebased)
+}

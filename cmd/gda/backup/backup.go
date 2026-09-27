@@ -106,8 +106,8 @@ func logLedger(ledger *libgda.Ledger) {
 		return
 	}
 	s := ledger.Stats
-	fs.Logf(nil, "gda: run %s: %d dirs indexed, %d added, %d modified, %d metadata only, %d deleted, %d unchanged; %d packs (%s), %d standalone (%s), %s compressed, %d deduplicated (%s); %d skipped, %d deferred, %d errors",
-		ledger.RunID, s.IndexedDirs, s.Added, s.Modified, s.MetaOnly, s.Deleted, s.Unchanged,
+	fs.Logf(nil, "gda: run %s: %d dirs indexed, %d added, %d modified, %d metadata only, %d deleted, %d unchanged, %d rebased; %d packs (%s), %d standalone (%s), %s compressed, %d deduplicated (%s); %d skipped, %d deferred, %d errors",
+		ledger.RunID, s.IndexedDirs, s.Added, s.Modified, s.MetaOnly, s.Deleted, s.Unchanged, s.Rebased,
 		s.Packs, fs.SizeSuffix(s.PackBytes), s.Standalone, fs.SizeSuffix(s.StandaloneBytes), fs.SizeSuffix(s.CompressedFrom),
 		s.Deduplicated, fs.SizeSuffix(s.DeduplicatedBytes), s.Skipped, s.Deferred, s.Errors)
 }
@@ -197,6 +197,11 @@ indexes again if no other run has written to the destination since,
 which saves a request per directory; otherwise it starts the cache
 afresh. Runs split over several hosts don't use it. Don't edit indexes
 by hand while a cache holds them.
+
+When a directory's unchanged files are spread over more than 20 packs,
+as happens after many small changes, the run packs them again from the
+source, so restoring the directory needs fewer objects. The old packs
+are kept for the history.
 
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose

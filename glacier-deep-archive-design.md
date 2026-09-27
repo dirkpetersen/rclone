@@ -341,7 +341,7 @@ manifests.
 | `run` | `20260926T120000Z` | Run that wrote this version |
 | `tree_size`, `tree_files` | `52428800`, `913` | Directory rows only: total bytes and files in the whole subtree, so a browser can show folder sizes without walking |
 | `listing` | `index` | Directory rows only: `index` (has its own `gda-index.csv`) or `rollup` (listed in this index by path prefix) |
-| `action` | `add` | Changesets only: `add`, `modify`, `meta`, `delete` |
+| `action` | `add` | Changesets only: `add`, `modify`, `meta`, `delete`, `rebase` (unchanged content packed again) |
 
 Encoding: RFC 4180 CSV, UTF-8, header row, fields quoted when needed. This
 handles commas, quotes and newlines in names. File names that aren't valid
@@ -503,7 +503,10 @@ Two things accumulate when backups run for a decade:
   files are spread over more than about 20 packs, or more than half of their
   bytes are dead, the next run **rebases** it: it writes a fresh full set of
   packs from the source, which costs nothing to read, and points the index at
-  them. The old packs are kept, following the retention policy.
+  them. The old packs are kept, following the retention policy. As
+  implemented, the trigger is the number of packs (more than 20) holding the
+  directory's unchanged files; the dead share would need a listing of the
+  directory's packs. The changeset records each moved file as `rebase`.
 
 With "keep forever", history grows with every change: a 1 TB directory that
 is rewritten weekly adds about 52 TB of old versions a year, about $620 a
@@ -1236,7 +1239,7 @@ the local and memory backends and production uses S3 or Ceph.
 | 5. Parallel workers | `--workers` on one host; `rclone gda plan`, `--run`/`--partition` and `rclone gda finish` across hosts | Done; resource limits per host left |
 | 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done, including `rclone gda prices` to refresh the table |
 | 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz | Done |
-| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; orphan removal, the compaction report and the local index cache done; catalog compaction, rebasing and compaction left |
+| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; orphan removal, the compaction report, the local index cache and rebasing done; catalog compaction and compaction left |
 
 Milestone 1 limits, each lifted by a later milestone:
 
