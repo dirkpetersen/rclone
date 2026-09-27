@@ -4,6 +4,7 @@ package gda
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -693,4 +694,38 @@ func TestBackupWorkerIDLength(t *testing.T) {
 	b, _, err := newBackup(context.Background(), src, newDst(t, dst), opt)
 	require.NoError(t, err)
 	b.close()
+}
+
+func TestBackupIndexCache(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	opt.IndexCache = t.TempDir()
+	writeFile(t, src, "dir/a.txt", 100)
+	writeFile(t, src, "dir/b.txt", 100)
+	runBackup(t, src, dst, opt)
+
+	// With the cache from the latest run, a run doesn't read the index,
+	// so it doesn't see this edit, which drops a file from it.
+	indexPath := filepath.Join(dst, "dir", IndexName)
+	index := readIndexFile(t, dst, "dir")
+	delete(index, "b.txt")
+	var edited []Entry
+	for _, e := range index {
+		edited = append(edited, e)
+	}
+	var buf bytes.Buffer
+	require.NoError(t, WriteEntries(&buf, edited))
+	require.NoError(t, os.WriteFile(indexPath, buf.Bytes(), 0o644))
+	l := runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(0), l.Stats.Added)
+
+	// Once another run has written to the destination, the cache isn't
+	// trusted, so the index is read again.
+	require.NoError(t, os.WriteFile(indexPath, buf.Bytes(), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dst, MetaDir, "runs", "29990101T000000Z"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dst, MetaDir, "runs", "29990101T000000Z", "other.json"), []byte("{}"), 0o644))
+	l = runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(1), l.Stats.Added)
 }

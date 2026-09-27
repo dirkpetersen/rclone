@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/cmd/gda"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/flags"
 	libgda "github.com/rclone/rclone/lib/gda"
 	"github.com/spf13/cobra"
@@ -31,6 +33,7 @@ var (
 
 func init() {
 	opt.Workers = min(runtime.NumCPU(), 15)
+	opt.IndexCache = filepath.Join(config.GetCacheDir(), "gda")
 	addFlags(Command.Flags())
 	flagSet := Command.Flags()
 	flags.StringVarP(flagSet, &runID, "run", "", runID, "Back up a partition of this planned run (see rclone gda plan)", "")
@@ -84,6 +87,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
 	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
 	flags.FVarP(flagSet, &compressMax, "compress-max", "", "Store standalone files bigger than this uncompressed", "")
+	flags.StringVarP(flagSet, &opt.IndexCache, "index-cache-dir", "", opt.IndexCache, "Directory for local copies of the destination's indexes (\"\" to disable)", "")
 	flags.IntVarP(flagSet, &opt.Workers, "workers", "", opt.Workers, "Directories to back up in parallel (default one per CPU, up to 15)", "")
 }
 
@@ -186,6 +190,13 @@ once per destination: a copy of content already stored, for example in
 a renamed or copied directory, is recorded in the index as referring to
 the stored copy instead of being uploaded again. Only files of a size
 some stored copy has are read to check.
+
+A run keeps a copy of every index it reads or writes in
+!--index-cache-dir!. The next run uses the copies instead of reading the
+indexes again if no other run has written to the destination since,
+which saves a request per directory; otherwise it starts the cache
+afresh. Runs split over several hosts don't use it. Don't edit indexes
+by hand while a cache holds them.
 
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose

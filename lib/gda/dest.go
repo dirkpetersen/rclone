@@ -40,6 +40,7 @@ type dest struct {
 	metaTier string // storage class for changesets, indexes and run files
 	dryRun   bool
 	retries  int
+	cache    *indexCache // local copies of indexes, nil if not caching
 }
 
 func (d *dest) info(remote string, size int64, modTime time.Time, md5sum, tier string) tieredInfo {
@@ -223,6 +224,22 @@ func (d *dest) exists(ctx context.Context, remote string) (bool, error) {
 // readIndex reads the index of the directory at dirKey. It returns nil
 // entries and no error if there is no index.
 func (d *dest) readIndex(ctx context.Context, dirKey string) ([]Entry, error) {
+	if d.cache == nil {
+		return d.readRemoteIndex(ctx, dirKey)
+	}
+	if entries, ok := d.cache.get(dirKey); ok {
+		return entries, nil
+	}
+	entries, err := d.readRemoteIndex(ctx, dirKey)
+	if err == nil && entries != nil {
+		d.cache.put(dirKey, entries)
+	}
+	return entries, err
+}
+
+// readRemoteIndex reads the index of the directory at dirKey from the
+// destination.
+func (d *dest) readRemoteIndex(ctx context.Context, dirKey string) ([]Entry, error) {
 	data, err := d.get(ctx, joinRemote(dirKey, IndexName))
 	if errors.Is(err, fs.ErrorObjectNotFound) {
 		return nil, nil
@@ -263,6 +280,21 @@ func (d *dest) readIndex(ctx context.Context, dirKey string) ([]Entry, error) {
 
 // writeIndex writes the index of the directory at dirKey for run runID.
 func (d *dest) writeIndex(ctx context.Context, dirKey string, entries []Entry, runID string) error {
+	err := d.writeRemoteIndex(ctx, dirKey, entries, runID)
+	if d.cache != nil {
+		if err == nil {
+			d.cache.put(dirKey, entries)
+		} else {
+			// The write may have happened even so.
+			d.cache.drop(dirKey)
+		}
+	}
+	return err
+}
+
+// writeRemoteIndex writes the index of the directory at dirKey to the
+// destination.
+func (d *dest) writeRemoteIndex(ctx context.Context, dirKey string, entries []Entry, runID string) error {
 	objects, err := encodeIndex(entries, maxIndexRows, runID)
 	if err != nil {
 		return err

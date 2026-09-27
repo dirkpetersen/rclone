@@ -40,6 +40,7 @@ type Options struct {
 	Changes       []string      // if set, back up only the directories these source paths are in
 	DedupMin      int64         // identical files of at least this size are stored once; -1 disables
 	CompressMax   int64         // standalone files bigger than this are stored uncompressed
+	IndexCache    string        // directory for local copies of indexes; "" to read them all from the destination
 }
 
 // DefaultOptions returns the default options.
@@ -179,18 +180,24 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	if err := b.loadDedup(ctx); err != nil {
 		return nil, err
 	}
+	if err := b.openCache(ctx); err != nil {
+		fs.Errorf(nil, "gda: not using the index cache: %v", err)
+	}
 	if len(opt.Changes) > 0 {
 		fs.Infof(nil, "gda: run %s: backing up %d changes in %s", b.runID, len(opt.Changes), b.srcRoot)
 		if err := b.backupChanges(ctx, opt.Changes); err != nil {
 			b.errorf("%v", err)
 		}
-		return b.finishLedger(ctx, ledger)
+		ledger, err := b.finishLedger(ctx, ledger)
+		b.finishCache(ctx)
+		return ledger, err
 	}
 	fs.Infof(nil, "gda: run %s: scanning %s with %d workers", b.runID, b.srcRoot, b.opt.Workers)
 	b.summarizeAll()
 	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, fs.ConfigString(dst))
 	b.processAll(ctx)
 	ledger, err = b.finishLedger(ctx, ledger)
+	b.finishCache(ctx)
 	if b.dedup != nil {
 		if cErr := compactDedup(ctx, b.d, b.runID); cErr != nil {
 			fs.Errorf(nil, "gda: compact dedup index: %v", cErr)
@@ -275,6 +282,50 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 		Options:       b.opt,
 	}
 	return b, ledger, nil
+}
+
+// openCache opens the index cache, if one is configured.
+func (b *backup) openCache(ctx context.Context) error {
+	if b.opt.IndexCache == "" || b.d.dryRun {
+		return nil
+	}
+	latest, err := b.latestRun(ctx)
+	if err != nil {
+		return err
+	}
+	cache, err := openIndexCache(b.opt.IndexCache, fs.ConfigString(b.d.f), latest)
+	if err != nil {
+		return err
+	}
+	b.d.cache = cache
+	return nil
+}
+
+// finishCache records in the index cache that the run finished, so the
+// next run can trust it.
+func (b *backup) finishCache(ctx context.Context) {
+	if b.d.cache != nil && !b.isStopped() && ctx.Err() == nil {
+		b.d.cache.finish(fs.ConfigString(b.d.f), b.runID)
+	}
+}
+
+// latestRun returns the ID of the latest run on the destination, or "".
+func (b *backup) latestRun(ctx context.Context) (string, error) {
+	entries, err := b.d.f.List(ctx, joinRemote(MetaDir, "runs"))
+	if errors.Is(err, fs.ErrorDirNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	latest := ""
+	for _, e := range entries {
+		name := path.Base(e.Remote())
+		if _, err := ParseRunID(name); err == nil && name > latest {
+			latest = name
+		}
+	}
+	return latest, nil
 }
 
 // loadDedup reads the dedup index if deduplicating.
