@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -290,11 +292,11 @@ func (b *backup) openCache(ctx context.Context) error {
 	if b.opt.IndexCache == "" || b.d.dryRun {
 		return nil
 	}
-	latest, err := b.latestRun(ctx)
+	runs, err := b.runsDigest(ctx)
 	if err != nil {
 		return err
 	}
-	cache, err := openIndexCache(b.opt.IndexCache, fs.ConfigString(b.d.f), latest)
+	cache, err := openIndexCache(b.opt.IndexCache, fs.ConfigString(b.d.f), runs)
 	if err != nil {
 		return err
 	}
@@ -305,13 +307,21 @@ func (b *backup) openCache(ctx context.Context) error {
 // finishCache records in the index cache that the run finished, so the
 // next run can trust it.
 func (b *backup) finishCache(ctx context.Context) {
-	if b.d.cache != nil && !b.isStopped() && ctx.Err() == nil {
-		b.d.cache.finish(fs.ConfigString(b.d.f), b.runID)
+	if b.d.cache == nil || b.isStopped() || ctx.Err() != nil {
+		return
 	}
+	runs, err := b.runsDigest(ctx)
+	if err != nil {
+		fs.Errorf(nil, "gda: index cache: %v", err)
+		return
+	}
+	b.d.cache.finish(fs.ConfigString(b.d.f), b.runID, runs)
 }
 
-// latestRun returns the ID of the latest run on the destination, or "".
-func (b *backup) latestRun(ctx context.Context) (string, error) {
+// runsDigest returns a digest of the IDs of the runs on the destination,
+// which changes whenever a run is added, whatever its ID, or "" if there
+// are none.
+func (b *backup) runsDigest(ctx context.Context) (string, error) {
 	entries, err := b.d.f.List(ctx, joinRemote(MetaDir, "runs"))
 	if errors.Is(err, fs.ErrorDirNotFound) {
 		return "", nil
@@ -319,14 +329,16 @@ func (b *backup) latestRun(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	latest := ""
+	var runs []string
 	for _, e := range entries {
-		name := path.Base(e.Remote())
-		if _, err := ParseRunID(name); err == nil && name > latest {
-			latest = name
-		}
+		runs = append(runs, path.Base(e.Remote()))
 	}
-	return latest, nil
+	if len(runs) == 0 {
+		return "", nil
+	}
+	sort.Strings(runs)
+	sum := sha256.Sum256([]byte(strings.Join(runs, "\n")))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // loadDedup reads the dedup index if deduplicating.
@@ -562,8 +574,15 @@ func (b *backup) unlock(ctx context.Context) {
 		return
 	}
 	data, err := b.d.get(ctx, lockKey)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return
+	}
+	if err != nil {
+		fs.Errorf(nil, "gda: not removing the lock, as it can't be read: %v", err)
+		return
+	}
 	var held lockInfo
-	if err == nil && json.Unmarshal(data, &held) == nil && held.RunID != b.runID {
+	if json.Unmarshal(data, &held) == nil && held.RunID != b.runID {
 		fs.Errorf(nil, "gda: not removing the lock, which run %s on %s holds now", held.RunID, held.Host)
 		return
 	}
@@ -908,7 +927,7 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 			c.retire = append(c.retire, joinRemote(key, name))
 		}
 	}
-	rebase(c, cur)
+	rebase(c, cur, b.opt.PackSize)
 	return c
 }
 
@@ -917,20 +936,25 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 var rebaseMaxPacks = 20
 
 // rebase moves the unchanged packed files of a directory whose files are
-// spread over more than rebaseMaxPacks packs to c.store, so they are
-// packed again from the source and restoring the directory needs fewer
-// objects. The old packs are kept, as history refers to them.
-func rebase(c *dirChange, cur []sourceEntry) {
+// fragmented to c.store, so they are packed again from the source and
+// restoring the directory needs fewer objects. The files are fragmented
+// if they are spread over more than rebaseMaxPacks packs and more than
+// twice the packs of packSize they would fill. The old packs are kept,
+// as history refers to them.
+func rebase(c *dirChange, cur []sourceEntry, packSize int64) {
 	isPacked := func(row *Entry) bool {
 		return row.Type == TypeFile && row.Size > 0 && row.Offset >= 0 && row.DedupOf == "" && row.Location != ""
 	}
 	packs := map[string]bool{}
+	var bytes int64
 	for i := range c.index {
 		if isPacked(&c.index[i]) {
 			packs[c.index[i].Location] = true
+			bytes += c.index[i].Size + packOverhead(&c.index[i])
 		}
 	}
-	if len(packs) <= rebaseMaxPacks {
+	needed := int((bytes + packSize - 1) / max(packSize, 1))
+	if len(packs) <= rebaseMaxPacks || len(packs) <= 2*needed {
 		return
 	}
 	source := make(map[string]*sourceEntry, len(cur))

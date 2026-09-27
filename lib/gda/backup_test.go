@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -725,10 +726,11 @@ func TestBackupIndexCache(t *testing.T) {
 	assert.Equal(t, int64(0), l.Stats.Added)
 
 	// Once another run has written to the destination, the cache isn't
-	// trusted, so the index is read again.
+	// trusted, so the index is read again. That run's ID may sort before
+	// the cache's, as another host's clock may be behind.
 	require.NoError(t, os.WriteFile(indexPath, buf.Bytes(), 0o644))
-	require.NoError(t, os.MkdirAll(filepath.Join(dst, MetaDir, "runs", "29990101T000000Z"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dst, MetaDir, "runs", "29990101T000000Z", "other.json"), []byte("{}"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dst, MetaDir, "runs", "20000101T000000Z"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dst, MetaDir, "runs", "20000101T000000Z", "other.json"), []byte("{}"), 0o644))
 	l = runBackup(t, src, dst, opt)
 	assert.Equal(t, int64(1), l.Stats.Added)
 }
@@ -777,6 +779,15 @@ func TestBackupRebase(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StateDone, st.State)
 	assertSameTree(t, src, target)
+	l = runBackup(t, src, dst, opt)
+	assert.Zero(t, l.Stats.Rebased)
+
+	// A directory whose files fill many packs isn't fragmented.
+	opt.PackSize = 10 * 1024
+	for i := range 12 {
+		writeFile(t, src, fmt.Sprintf("big/f%02d", i), 3000)
+	}
+	runBackup(t, src, dst, opt)
 	l = runBackup(t, src, dst, opt)
 	assert.Zero(t, l.Stats.Rebased)
 }

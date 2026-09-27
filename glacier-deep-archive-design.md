@@ -426,8 +426,9 @@ use that instead:
   run makes that change.
 - **Local index cache:** each worker keeps copies of the indexes it owns,
   so a run doesn't download millions of indexes just to compare them. As
-  implemented, the copies are trusted when the latest run on the
-  destination is the one which last finished with the cache, as then no
+  implemented, the copies are trusted when the runs on the destination are
+  the ones there when the last run with the cache finished (compared as a
+  digest of the run IDs, as another host's clock may be behind), as then no
   other run has written indexes since; otherwise the cache starts afresh.
   This needs one listing of `_gda/runs` rather than a request per index.
   Runs split over several hosts don't use it yet.
@@ -504,9 +505,10 @@ Two things accumulate when backups run for a decade:
   bytes are dead, the next run **rebases** it: it writes a fresh full set of
   packs from the source, which costs nothing to read, and points the index at
   them. The old packs are kept, following the retention policy. As
-  implemented, the trigger is the number of packs (more than 20) holding the
-  directory's unchanged files; the dead share would need a listing of the
-  directory's packs. The changeset records each moved file as `rebase`.
+  implemented, the trigger is the number of packs holding the directory's
+  unchanged files: more than 20, and more than twice the packs those files
+  would fill, so a big directory isn't repacked on every run; the dead
+  share would need a listing of the directory's packs. The changeset records each moved file as `rebase`.
 
 With "keep forever", history grows with every change: a 1 TB directory that
 is rewritten weekly adds about 52 TB of old versions a year, about $620 a
@@ -673,7 +675,9 @@ moves their `location`, then deletes the old pack.
   compacting; `--delete-orphans` removes orphans older than `--min-age`
   while holding the destination lock. Objects listed in the dedup index
   count as referenced, and objects without GDA names are only reported.
-  Compaction itself is left.
+  Compaction itself is left. It must count the dedup index as a reference
+  too: after a rebase, duplicates may still point at members of the old
+  packs.
 
 ## Commit protocol and crash safety
 
