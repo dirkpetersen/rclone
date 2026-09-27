@@ -6,12 +6,15 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -313,6 +316,73 @@ func TestRandomHistory(t *testing.T) {
 			gc, err := GC(context.Background(), f, GCOptions{})
 			require.NoError(t, err)
 			assert.Empty(t, gc.Orphans)
+		})
+	}
+}
+
+// flakyFs fails a share of uploads.
+type flakyFs struct {
+	fs.Fs
+	mu   sync.Mutex
+	r    *rand.Rand
+	rate float64
+}
+
+func (f *flakyFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	f.mu.Lock()
+	fail := f.r.Float64() < f.rate
+	f.mu.Unlock()
+	if fail {
+		return nil, errors.New("injected upload failure")
+	}
+	return f.Fs.Put(ctx, in, src, options...)
+}
+
+func TestRandomFailures(t *testing.T) {
+	for seed := int64(1); seed <= 6; seed++ {
+		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
+			fakeClock(t)
+			r := rand.New(rand.NewSource(seed))
+			src := t.TempDir()
+			f := newDst(t, fmt.Sprintf(":memory:failures%d/lab", seed))
+			m := &mutator{t: t, r: r, root: src, clock: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
+			m.mutate(40)
+			var runs []string
+			var states []map[string]string
+			for run := range 6 {
+				opt := testOptions()
+				opt.RollupMax = []int64{0, 64, 4096}[r.Intn(3)]
+				opt.Workers = 1 + r.Intn(4)
+				opt.DedupMin = 1000
+				opt.Retries = 1
+				// A run which fails part way, then one which completes.
+				flaky := &flakyFs{Fs: f, r: rand.New(rand.NewSource(seed*100 + int64(run))), rate: 0.2}
+				_, _ = Backup(context.Background(), src, flaky, opt)
+				states = append(states, treeState(t, src))
+				l, err := Backup(context.Background(), src, f, opt)
+				require.NoError(t, err, "run %d", run)
+				runs = append(runs, l.RunID)
+				m.mutate(15)
+			}
+			gc, err := GC(context.Background(), f, GCOptions{DeleteOrphans: true, LockTimeout: time.Hour})
+			require.NoError(t, err)
+			t.Logf("removed %d orphans", gc.Deleted)
+			for i, runID := range runs {
+				ropt := DefaultRestoreOptions()
+				ropt.At = runID
+				target := t.TempDir()
+				st, err := StartRestore(context.Background(), f, target, ropt)
+				if len(states[i]) == 0 {
+					assert.ErrorContains(t, err, "nothing to restore")
+					continue
+				}
+				require.NoError(t, err, "restore at run %d", i)
+				assert.Equal(t, StateDone, st.State, "restore at run %d", i)
+				assert.Equal(t, states[i], treeState(t, target), "restore at run %d", i)
+			}
+			report, err := Check(context.Background(), f, "", "", CheckOptions{Download: true})
+			require.NoError(t, err)
+			assert.False(t, report.Failed(), "%+v", report)
 		})
 	}
 }
