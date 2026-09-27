@@ -1,0 +1,21 @@
+backend: gda
+name: GDA
+tier: Tier 4
+maintainers: External
+features_score: 1
+integration_tests: None
+data_integrity: Hash
+performance: Medium
+adoption: New
+docs: Full
+security: High
+virtual: true
+remote: ''
+features:
+- CanHaveEmptyDirectories
+- GetTier
+- ReadMetadata
+- ReadMimeType
+hashes:
+- md5
+precision: 1

@@ -27,12 +27,20 @@ func (b *backup) summarizeAll() {
 }
 
 // processAll backs up every directory with its own index, starting at
-// the root, with the run's workers taking directories from a shared
-// queue. Each directory is processed by exactly one worker, so its
+// the root. Each directory is processed by exactly one worker, so its
 // changeset and index have a single writer.
 func (b *backup) processAll(ctx context.Context) {
+	b.processItems(ctx, []childDir{{}})
+}
+
+// processItems backs up the directories in items, and the directories
+// with their own index below those which aren't shallow, with the run's
+// workers taking directories from a shared queue.
+func (b *backup) processItems(ctx context.Context, items []childDir) {
 	q := newWorkQueue()
-	q.push(childDir{})
+	for _, item := range items {
+		q.push(item)
+	}
 	var wg sync.WaitGroup
 	for i := range b.opt.Workers {
 		w := b.workerID(i)
@@ -44,8 +52,11 @@ func (b *backup) processAll(ctx context.Context) {
 				if !ok {
 					return
 				}
-				for _, child := range b.processDir(ctx, w, item.rel, item.key, b.isRollupRoot(item.rel)) {
-					q.push(child)
+				children := b.processDir(ctx, w, item.rel, item.key, b.isRollupRoot(item.rel))
+				if !item.shallow {
+					for _, child := range children {
+						q.push(child)
+					}
 				}
 				q.done()
 			}
