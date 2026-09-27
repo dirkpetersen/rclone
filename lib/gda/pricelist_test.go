@@ -56,6 +56,9 @@ func TestFetchPrices(t *testing.T) {
 		s3("USW2-Requests-Tier5", ""),
 		s3("USW2-TimedStorage-ByteHrs", ""),
 		s3("USW2-Requests-Tier2", ""),
+		s3("USW2-TimedStorage-GlacierByteHrs", ""),
+		s3("USW2-Requests-Tier1", ""),
+		s3("USW2-Requests-GLACIER-Tier1", "PutObject"),
 		// Look-alikes which mustn't be picked.
 		s3("USW2-Standard-Retrieval-Bytes", "IntDAARestoreObject"),
 		s3("USW2-Requests-INT-Tier2", ""),
@@ -70,6 +73,9 @@ func TestFetchPrices(t *testing.T) {
 		one("0.0000000000", "Requests"),
 		{{"51200", "512000", "0.022", "GB-Mo"}, {"0", "51200", "0.0230000000", "GB-Mo"}},
 		one("0.0000004000", "Requests"),
+		one("0.0040000000", "GB-Mo"),
+		one("0.0000050000", "Requests"),
+		one("0.0000300000", "Requests"),
 		one("9", "GB"),
 		one("9", "Requests"),
 	})
@@ -119,6 +125,11 @@ func TestFetchPrices(t *testing.T) {
 	assert.Equal(t, 0.0004, p.GetPer1000)
 	assert.Equal(t, []EgressTier{{UpToGB: 10240, PerGB: 0.09}, {UpToGB: 51200, PerGB: 0.085}, {UpToGB: 0, PerGB: 0.05}}, p.Egress[EgressInternet])
 	assert.Equal(t, DefaultPrices().Egress[EgressDirectConnect], p.Egress[EgressDirectConnect])
+	assert.Equal(t, 0.023, p.Storage["STANDARD"].PerGBMonth)
+	assert.Equal(t, 0.005, p.Storage["STANDARD"].PutPer1000)
+	assert.Equal(t, 0.004, p.Storage["GLACIER"].PerGBMonth)
+	assert.Equal(t, 0.03, p.Storage["GLACIER"].PutPer1000)
+	assert.Equal(t, DefaultPrices().Storage["DEEP_ARCHIVE"], p.Storage["DEEP_ARCHIVE"])
 
 	// A region without a price list fails.
 	_, err = FetchPrices(context.Background(), srv.Client(), "xx-nowhere-1")

@@ -139,3 +139,16 @@ func TestCanonicalTier(t *testing.T) {
 	_, err = canonicalTier("slow")
 	assert.Error(t, err)
 }
+
+func TestEstimateBackup(t *testing.T) {
+	p := DefaultPrices()
+	// A million 256 MiB packs is 256 TiB.
+	c, ok := p.EstimateBackup(1000000, 1000000*256<<20, 2000000, "deep_archive", "STANDARD")
+	require.True(t, ok)
+	assert.InDelta(t, 1000000.0/1000*0.05+2000000.0/1000*0.005, float64(c.Requests), 0.01)
+	gb := 250000.0 + 1000000*32.0/1024/1024
+	assert.InDelta(t, gb*0.00099+1000000*8.0/1024/1024*0.023, float64(c.Monthly), 0.01)
+	assert.Equal(t, 180, c.MinDays)
+	_, ok = p.EstimateBackup(1, 1, 1, "NOPE", "STANDARD")
+	assert.False(t, ok)
+}

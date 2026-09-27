@@ -25,6 +25,19 @@ type Prices struct {
 	GetPer1000 float64 `json:"get_per_1000"`
 	// Data transfer out by network path.
 	Egress map[string][]EgressTier `json:"egress"`
+	// Storage and upload rates by storage class, for backup estimates.
+	Storage map[string]StoragePrice `json:"storage"`
+}
+
+// StoragePrice is the cost of storing objects in one storage class.
+type StoragePrice struct {
+	PerGBMonth float64 `json:"per_gb_month"`
+	PutPer1000 float64 `json:"put_per_1000"`
+	MinDays    int     `json:"min_days"` // minimum storage duration billed
+	// S3 bills metadata for each archived object: OverheadKB at this
+	// class's rate and OverheadStandardKB at the STANDARD rate.
+	OverheadKB         float64 `json:"overhead_kb"`
+	OverheadStandardKB float64 `json:"overhead_standard_kb"`
 }
 
 // RetrievalPrice is the price and speed of one retrieval tier.
@@ -77,6 +90,11 @@ func DefaultPrices() Prices {
 			EgressDirectConnect: {{UpToGB: 0, PerGB: 0.02}},
 			EgressSameRegion:    {{UpToGB: 0, PerGB: 0}},
 		},
+		Storage: map[string]StoragePrice{
+			"DEEP_ARCHIVE": {PerGBMonth: 0.00099, PutPer1000: 0.05, MinDays: 180, OverheadKB: 32, OverheadStandardKB: 8},
+			"GLACIER":      {PerGBMonth: 0.0036, PutPer1000: 0.03, MinDays: 90, OverheadKB: 32, OverheadStandardKB: 8},
+			"STANDARD":     {PerGBMonth: 0.023, PutPer1000: 0.005},
+		},
 	}
 }
 
@@ -122,7 +140,42 @@ func LoadPrices(path string) (Prices, error) {
 	for path, tiers := range file.Egress {
 		prices.Egress[path] = tiers
 	}
+	for class, price := range file.Storage {
+		prices.Storage[class] = price
+	}
 	return prices, nil
+}
+
+// BackupCost is the estimated cost of the data a backup run stored.
+type BackupCost struct {
+	Requests Money  `json:"requests"` // one off: uploads of data and metadata objects
+	Monthly  Money  `json:"monthly"`  // storage per month of the data objects, with S3's per object overhead
+	MinDays  int    `json:"min_days"` // storage of the data is billed for at least this many days
+	Currency string `json:"currency"` // of the amounts
+}
+
+// EstimateBackup returns the cost of storing dataObjects objects of
+// dataBytes in all in dataTier and writing metaObjects objects in
+// metaTier. It returns false if either tier has no prices.
+func (p *Prices) EstimateBackup(dataObjects, dataBytes, metaObjects int64, dataTier, metaTier string) (BackupCost, bool) {
+	data, ok1 := p.Storage[canonicalStorageClass(dataTier)]
+	meta, ok2 := p.Storage[canonicalStorageClass(metaTier)]
+	standard := p.Storage["STANDARD"]
+	if !ok1 || !ok2 {
+		return BackupCost{}, false
+	}
+	objects := float64(dataObjects)
+	gb := float64(dataBytes) / bytesPerGB
+	gb += objects * data.OverheadKB * 1024 / bytesPerGB
+	monthly := gb*data.PerGBMonth + objects*data.OverheadStandardKB*1024/bytesPerGB*standard.PerGBMonth
+	requests := objects/1000*data.PutPer1000 + float64(metaObjects)/1000*meta.PutPer1000
+	return BackupCost{Requests: Money(requests), Monthly: Money(monthly), MinDays: data.MinDays, Currency: p.Currency}, true
+}
+
+// canonicalStorageClass returns the S3 name of a storage class given in
+// any case.
+func canonicalStorageClass(class string) string {
+	return strings.ToUpper(class)
 }
 
 // bytesPerGB is the size of a GB as AWS bills it.
