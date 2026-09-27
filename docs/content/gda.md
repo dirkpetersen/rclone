@@ -60,6 +60,8 @@ GDA backups are made and managed with the `rclone gda` commands:
 - [rclone gda ls](/commands/rclone_gda_ls/) lists and
   [rclone gda find](/commands/rclone_gda_find/) searches a backup from
   its indexes.
+- [rclone gda check](/commands/rclone_gda_check/) checks that a
+  backup's data is all there, and can read back what is readable.
 - [rclone gda gc](/commands/rclone_gda_gc/) reports on the stored data
   and removes objects left by runs that didn't finish.
 
