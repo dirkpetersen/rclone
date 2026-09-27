@@ -41,6 +41,22 @@ func TestParseChanges(t *testing.T) {
 
 	_, err = ParseChanges(strings.NewReader("x"), "gpfs", root)
 	assert.Error(t, err)
+
+	// A source given relative to the working directory or through a
+	// symlink matches absolute paths to it.
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	require.NoError(t, os.Mkdir(real, 0o755))
+	require.NoError(t, os.Symlink(real, filepath.Join(dir, "link")))
+	t.Chdir(dir)
+	for _, src := range []string{"real", "link", filepath.Join(dir, "link")} {
+		got, err = ParseChanges(strings.NewReader(filepath.Join(real, "a")+"\n"), ChangesLines, src)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"a"}, got, src)
+	}
+	got, err = ParseChanges(strings.NewReader(filepath.Join(dir, "link", "b")+"\n"), ChangesLines, "link")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b"}, got)
 }
 
 func TestBackupChanges(t *testing.T) {

@@ -26,11 +26,16 @@ const (
 
 // ParseChanges reads a change list in format and returns the changed
 // paths below srcRoot, relative to it. Paths outside srcRoot are left out.
+// Absolute paths may name srcRoot as given, made absolute, or with its
+// symlinks resolved.
 //
 // zfs diff names paths below where the file system is mounted, so for a
 // source in a snapshot, such as /pool/data/.zfs/snapshot/today, they are
 // taken as below /pool/data.
 func ParseChanges(r io.Reader, format, srcRoot string) ([]string, error) {
+	if abs, err := filepath.Abs(srcRoot); err == nil {
+		srcRoot = abs
+	}
 	srcRoot = filepath.Clean(srcRoot)
 	pathRoot := srcRoot
 	if format == ChangesZFS {
@@ -41,16 +46,22 @@ func ParseChanges(r io.Reader, format, srcRoot string) ([]string, error) {
 			pathRoot = filepath.Join(mount, below)
 		}
 	}
+	roots := []string{pathRoot}
+	if real, err := filepath.EvalSymlinks(pathRoot); err == nil && real != pathRoot {
+		roots = append(roots, real)
+	}
 	var out []string
 	add := func(p string) {
 		if !filepath.IsAbs(p) {
 			p = filepath.Join(pathRoot, p)
 		}
-		rel, err := filepath.Rel(pathRoot, filepath.Clean(p))
-		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
-			return
+		for _, root := range roots {
+			rel, err := filepath.Rel(root, filepath.Clean(p))
+			if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") {
+				out = append(out, filepath.ToSlash(rel))
+				return
+			}
 		}
-		out = append(out, filepath.ToSlash(rel))
 	}
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
