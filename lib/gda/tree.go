@@ -26,7 +26,8 @@ type tree struct {
 	d  *dest
 	at string // run ID to read the tree at, or "" for the latest indexes
 
-	cache map[string][]Entry // entries by index key
+	cache   map[string][]Entry // entries by index key
+	checked bool               // whether history at at is known to be kept
 }
 
 func newTree(d *dest, at string) *tree {
@@ -57,9 +58,15 @@ func (t *tree) entries(ctx context.Context, key string) ([]Entry, error) {
 	}
 	var entries []Entry
 	var err error
-	if t.at == "" {
+	switch {
+	case t.at == "":
 		entries, err = t.d.readIndex(ctx, key)
-	} else {
+	case !t.checked:
+		if err = checkHistory(ctx, t.d, t.at); err == nil {
+			t.checked = true
+			entries, err = t.replay(ctx, key)
+		}
+	default:
 		entries, err = t.replay(ctx, key)
 	}
 	if err != nil {
