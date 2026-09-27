@@ -1186,6 +1186,7 @@ type Object struct {
 	meta         map[string]string // The object metadata if known - may be nil - with lower case keys
 	mimeType     string            // MimeType of object - may be ""
 	versionID    *string           // If present this points to an object version
+	headVersion  *string           // version the last HEAD or upload reported
 
 	// Metadata as pointers to strings as they often won't be present
 	storageClass       *string // e.g. GLACIER
@@ -4270,6 +4271,8 @@ func (o *Object) setMetaData(resp *s3.HeadObjectOutput) {
 		}
 	}
 	o.mimeType = strings.Clone(deref(resp.ContentType))
+
+	o.headVersion = stringClonePointer(resp.VersionId)
 
 	// Set system metadata
 	o.storageClass = stringClone(string(resp.StorageClass))
