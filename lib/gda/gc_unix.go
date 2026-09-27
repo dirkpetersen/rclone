@@ -58,10 +58,15 @@ type GCReport struct {
 	StaleIndexes []GCObject  `json:"stale_indexes"` // parts of split indexes which a later index replaced
 	Compactable  []PackUsage `json:"compactable"`   // packs worth rewriting
 	Errors       []string    `json:"errors"`
-	mu           sync.Mutex
-	referenced   map[string]bool // keys referenced from other directories
-	candidates   []gcCandidate   // unreferenced in their own directory
-	sharedPacks  map[string]bool // packs with live members referenced from other directories
+}
+
+// gcScan is the state of a GC while it reads the tree.
+type gcScan struct {
+	*GCReport
+	mu          sync.Mutex
+	referenced  map[string]bool // keys referenced from other directories
+	candidates  []gcCandidate   // unreferenced in their own directory
+	sharedPacks map[string]bool // packs with live members referenced from other directories
 }
 
 // gcCandidate is an object its own directory's changesets don't refer to.
@@ -108,8 +113,11 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		defer b.unlock(ctx)
 		defer b.keepLock(ctx)()
 	}
-	r := &GCReport{Orphans: []GCObject{}, Unknown: []GCObject{}, StaleIndexes: []GCObject{}, Compactable: []PackUsage{}, Errors: []string{},
-		referenced: map[string]bool{}, sharedPacks: map[string]bool{}}
+	r := &gcScan{
+		GCReport:    &GCReport{Orphans: []GCObject{}, Unknown: []GCObject{}, StaleIndexes: []GCObject{}, Compactable: []PackUsage{}, Errors: []string{}},
+		referenced:  map[string]bool{},
+		sharedPacks: map[string]bool{},
+	}
 	if err := r.loadDedupRefs(ctx, d); err != nil {
 		return nil, err
 	}
@@ -161,16 +169,16 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 	sort.Slice(r.StaleIndexes, func(i, j int) bool { return r.StaleIndexes[i].Key < r.StaleIndexes[j].Key })
 	sort.Slice(r.Compactable, func(i, j int) bool { return r.Compactable[i].Key < r.Compactable[j].Key })
 	if !opt.DeleteOrphans {
-		return r, nil
+		return r.GCReport, nil
 	}
 	if len(r.Errors) > 0 {
 		// A directory that couldn't be read may hold references.
-		return r, errors.New("not removing orphans as the tree couldn't be read in full")
+		return r.GCReport, errors.New("not removing orphans as the tree couldn't be read in full")
 	}
 	for _, o := range append(r.Orphans, r.StaleIndexes...) {
 		if b.isStopped() {
 			// Another run may be writing objects which look like orphans.
-			return r, errors.New("stopped removing orphans as the destination lock was lost")
+			return r.GCReport, errors.New("stopped removing orphans as the destination lock was lost")
 		}
 		// Objects keep their source file's modification time, so the
 		// age comes from the run which wrote them.
@@ -197,9 +205,9 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		r.Deleted++
 	}
 	if len(r.Errors) > 0 {
-		return r, fmt.Errorf("gc finished with %d errors", len(r.Errors))
+		return r.GCReport, fmt.Errorf("gc finished with %d errors", len(r.Errors))
 	}
-	return r, nil
+	return r.GCReport, nil
 }
 
 // orphanRun returns when the run which wrote the data object at key
@@ -221,7 +229,7 @@ var runInNameRe = regexp.MustCompile(`\.gda\.(\d{8}T\d{6}Z)\.[^./]+(\.\d+\.tar)?
 var indexPartRe = regexp.MustCompile(`^gda-index\.\d{8}T\d{6}Z\.\d+\.csv$`)
 
 // errorf records an error.
-func (r *GCReport) errorf(format string, args ...any) {
+func (r *gcScan) errorf(format string, args ...any) {
 	err := fmt.Errorf(format, args...)
 	fs.Errorf(nil, "gda: gc: %v", err)
 	r.mu.Lock()
@@ -233,7 +241,7 @@ func (r *GCReport) errorf(format string, args ...any) {
 // a run records a stored copy there before committing its directory, so
 // later directories may refer to an object whose own directory never
 // committed it.
-func (r *GCReport) loadDedupRefs(ctx context.Context, d *dest) error {
+func (r *gcScan) loadDedupRefs(ctx context.Context, d *dest) error {
 	entries, err := d.f.List(ctx, dedupDir)
 	if errors.Is(err, fs.ErrorDirNotFound) {
 		return nil
@@ -262,7 +270,7 @@ func (r *GCReport) loadDedupRefs(ctx context.Context, d *dest) error {
 
 // scanDir reads the changesets and index of the directory dir, whose
 // listing is entries, and accounts for its data objects.
-func (r *GCReport) scanDir(ctx context.Context, d *dest, dir string, entries fs.DirEntries) error {
+func (r *gcScan) scanDir(ctx context.Context, d *dest, dir string, entries fs.DirEntries) error {
 	var objects []fs.Object
 	var changesets []string
 	for _, e := range entries {
