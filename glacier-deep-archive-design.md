@@ -683,6 +683,17 @@ moves their `location`, then deletes the old pack.
   Compaction itself is left. It must count the dedup index as a reference
   too: after a rebase, duplicates may still point at members of the old
   packs.
+- **Retention (implemented):** `rclone gda gc --keep-history 365d` (or
+  `--keep-from <run>`) works out, from each directory's changesets, which
+  data only rows that ended before then need: a row ends when a later
+  run replaces or deletes its file. Objects, and in versioned buckets
+  object versions, which nothing still live needs, here or through a
+  `dedup_of` elsewhere, are reported, and `--delete-expired` removes them
+  under the lock. It first records the cutoff in `_gda/history.json`, so
+  restores and listings of earlier runs are refused, and afterwards takes
+  the removed objects out of the dedup index. Packs which still hold a
+  live file stay; rebasing gathers live files out of fragmented ones.
+  Changesets stay, as they are small.
 
 ## Commit protocol and crash safety
 
@@ -1334,7 +1345,7 @@ Decided on 2026-09-26:
 | History of large standalone files | Both methods: bucket versioning when enabled, otherwise `<name>.gda.<run>` key names |
 | Owner and group | Stored as names and numeric IDs (`owner`, `group`, `uid`, `gid`) |
 | Motuz | Detects `gda-index.csv` automatically on S3 connections, through the read-only `gda` backend |
-| Retention | Keep superseded and deleted versions forever by default. Garbage collection runs only when invoked, with a dry-run cost report |
+| Retention | Keep superseded and deleted versions forever by default. Garbage collection runs only when invoked, with a dry-run cost report; `gc --keep-history` removes what only older history needs (decided 2026-09-27) |
 | Encryption | SSE-S3 (bucket default encryption) |
 | Where the code lives | In the fork first. Propose `rclone gda` and the `gda` backend upstream once the format is proven; send generic S3 fixes upstream right away |
 | First step | The upstream S3 fixes from the analysis, each on its own branch from `master` |

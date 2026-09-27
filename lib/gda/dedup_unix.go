@@ -326,33 +326,14 @@ func (b *backup) recordCopies(key string, rows map[string]Entry) {
 	}
 }
 
-// dedupCompactAt is the number of dedup index files above which a run
-// merges them into one. Tests lower it.
-var dedupCompactAt = 50
-
-// compactDedup merges the dedup index files into one when there are more
-// than dedupCompactAt, then removes the merged ones. It must be called
-// while holding the destination lock. Readers take the union of the
-// files, so a copy listed twice while this runs does no harm.
-func compactDedup(ctx context.Context, d *dest, runID string) error {
-	if d.dryRun {
-		return nil
-	}
-	entries, err := d.f.List(ctx, dedupDir)
-	if errors.Is(err, fs.ErrorDirNotFound) {
-		return nil
-	}
-	if err != nil {
+// dropFromDedup rewrites the dedup index without the copies stored in
+// the objects removed, referred to as versionKey does, so that no later
+// run refers to them. It must be called while holding the destination
+// lock.
+func dropFromDedup(ctx context.Context, d *dest, removed map[string]bool, runID string) error {
+	files, err := dedupFiles(ctx, d)
+	if err != nil || len(files) == 0 {
 		return err
-	}
-	var files []fs.Object
-	for _, entry := range entries {
-		if o, ok := entry.(fs.Object); ok && path.Ext(o.Remote()) == ".csv" {
-			files = append(files, o)
-		}
-	}
-	if len(files) <= dedupCompactAt {
-		return nil
 	}
 	idx := newDedupIndex()
 	for _, o := range files {
@@ -360,6 +341,36 @@ func compactDedup(ctx context.Context, d *dest, runID string) error {
 			return fmt.Errorf("read dedup index %q: %w", o.Remote(), err)
 		}
 	}
+	for k, c := range idx.bySum {
+		if removed[versionKey(c.location, c.versionID)] {
+			delete(idx.bySum, k)
+		}
+	}
+	return replaceDedup(ctx, d, idx, files, runID)
+}
+
+// dedupFiles returns the files of the dedup index.
+func dedupFiles(ctx context.Context, d *dest) ([]fs.Object, error) {
+	entries, err := d.f.List(ctx, dedupDir)
+	if errors.Is(err, fs.ErrorDirNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var files []fs.Object
+	for _, entry := range entries {
+		if o, ok := entry.(fs.Object); ok && path.Ext(o.Remote()) == ".csv" {
+			files = append(files, o)
+		}
+	}
+	return files, nil
+}
+
+// replaceDedup writes idx as one dedup index file and removes files,
+// which it replaces. Readers take the union of the files, so a copy
+// listed twice meanwhile does no harm.
+func replaceDedup(ctx context.Context, d *dest, idx *dedupIndex, files []fs.Object, runID string) error {
 	target := joinRemote(dedupDir, "compact-"+runID+".csv")
 	if err := idx.write(ctx, d, target); err != nil {
 		return err
@@ -372,6 +383,34 @@ func compactDedup(ctx context.Context, d *dest, runID string) error {
 			return fmt.Errorf("remove merged dedup index %q: %w", o.Remote(), err)
 		}
 	}
-	fs.Infof(nil, "gda: merged %d dedup index files into %q", len(files), target)
+	return nil
+}
+
+// dedupCompactAt is the number of dedup index files above which a run
+// merges them into one. Tests lower it.
+var dedupCompactAt = 50
+
+// compactDedup merges the dedup index files into one when there are more
+// than dedupCompactAt, then removes the merged ones. It must be called
+// while holding the destination lock. Readers take the union of the
+// files, so a copy listed twice while this runs does no harm.
+func compactDedup(ctx context.Context, d *dest, runID string) error {
+	if d.dryRun {
+		return nil
+	}
+	files, err := dedupFiles(ctx, d)
+	if err != nil || len(files) <= dedupCompactAt {
+		return err
+	}
+	idx := newDedupIndex()
+	for _, o := range files {
+		if err := idx.load(ctx, o); err != nil {
+			return fmt.Errorf("read dedup index %q: %w", o.Remote(), err)
+		}
+	}
+	if err := replaceDedup(ctx, d, idx, files, runID); err != nil {
+		return err
+	}
+	fs.Infof(nil, "gda: merged %d dedup index files", len(files))
 	return nil
 }

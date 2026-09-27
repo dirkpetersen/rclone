@@ -369,6 +369,40 @@ func TestRandomHistory(t *testing.T) {
 			gc, err := GC(context.Background(), f, GCOptions{})
 			require.NoError(t, err)
 			assert.Empty(t, gc.Orphans)
+
+			// Drop the history before a random run, then carry on
+			// backing up: what is kept still restores, and later runs
+			// don't refer to anything removed.
+			keep := r.Intn(len(runs))
+			_, err = GC(context.Background(), f, GCOptions{KeepFrom: runs[keep], DeleteExpired: true, LockTimeout: time.Hour})
+			require.NoError(t, err)
+			for range 2 {
+				m.mutate(15)
+				opt := testOptions()
+				opt.RollupMax = []int64{0, 64, 4096}[r.Intn(3)]
+				opt.DedupMin = 1000
+				opt.AllowEmpty = true
+				states = append(states, treeState(t, src))
+				l, err := Backup(context.Background(), src, f, opt)
+				require.NoError(t, err)
+				runs = append(runs, l.RunID)
+			}
+			for i := keep; i < len(runs); i++ {
+				ropt := DefaultRestoreOptions()
+				ropt.At = runs[i]
+				target := t.TempDir()
+				st, err := StartRestore(context.Background(), f, target, ropt)
+				if len(states[i]) == 0 {
+					assert.ErrorContains(t, err, "nothing to restore")
+					continue
+				}
+				require.NoError(t, err, "restore at run %d after expiry", i)
+				assert.Equal(t, StateDone, st.State, "restore at run %d after expiry", i)
+				assert.Equal(t, states[i], treeState(t, target), "restore at run %d after expiry", i)
+			}
+			report, err = Check(context.Background(), f, "", "", CheckOptions{Download: true})
+			require.NoError(t, err)
+			assert.False(t, report.Failed(), "after expiry: %+v", report)
 		})
 	}
 }

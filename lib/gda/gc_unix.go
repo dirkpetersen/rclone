@@ -40,6 +40,9 @@ type GCOptions struct {
 	DeleteOrphans bool          // remove orphan data objects
 	MinAge        time.Duration // orphans younger than this are kept
 	LockTimeout   time.Duration // as for backups, when taking the lock to delete
+	KeepHistory   time.Duration // history to keep; 0 keeps all of it
+	KeepFrom      string        // run from which to keep history, instead of KeepHistory
+	DeleteExpired bool          // remove data only history older than KeepHistory needs
 }
 
 // GCReport describes the data objects of a GDA tree.
@@ -53,10 +56,13 @@ type GCReport struct {
 	DeadPackData int64       `json:"dead_pack_data"` // bytes of pack members only in history, before compression
 	Orphans      []GCObject  `json:"orphans"`        // data objects nothing refers to
 	OrphanBytes  int64       `json:"orphan_bytes"`
-	Deleted      int64       `json:"deleted"`       // orphans removed
-	Unknown      []GCObject  `json:"unknown"`       // other objects no changeset refers to, never removed
-	StaleIndexes []GCObject  `json:"stale_indexes"` // parts of split indexes which a later index replaced
-	Compactable  []PackUsage `json:"compactable"`   // packs worth rewriting
+	Deleted      int64       `json:"deleted"`                // orphans removed
+	Unknown      []GCObject  `json:"unknown"`                // other objects no changeset refers to, never removed
+	StaleIndexes []GCObject  `json:"stale_indexes"`          // parts of split indexes which a later index replaced
+	HistoryFrom  string      `json:"history_from,omitempty"` // with KeepHistory, the run from which history is kept
+	Expired      []GCObject  `json:"expired"`                // data only history before HistoryFrom needs
+	ExpiredBytes int64       `json:"expired_bytes"`
+	Compactable  []PackUsage `json:"compactable"` // packs worth rewriting
 	Errors       []string    `json:"errors"`
 }
 
@@ -67,6 +73,8 @@ type gcScan struct {
 	referenced  map[string]bool // keys referenced from other directories
 	candidates  []gcCandidate   // unreferenced in their own directory
 	sharedPacks map[string]bool // packs with live members referenced from other directories
+	needed      map[string]bool // with KeepHistory, objects rows in other directories need, by reference
+	expired     []GCObject      // with KeepHistory, objects only expired rows of their directory need
 }
 
 // gcCandidate is an object its own directory's changesets don't refer to.
@@ -104,7 +112,7 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		return nil, fmt.Errorf("%s isn't the root of a GDA tree: %w", destName(dst), err)
 	}
 	var b *backup
-	if opt.DeleteOrphans {
+	if opt.DeleteOrphans || opt.DeleteExpired {
 		b = &backup{d: d, runID: NewRunID(timeNow().UTC()), opt: Options{LockTimeout: opt.LockTimeout, MetaTier: "STANDARD"}}
 		host, _ := os.Hostname()
 		if err := b.lock(ctx, host); err != nil {
@@ -114,9 +122,16 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		defer b.keepLock(ctx)()
 	}
 	r := &gcScan{
-		GCReport:    &GCReport{Orphans: []GCObject{}, Unknown: []GCObject{}, StaleIndexes: []GCObject{}, Compactable: []PackUsage{}, Errors: []string{}},
+		GCReport:    &GCReport{Orphans: []GCObject{}, Unknown: []GCObject{}, StaleIndexes: []GCObject{}, Expired: []GCObject{}, Compactable: []PackUsage{}, Errors: []string{}},
 		referenced:  map[string]bool{},
 		sharedPacks: map[string]bool{},
+		needed:      map[string]bool{},
+	}
+	switch {
+	case opt.KeepFrom != "":
+		r.HistoryFrom = opt.KeepFrom
+	case opt.KeepHistory > 0:
+		r.HistoryFrom = NewRunID(timeNow().Add(-opt.KeepHistory))
 	}
 	if err := r.loadDedupRefs(ctx, d); err != nil {
 		return nil, err
@@ -164,50 +179,101 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 	for i := range r.Compactable {
 		r.Compactable[i].Shared = r.sharedPacks[r.Compactable[i].Key]
 	}
+	for _, o := range r.expired {
+		if !r.needed[o.Key] {
+			r.Expired = append(r.Expired, o)
+			r.ExpiredBytes += o.Size
+		}
+	}
+	sort.Slice(r.Expired, func(i, j int) bool { return r.Expired[i].Key < r.Expired[j].Key })
 	sort.Slice(r.Orphans, func(i, j int) bool { return r.Orphans[i].Key < r.Orphans[j].Key })
 	sort.Slice(r.Unknown, func(i, j int) bool { return r.Unknown[i].Key < r.Unknown[j].Key })
 	sort.Slice(r.StaleIndexes, func(i, j int) bool { return r.StaleIndexes[i].Key < r.StaleIndexes[j].Key })
 	sort.Slice(r.Compactable, func(i, j int) bool { return r.Compactable[i].Key < r.Compactable[j].Key })
-	if !opt.DeleteOrphans {
+	if !opt.DeleteOrphans && !opt.DeleteExpired {
 		return r.GCReport, nil
 	}
 	if len(r.Errors) > 0 {
 		// A directory that couldn't be read may hold references.
-		return r.GCReport, errors.New("not removing orphans as the tree couldn't be read in full")
+		return r.GCReport, errors.New("not removing anything as the tree couldn't be read in full")
 	}
-	for _, o := range append(r.Orphans, r.StaleIndexes...) {
-		if b.isStopped() {
-			// Another run may be writing objects which look like orphans.
-			return r.GCReport, errors.New("stopped removing orphans as the destination lock was lost")
+	if opt.DeleteOrphans {
+		for _, o := range append(r.Orphans, r.StaleIndexes...) {
+			if b.isStopped() {
+				// Another run may be writing objects which look like orphans.
+				return r.GCReport, errors.New("stopped removing orphans as the destination lock was lost")
+			}
+			// Objects keep their source file's modification time, so the
+			// age comes from the run which wrote them.
+			written, ok := orphanRun(o.Key)
+			if !ok {
+				fs.Logf(o.Key, "gda: not removing orphan, as its name doesn't show which run wrote it")
+				continue
+			}
+			if time.Since(written) < opt.MinAge {
+				continue
+			}
+			if d.dryRun {
+				fs.Logf(o.Key, "Not deleting as --dry-run is set")
+				continue
+			}
+			obj, err := dst.NewObject(ctx, o.Key)
+			if err == nil {
+				err = obj.Remove(ctx)
+			}
+			if err != nil {
+				r.errorf("remove %q: %v", o.Key, err)
+				continue
+			}
+			r.Deleted++
 		}
-		// Objects keep their source file's modification time, so the
-		// age comes from the run which wrote them.
-		written, ok := orphanRun(o.Key)
-		if !ok {
-			fs.Logf(o.Key, "gda: not removing orphan, as its name doesn't show which run wrote it")
-			continue
-		}
-		if time.Since(written) < opt.MinAge {
-			continue
-		}
-		if d.dryRun {
-			fs.Logf(o.Key, "Not deleting as --dry-run is set")
-			continue
-		}
-		obj, err := dst.NewObject(ctx, o.Key)
-		if err == nil {
-			err = obj.Remove(ctx)
-		}
-		if err != nil {
-			r.errorf("remove %q: %v", o.Key, err)
-			continue
-		}
-		r.Deleted++
+	}
+	if opt.DeleteExpired && r.HistoryFrom != "" {
+		r.deleteExpired(ctx, d, b)
 	}
 	if len(r.Errors) > 0 {
 		return r.GCReport, fmt.Errorf("gc finished with %d errors", len(r.Errors))
 	}
 	return r.GCReport, nil
+}
+
+// deleteExpired removes the expired data, records from which run history
+// is kept, and takes the removed objects out of the dedup index, so no
+// later run refers to them.
+func (r *gcScan) deleteExpired(ctx context.Context, d *dest, b *backup) {
+	if d.dryRun {
+		for _, o := range r.Expired {
+			fs.Logf(o.Key, "Not deleting as --dry-run is set")
+		}
+		return
+	}
+	// Readers learn that older history is gone before any of it is.
+	if err := writeHistoryFrom(ctx, d, r.HistoryFrom); err != nil {
+		r.errorf("record kept history: %v", err)
+		return
+	}
+	removed := map[string]bool{}
+	for _, o := range r.Expired {
+		if b.isStopped() {
+			r.errorf("stopped removing expired data as the destination lock was lost")
+			break
+		}
+		obj, err := newDataObject(ctx, d.f, o.Key)
+		if err == nil {
+			err = obj.Remove(ctx)
+		}
+		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+			r.errorf("remove %q: %v", o.Key, err)
+			continue
+		}
+		removed[o.Key] = true
+		r.Deleted++
+	}
+	if len(removed) > 0 {
+		if err := dropFromDedup(ctx, d, removed, b.runID); err != nil {
+			r.errorf("update dedup index: %v", err)
+		}
+	}
 }
 
 // orphanRun returns when the run which wrote the data object at key
@@ -289,6 +355,16 @@ func (r *gcScan) scanDir(ctx context.Context, d *dest, dir string, entries fs.Di
 	local := map[string]bool{}
 	members := map[string]map[int64]int64{}
 	var remote []string
+	// Changesets in the order history replays them.
+	sort.Slice(changesets, func(i, j int) bool {
+		ri := changesetRe.FindStringSubmatch(path.Base(changesets[i]))[1]
+		rj := changesetRe.FindStringSubmatch(path.Base(changesets[j]))[1]
+		if ri != rj {
+			return ri < rj
+		}
+		return changesets[i] < changesets[j]
+	})
+	hist := newHistory(dir)
 	for _, key := range changesets {
 		data, err := d.get(ctx, key)
 		if err != nil {
@@ -298,8 +374,10 @@ func (r *gcScan) scanDir(ctx context.Context, d *dest, dir string, entries fs.Di
 		if err != nil {
 			return fmt.Errorf("parse %q: %w", key, err)
 		}
+		run := changesetRe.FindStringSubmatch(path.Base(key))[1]
 		for i := range rows {
 			row := &rows[i]
+			hist.add(run, row)
 			if row.DedupOf != "" {
 				l := Located{Entry: *row, IndexKey: dir}
 				remote = append(remote, l.ObjectKey())
@@ -360,9 +438,29 @@ func (r *gcScan) scanDir(ctx context.Context, d *dest, dir string, entries fs.Di
 		}
 	}
 
+	neededHere, neededElsewhere, expiredRefs := hist.expiry(r.HistoryFrom)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.Directories++
+	for ref := range neededElsewhere {
+		r.needed[ref] = true
+	}
+	if r.HistoryFrom != "" {
+		for _, o := range objects {
+			name := path.Base(o.Remote())
+			if _, ok := expiredRefs[name]; ok && !neededHere[name] {
+				r.expired = append(r.expired, GCObject{Key: o.Remote(), Size: o.Size(), ModTime: o.ModTime(ctx)})
+			}
+		}
+		// Versions of objects aren't listed, so come from the rows.
+		for ref, size := range expiredRefs {
+			if _, version := splitVersionKey(ref); version != "" && !neededHere[ref] {
+				key, _ := splitVersionKey(ref)
+				r.expired = append(r.expired, GCObject{Key: versionKey(joinRemote(dir, key), version), Size: size})
+			}
+		}
+	}
 	r.StaleIndexes = append(r.StaleIndexes, stale...)
 	for _, key := range remote {
 		r.referenced[key] = true

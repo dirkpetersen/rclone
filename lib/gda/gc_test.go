@@ -206,3 +206,63 @@ func TestGCStaleIndexReadError(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, entries, 5)
 }
+
+func TestGCExpireHistory(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	opt.PackSize = 64 * 1024
+	opt.StandaloneMin = 8 * 1024
+	writeFile(t, src, "d/a.txt", 100)
+	writeFile(t, src, "d/b.txt", 100)
+	writeFile(t, src, "d/big.bin", 9000)
+	run1 := runBackup(t, src, dst, opt)
+	writeFile(t, src, "d/a.txt", 101)
+	writeFile(t, src, "d/big.bin", 9001)
+	run2 := runBackup(t, src, dst, opt)
+	require.NoError(t, os.Remove(filepath.Join(src, "d/a.txt")))
+	run3 := runBackup(t, src, dst, opt)
+	f := newDst(t, dst)
+
+	// Keeping history from run 3, the pack holding only a.txt's second
+	// version and big.bin's first version are no longer needed; the first
+	// pack still holds b.txt.
+	r, err := GC(context.Background(), f, GCOptions{KeepFrom: run3.RunID})
+	require.NoError(t, err)
+	var expired []string
+	for _, o := range r.Expired {
+		expired = append(expired, o.Key)
+	}
+	assert.ElementsMatch(t, []string{"d/d.gda." + run2.RunID + ".w01.001.tar", "d/big.bin"}, expired)
+	// Keeping everything expires nothing.
+	r, err = GC(context.Background(), f, GCOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, r.Expired)
+
+	r, err = GC(context.Background(), f, GCOptions{KeepFrom: run3.RunID, DeleteExpired: true, LockTimeout: time.Hour})
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), r.Deleted)
+	assert.NoFileExists(t, filepath.Join(dst, "d", "big.bin"))
+
+	// The tree as it is, and as it was at run 3, still restores; earlier
+	// runs are refused.
+	for _, at := range []string{"", run3.RunID} {
+		ropt := DefaultRestoreOptions()
+		ropt.At = at
+		target := t.TempDir()
+		st, err := StartRestore(context.Background(), f, target, ropt)
+		require.NoError(t, err, at)
+		assert.Equal(t, StateDone, st.State, at)
+		if at == "" {
+			assertSameTree(t, src, target)
+		}
+	}
+	ropt := DefaultRestoreOptions()
+	ropt.At = run1.RunID
+	_, err = StartRestore(context.Background(), f, t.TempDir(), ropt)
+	assert.ErrorContains(t, err, "history before run "+run3.RunID+" has been removed")
+	report, err := Check(context.Background(), f, "", "", CheckOptions{Download: true})
+	require.NoError(t, err)
+	assert.False(t, report.Failed(), "%+v", report)
+}

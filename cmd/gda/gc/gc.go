@@ -6,6 +6,7 @@ package gc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -24,7 +25,8 @@ var (
 		MinAge:      7 * 24 * time.Hour,
 		LockTimeout: libgda.DefaultOptions().LockTimeout,
 	}
-	jsonOut = false
+	jsonOut  = false
+	keepFrom = ""
 )
 
 // maxListed is how many objects of each kind the text report lists.
@@ -36,6 +38,9 @@ func init() {
 	flags.DurationVarP(flagSet, &opt.MinAge, "min-age", "", opt.MinAge, "Keep orphans younger than this", "")
 	flags.DurationVarP(flagSet, &opt.LockTimeout, "lock-timeout", "", opt.LockTimeout, "Take over a destination lock older than this", "")
 	flags.BoolVarP(flagSet, &jsonOut, "json", "", jsonOut, "Print the report as JSON", "")
+	flags.DurationVarP(flagSet, &opt.KeepHistory, "keep-history", "", opt.KeepHistory, "Keep history this far back, reporting data only older history needs (default all of it)", "")
+	flags.StringVarP(flagSet, &keepFrom, "keep-from", "", keepFrom, "Keep history from this run ID or RFC 3339 time, as --keep-history", "")
+	flags.BoolVarP(flagSet, &opt.DeleteExpired, "delete-expired", "", opt.DeleteExpired, "Remove data only history older than --keep-history needs", "")
 	gda.Command.AddCommand(Command)
 }
 
@@ -56,11 +61,20 @@ Reads every changeset and index of the GDA tree and reports:
 - objects without GDA names which no changeset refers to, which may
   not be GDA's.
 
+With !--keep-history! or !--keep-from!, it also reports the data which
+only history from before then needs: versions of files which were
+replaced or deleted before then, and packs holding nothing else. With
+!--delete-expired! it removes that data, after recording from when
+history is kept, so that restoring or listing the tree as it was before
+then is refused rather than failing part way. Removing archived data
+younger than its minimum storage duration, 180 days for Deep Archive,
+is charged as if it had been kept that long.
+
 With !--delete-orphans! it also removes the orphans and old index parts
 older than !--min-age!, holding the destination lock so that no backup
 adds data meanwhile. Nothing else is ever removed, and nothing is
-removed if any directory couldn't be read. Superseded and deleted files
-stay in their packs, as history is kept.
+removed if any directory couldn't be read. Without !--keep-history!,
+superseded and deleted files stay, as all history is kept.
 `, "!", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",
@@ -69,6 +83,14 @@ stay in their packs, as history is kept.
 		cmd.CheckArgs(1, 1, command, args)
 		f := cmd.NewFsDir(args)
 		cmd.Run(false, false, command, func() error {
+			from, err := libgda.ParseAt(keepFrom)
+			if err != nil {
+				return err
+			}
+			opt.KeepFrom = from
+			if opt.DeleteExpired && opt.KeepHistory == 0 && opt.KeepFrom == "" {
+				return errors.New("--delete-expired needs --keep-history or --keep-from")
+			}
 			r, err := libgda.GC(context.Background(), f, opt)
 			if r == nil {
 				return err
@@ -93,7 +115,7 @@ func printReport(r *libgda.GCReport) {
 	fmt.Printf("Directories:   %d\n", r.Directories)
 	fmt.Printf("Data objects:  %d (%s)\n", r.DataObjects, fs.SizeSuffix(r.DataBytes))
 	fmt.Printf("Packs:         %d (%s), members %s live, %s only in history\n", r.Packs, fs.SizeSuffix(r.PackBytes), fs.SizeSuffix(r.LivePackData), fs.SizeSuffix(r.DeadPackData))
-	fmt.Printf("Orphans:       %d (%s), %d removed\n", len(r.Orphans), fs.SizeSuffix(r.OrphanBytes), r.Deleted)
+	fmt.Printf("Orphans:       %d (%s)\n", len(r.Orphans), fs.SizeSuffix(r.OrphanBytes))
 	for i, o := range r.Orphans {
 		if i == maxListed {
 			fmt.Printf("  ... and %d more\n", len(r.Orphans)-maxListed)
@@ -106,6 +128,9 @@ func printReport(r *libgda.GCReport) {
 		staleBytes += o.Size
 	}
 	fmt.Printf("Old indexes:   %d parts of split indexes replaced since (%s)\n", len(r.StaleIndexes), fs.SizeSuffix(staleBytes))
+	if r.HistoryFrom != "" {
+		fmt.Printf("Expired:       %d objects (%s) only history before run %s needs\n", len(r.Expired), fs.SizeSuffix(r.ExpiredBytes), r.HistoryFrom)
+	}
 	fmt.Printf("Compactable:   %d packs\n", len(r.Compactable))
 	for i, u := range r.Compactable {
 		if i == maxListed {
@@ -118,6 +143,7 @@ func printReport(r *libgda.GCReport) {
 		}
 		fmt.Printf("  %s (%s, %s of %s live%s)\n", u.Key, fs.SizeSuffix(u.Size), fs.SizeSuffix(u.Live), fs.SizeSuffix(u.Members), shared)
 	}
+	fmt.Printf("Removed:       %d objects\n", r.Deleted)
 	fmt.Printf("Not GDA's:     %d objects no changeset refers to\n", len(r.Unknown))
 	for i, o := range r.Unknown {
 		if i == maxListed {
