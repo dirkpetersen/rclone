@@ -130,9 +130,9 @@ func (t *tree) replay(ctx context.Context, key string) ([]Entry, error) {
 // Located is an entry together with the key of the index it is in.
 type Located struct {
 	Entry
-	IndexKey  string // key of the directory whose index holds the entry
-	Path      string // path relative to the walk's start, as named in indexes
-	LocalPath string // Path with names decoded to their original bytes
+	IndexKey  string `json:"index_key"`  // key of the directory whose index holds the entry
+	Path      string `json:"path"`       // path relative to the walk's start, as named in indexes
+	LocalPath string `json:"local_path"` // Path with names decoded to their original bytes
 }
 
 // ObjectKey returns the key of the object holding the entry's data.

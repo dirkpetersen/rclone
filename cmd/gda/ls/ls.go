@@ -65,7 +65,7 @@ up, reading only the indexes, so nothing needs to be restored. With
 				if e.IsDir() {
 					size = e.TreeSize
 				}
-				fmt.Printf("%-8s %12d %s %s\n", e.Type, max(size, 0), e.ModTime.Local().Format("2006-01-02 15:04:05"), e.Path)
+				fmt.Printf("%-8s %12d %s %s\n", e.Type, max(size, 0), e.ModTime.Local().Format("2006-01-02 15:04:05"), e.LocalPath)
 			}
 			return nil
 		})

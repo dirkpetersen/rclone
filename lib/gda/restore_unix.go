@@ -77,6 +77,7 @@ type FileCounts struct {
 	Fetched          int `json:"fetched"`           // entries in place
 	SkippedIdentical int `json:"skipped_identical"` // entries which were already in place when the restore started
 	Failed           int `json:"failed"`            // entries which couldn't be restored
+	Unsupported      int `json:"unsupported"`       // entries which can't be recreated here, such as devices when not root
 }
 
 // RestoreRecord describes a restore. It is saved as
@@ -106,6 +107,7 @@ func newRestoreID() string {
 	return NewRunID(timeNow()) + "-" + hex.EncodeToString(b[:])
 }
 
+// restoreKey returns the key of a restore's record or plan.
 func restoreKey(id, ext string) string {
 	return joinRemote(MetaDir, "restores", id+ext)
 }
@@ -196,7 +198,49 @@ func ResumeRestore(ctx context.Context, dst fs.Fs, id, target string) (*RestoreS
 	if err != nil {
 		return nil, fmt.Errorf("parse restore plan %q: %w", id, err)
 	}
-	return fetchPlan(ctx, d, rec, plan), nil
+	// The plan comes from the destination, so check it can't write
+	// outside the target directory.
+	for i := range plan {
+		if err := validTarget(plan[i].Target); err != nil {
+			return nil, fmt.Errorf("restore plan %q: %w", id, err)
+		}
+	}
+	st := fetchPlan(ctx, d, rec, plan)
+	now := timeNow().UTC()
+	if len(st.Pending) > 0 && now.After(rec.ReadyBy) && !d.dryRun {
+		// Restored copies expire after their lifetime, and a request
+		// can be lost, so ask again for whatever still isn't readable.
+		// Objects still being restored just report that.
+		fs.Logf(nil, "gda: restore %s: %d objects still aren't readable after %s, requesting them again", rec.ID, len(st.Pending), rec.ReadyBy.Format(time.RFC3339))
+		if err := requestRestore(ctx, dst, st.Pending, rec.Tier, rec.Lifetime); err != nil {
+			st.Errors = append(st.Errors, err.Error())
+			return st, nil
+		}
+		rec.ReadyBy = now.Add(time.Duration(tierHours[rec.Tier]) * time.Hour)
+		st.ReadyBy, st.Record = rec.ReadyBy, rec
+		data, err := json.MarshalIndent(rec, "", "  ")
+		if err == nil {
+			err = d.putBytes(ctx, restoreKey(rec.ID, ".json"), data, d.metaTier)
+		}
+		if err != nil {
+			st.Errors = append(st.Errors, fmt.Sprintf("save restore record: %v", err))
+		}
+	}
+	return st, nil
+}
+
+// validTarget returns an error if rel, a path below the restore target,
+// isn't a clean relative path which stays below it.
+func validTarget(rel string) error {
+	if rel == "" || strings.HasPrefix(rel, "/") {
+		return fmt.Errorf("invalid restore path %q", rel)
+	}
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("invalid restore path %q", rel)
+		}
+	}
+	return nil
 }
 
 // buildPlan returns the entries to restore. In the plan, Target is the
@@ -228,6 +272,9 @@ func buildPlan(ctx context.Context, t *tree, paths []string) ([]Entry, error) {
 				return nil
 			}
 			seen[name] = true
+			if err := validTarget(name); err != nil {
+				return err
+			}
 			e := l.Entry
 			e.Target = name
 			if e.Location != "" {
@@ -244,13 +291,19 @@ func buildPlan(ctx context.Context, t *tree, paths []string) ([]Entry, error) {
 	return plan, nil
 }
 
+// needsData returns true if restoring e needs data from an object.
+// Empty files don't, so they never wait for a restore.
+func needsData(e *Entry) bool {
+	return e.Type == TypeFile && e.Size > 0 && e.Action != actionSkip
+}
+
 // planObjects returns the keys of the objects holding data of plan
 // entries which aren't in place yet.
 func planObjects(plan []Entry) []string {
 	keys := map[string]bool{}
-	for _, e := range plan {
-		if e.Type == TypeFile && e.Action != actionSkip {
-			keys[e.Location] = true
+	for i := range plan {
+		if needsData(&plan[i]) {
+			keys[plan[i].Location] = true
 		}
 	}
 	out := make([]string, 0, len(keys))
@@ -262,7 +315,8 @@ func planObjects(plan []Entry) []string {
 }
 
 // markIdentical marks plan entries already in place under target with
-// actionSkip and returns the names of those which exist but differ.
+// actionSkip and returns the names of those which exist but differ,
+// including anything other than a real directory where a directory goes.
 func markIdentical(plan []Entry, target string) (conflicts []string, err error) {
 	for i := range plan {
 		e := &plan[i]
@@ -273,7 +327,7 @@ func markIdentical(plan []Entry, target string) (conflicts []string, err error) 
 		switch {
 		case same:
 			e.Action = actionSkip
-		case exists && !e.IsDir():
+		case exists:
 			conflicts = append(conflicts, e.Target)
 		}
 	}
@@ -281,10 +335,11 @@ func markIdentical(plan []Entry, target string) (conflicts []string, err error) 
 }
 
 // inPlace returns whether the local path p exists, and whether it
-// already holds entry e.
+// already holds entry e. A directory is only in place if it is a real
+// directory, not a symlink to one.
 func inPlace(e *Entry, p string) (same, exists bool, err error) {
 	info, err := os.Lstat(p)
-	if errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		return false, false, nil
 	}
 	if err != nil {
@@ -312,7 +367,8 @@ func inPlace(e *Entry, p string) (same, exists bool, err error) {
 
 // requestRestore asks the backend to restore the objects at keys. It
 // does nothing for backends without a restore command, whose objects
-// are always readable.
+// are always readable. It returns an error if any object is missing or
+// its restore couldn't be requested.
 func requestRestore(ctx context.Context, f fs.Fs, keys []string, tier string, lifetime int) error {
 	command := f.Features().Command
 	if command == nil || len(keys) == 0 {
@@ -347,25 +403,88 @@ func requestRestore(ctx context.Context, f fs.Fs, keys []string, tier string, li
 	}
 	var results []struct{ Status, Remote string }
 	if err := json.Unmarshal(data, &results); err != nil {
-		return nil
+		return fmt.Errorf("request restore: unexpected result: %w", err)
 	}
+	status := make(map[string]string, len(results))
 	for _, r := range results {
-		if r.Status != "OK" && !strings.HasPrefix(r.Status, "Not ") && !strings.Contains(r.Status, "RestoreAlreadyInProgress") {
-			fs.Errorf(r.Remote, "gda: restore request: %s", r.Status)
+		status[r.Remote] = r.Status
+	}
+	var problems []string
+	for _, k := range keys {
+		s, ok := status[k]
+		switch {
+		case !ok:
+			// Objects which don't exist are left out of the results.
+			problems = append(problems, fmt.Sprintf("%s: not found", k))
+		case s == "OK", strings.HasPrefix(s, "Not "), strings.Contains(s, "RestoreAlreadyInProgress"):
+			// "Not ..." means the object isn't archived, so is readable.
+		default:
+			problems = append(problems, fmt.Sprintf("%s: %s", k, s))
 		}
+	}
+	if len(problems) > 0 {
+		sort.Strings(problems)
+		if len(problems) > 5 {
+			problems = append(problems[:5], fmt.Sprintf("and %d more", len(problems)-5))
+		}
+		return fmt.Errorf("request restore of %d objects failed:\n  %s", len(problems), strings.Join(problems, "\n  "))
 	}
 	return nil
 }
 
 // isRestorePending returns true if err means the object must be
-// restored before it can be read.
+// restored before it can be read. The s3 backend's Open reports this as
+// "Object in <class>, restore first".
 func isRestorePending(err error) bool {
 	return err != nil && (strings.Contains(err.Error(), "restore first") || strings.Contains(err.Error(), "InvalidObjectState"))
+}
+
+// errUnsupported is returned for entries which can't be recreated here.
+var errUnsupported = errors.New("can't be recreated here")
+
+// makeDirs makes sure that every element of rel below target is a real
+// directory, creating the missing ones. Symlinks and other files in the
+// way are an error, or replaced if overwrite is set, so nothing is ever
+// written outside target by following a symlink.
+func makeDirs(target, rel string, overwrite bool) error {
+	if err := os.MkdirAll(target, 0o777); err != nil {
+		return err
+	}
+	p := target
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		p = filepath.Join(p, part)
+		info, err := os.Lstat(p)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return err
+		case info.IsDir():
+			continue
+		case !overwrite:
+			return fmt.Errorf("%q is in the way of a directory; use --overwrite to replace it", p)
+		default:
+			if err := os.Remove(p); err != nil {
+				return err
+			}
+		}
+		// The umask applies, as with mkdir; the recorded mode is set
+		// once the directory's contents are in place.
+		if err := os.Mkdir(p, 0o777); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // fetchPlan fetches the data of every plan entry that isn't in place and
 // whose object is readable, then creates the other entries and applies
 // metadata.
+//
+// Files which are already identical aren't fetched again, but their
+// permissions and times are set from the backup like everything else.
 func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *RestoreStatus {
 	st := &RestoreStatus{RestoreID: rec.ID, Tier: rec.Tier, ReadyBy: rec.ReadyBy, Record: rec}
 	st.Files.Total = len(plan)
@@ -385,19 +504,18 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 	}
 	done := make([]bool, len(plan))
 	failed := make([]bool, len(plan))
+	unsupported := make([]bool, len(plan))
 	for i := range plan {
 		if plan[i].Action == actionSkip {
 			st.Files.SkippedIdentical++
 		}
 	}
 
-	// Directories first, so files have somewhere to go.
+	// Directories first, so everything else has somewhere to go.
 	for i := range plan {
 		e := &plan[i]
 		if e.IsDir() {
-			// The umask applies, as with mkdir; the recorded mode is set
-			// once the directory's contents are in place.
-			if err := os.MkdirAll(localPath(e), 0o777); err != nil {
+			if err := makeDirs(rec.Target, e.Target, rec.Overwrite); err != nil {
 				errorf("create directory %q: %v", e.Target, err)
 				failed[i] = true
 			}
@@ -406,12 +524,44 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 
 	// Files, grouped by the object holding their data.
 	byObject := map[string][]int{}
+	swept := map[string]bool{}
 	for i := range plan {
 		e := &plan[i]
 		if e.Type != TypeFile {
 			continue
 		}
-		if e.Action == actionSkip {
+		p := localPath(e)
+		same, exists, err := inPlace(e, p)
+		switch {
+		case err != nil:
+			errorf("check %q: %v", e.Target, err)
+			failed[i] = true
+			continue
+		case same:
+			done[i] = true
+			continue
+		case exists && !rec.Overwrite:
+			// Changed locally since the restore started.
+			errorf("%q exists and differs from the backup; use --overwrite to replace it", e.Target)
+			failed[i] = true
+			continue
+		}
+		parent := path.Dir(e.Target)
+		if err := makeDirs(rec.Target, parent, rec.Overwrite); err != nil {
+			errorf("create directory for %q: %v", e.Target, err)
+			failed[i] = true
+			continue
+		}
+		if !swept[parent] {
+			swept[parent] = true
+			sweepTemp(filepath.Dir(p))
+		}
+		if !needsData(e) {
+			if err := writeVerified(io.NopCloser(strings.NewReader("")), e, p); err != nil {
+				errorf("create %q: %v", e.Target, err)
+				failed[i] = true
+				continue
+			}
 			done[i] = true
 			continue
 		}
@@ -424,20 +574,8 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 	sort.Strings(keys)
 	st.Objects.Requested = len(keys)
 	for _, key := range keys {
-		var todo []int
-		for _, i := range byObject[key] {
-			same, _, err := inPlace(&plan[i], localPath(&plan[i]))
-			if err == nil && same {
-				done[i] = true
-				continue
-			}
-			todo = append(todo, i)
-		}
-		if len(todo) == 0 {
-			st.Objects.Fetched++
-			continue
-		}
-		fetched, err := fetchObject(ctx, d, key, plan, todo, localPath)
+		todo := byObject[key]
+		fetched, err := fetchObject(ctx, d, key, plan, todo, localPath, errorf)
 		switch {
 		case isRestorePending(err):
 			st.Objects.Restoring++
@@ -464,12 +602,21 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 		if e.Type == TypeFile || e.IsDir() {
 			continue
 		}
-		if err := createSpecial(e, localPath(e), rec.Overwrite); err != nil {
-			errorf("create %q: %v", e.Target, err)
+		if err := makeDirs(rec.Target, path.Dir(e.Target), rec.Overwrite); err != nil {
+			errorf("create directory for %q: %v", e.Target, err)
 			failed[i] = true
 			continue
 		}
-		done[i] = true
+		err := createSpecial(e, localPath(e), rec.Overwrite)
+		switch {
+		case errors.Is(err, errUnsupported):
+			unsupported[i] = true
+		case err != nil:
+			errorf("create %q: %v", e.Target, err)
+			failed[i] = true
+		default:
+			done[i] = true
+		}
 	}
 
 	isRoot := os.Geteuid() == 0
@@ -483,21 +630,32 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 	}
 	if st.Objects.Restoring == 0 {
 		// Directory metadata last and deepest first, as creating their
-		// contents changes their modification times.
-		for i := len(plan) - 1; i >= 0; i-- {
-			e := &plan[i]
-			if e.IsDir() && !failed[i] {
-				if err := applyMeta(e, localPath(e), isRoot); err != nil {
-					errorf("set metadata of %q: %v", e.Target, err)
-				}
-				done[i] = true
+		// contents changes their modification times and a read only
+		// directory couldn't be filled.
+		var dirs []int
+		for i := range plan {
+			if plan[i].IsDir() && !failed[i] {
+				dirs = append(dirs, i)
 			}
+		}
+		sort.SliceStable(dirs, func(a, b int) bool {
+			return strings.Count(plan[dirs[a]].Target, "/") > strings.Count(plan[dirs[b]].Target, "/")
+		})
+		for _, i := range dirs {
+			e := &plan[i]
+			if err := applyMeta(e, localPath(e), isRoot); err != nil {
+				errorf("set metadata of %q: %v", e.Target, err)
+			}
+			done[i] = true
 		}
 	}
 	for i := range plan {
-		if failed[i] {
+		switch {
+		case failed[i]:
 			st.Files.Failed++
-		} else if done[i] {
+		case unsupported[i]:
+			st.Files.Unsupported++
+		case done[i]:
 			st.Files.Fetched++
 		}
 	}
@@ -512,6 +670,17 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 	return st
 }
 
+// tempPattern names the temporary files restores write into.
+const tempPattern = ".gda-restore-*"
+
+// sweepTemp removes temporary files left in dir by an interrupted restore.
+func sweepTemp(dir string) {
+	matches, _ := filepath.Glob(filepath.Join(dir, tempPattern))
+	for _, m := range matches {
+		_ = os.Remove(m)
+	}
+}
+
 // wholeObjectMembers is the number of members above which a pack is
 // downloaded whole rather than with a ranged read per member.
 const wholeObjectMembers = 16
@@ -519,7 +688,7 @@ const wholeObjectMembers = 16
 // fetchObject fetches the plan entries at todo from the object at key.
 // It returns which of them were written; the error is the first problem
 // with the object as a whole.
-func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []int, localPath func(*Entry) string) (map[int]bool, error) {
+func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []int, localPath func(*Entry) string, errorf func(string, ...any)) (map[int]bool, error) {
 	fetched := map[int]bool{}
 	o, err := d.f.NewObject(ctx, key)
 	if err != nil {
@@ -550,21 +719,22 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 				return fetched, err
 			}
 			if err := writeVerified(in, e, localPath(e)); err != nil {
-				fs.Errorf(e.Target, "gda: %v", err)
+				errorf("%v", err)
 				continue
 			}
 			fetched[i] = true
 		}
 		return fetched, nil
 	}
-	return fetched, extractPack(ctx, o, plan, todo, localPath, fetched)
+	return fetched, extractPack(ctx, o, plan, todo, localPath, fetched, errorf)
 }
 
 // extractPack reads the whole pack o and writes the members at todo.
-func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, localPath func(*Entry) string, fetched map[int]bool) (err error) {
+// Members are matched by their index name, so tar member names are never
+// used as paths.
+func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, localPath func(*Entry) string, fetched map[int]bool, errorf func(string, ...any)) (err error) {
 	wanted := make(map[string]int, len(todo))
 	for _, i := range todo {
-		// Tar member names are the entries' names in their index.
 		wanted[plan[i].Name] = i
 	}
 	in, err := o.Open(ctx)
@@ -588,25 +758,23 @@ func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, loc
 		delete(wanted, hdr.Name)
 		e := &plan[i]
 		if err := writeVerified(io.NopCloser(tr), e, localPath(e)); err != nil {
-			fs.Errorf(e.Target, "gda: %v", err)
+			errorf("%v", err)
 			continue
 		}
 		fetched[i] = true
 	}
 	for name := range wanted {
-		fs.Errorf(name, "gda: not found in pack %q", o.Remote())
+		errorf("%q not found in pack %q", name, o.Remote())
 	}
 	return nil
 }
 
-// writeVerified writes in to p through a temporary file, checking the
-// size and MD5 against e before putting it in place.
+// writeVerified writes in to p through a temporary file in the same
+// directory, checking the size and MD5 against e before renaming it into
+// place. The rename replaces a symlink at p rather than following it.
 func writeVerified(in io.ReadCloser, e *Entry, p string) (err error) {
 	defer fs.CheckClose(in, &err)
-	if err := os.MkdirAll(filepath.Dir(p), 0o777); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".gda-restore-*")
+	tmp, err := os.CreateTemp(filepath.Dir(p), tempPattern)
 	if err != nil {
 		return err
 	}
@@ -633,8 +801,18 @@ func writeVerified(in io.ReadCloser, e *Entry, p string) (err error) {
 	return os.Rename(tmp.Name(), p)
 }
 
-// createSpecial creates a symlink or special file.
+// createSpecial creates a symlink or special file. It returns
+// errUnsupported for entries which can't be recreated here.
 func createSpecial(e *Entry, p string, overwrite bool) error {
+	switch e.Type {
+	case TypeSymlink, TypeFifo:
+	case TypeCharDev, TypeBlockDev:
+		if os.Geteuid() != 0 || e.DevMajor < 0 || e.DevMinor < 0 {
+			return errUnsupported
+		}
+	default:
+		return errUnsupported
+	}
 	same, exists, err := inPlace(e, p)
 	if err != nil || same {
 		return err
@@ -652,32 +830,18 @@ func createSpecial(e *Entry, p string, overwrite bool) error {
 		return os.Symlink(e.LinkTarget, p)
 	case TypeFifo:
 		return syscall.Mkfifo(p, e.Mode&0o777)
-	case TypeCharDev, TypeBlockDev:
-		if os.Geteuid() != 0 || e.DevMajor < 0 || e.DevMinor < 0 {
-			fs.Logf(e.Target, "gda: not restoring %s: needs root and device numbers", e.Type)
-			return nil
-		}
+	default:
 		kind := uint32(unix.S_IFCHR)
 		if e.Type == TypeBlockDev {
 			kind = unix.S_IFBLK
 		}
 		return unix.Mknod(p, kind|e.Mode&0o777, int(unix.Mkdev(uint32(e.DevMajor), uint32(e.DevMinor))))
-	default:
-		fs.Logf(e.Target, "gda: not restoring %s", e.Type)
-		return nil
 	}
 }
 
 // applyMeta sets the permissions and modification time of p from e, and
 // its owner and group when running as root.
 func applyMeta(e *Entry, p string, isRoot bool) error {
-	if e.Type == TypeSocket {
-		return nil
-	}
-	if _, err := os.Lstat(p); err != nil {
-		// Entries which couldn't be created, such as devices when not root.
-		return nil
-	}
 	if isRoot {
 		uid, gid := lookupOwner(e)
 		if uid >= 0 || gid >= 0 {
