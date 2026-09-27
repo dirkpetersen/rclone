@@ -829,3 +829,38 @@ func TestSameLink(t *testing.T) {
 	b.Mode = 0o600
 	assert.False(t, sameLink(&a, &b))
 }
+
+func TestBackupLongKeys(t *testing.T) {
+	fakeClock(t)
+	long := func(c string) string { return strings.Repeat(c, 200) }
+	deep := strings.Join([]string{long("a"), long("b"), long("c")}, "/")
+	// Pad the destination so that deep's own keys just fit, but the
+	// versioned name of a long file in it doesn't.
+	base := t.TempDir()
+	pad := 730 - len(strings.Trim(base, "/")) - len("/x/lab/") - len(deep)
+	src, dst := t.TempDir(), filepath.Join(base, strings.Repeat("x", pad), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	writeFile(t, src, deep+"/small.txt", 10)
+	// Big enough to be stored on its own, but its versioned name would
+	// make too long a key.
+	writeFile(t, src, deep+"/"+strings.Repeat("f", 250), 9000)
+	writeFile(t, src, deep+"/"+long("d")+"/"+long("e")+"/x.txt", 20)
+	l := runBackup(t, src, dst, opt)
+	assert.Zero(t, l.Stats.Errors)
+
+	// The directories whose keys would be too long are packed with the
+	// deepest directory which has an index, and so is the big file.
+	rows := readIndexFile(t, dst, deep)
+	assert.Equal(t, ListingRollup, rows[long("d")].Listing)
+	assert.Contains(t, rows, long("d")+"/"+long("e")+"/x.txt")
+	assert.GreaterOrEqual(t, rows[strings.Repeat("f", 250)].Offset, int64(0))
+
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), newDst(t, dst), target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+	l = runBackup(t, src, dst, opt)
+	assert.Zero(t, l.Stats.Added+l.Stats.Modified+l.Stats.MetaOnly+l.Stats.Errors)
+}
