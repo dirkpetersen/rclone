@@ -158,13 +158,13 @@ func TestRestoreResume(t *testing.T) {
 
 	// Resuming into a new target fetches the whole plan there.
 	other := t.TempDir()
-	st2, err := ResumeRestore(context.Background(), f, st.RestoreID, other)
+	st2, err := ResumeRestore(context.Background(), f, st.RestoreID, other, false)
 	require.NoError(t, err)
 	assert.Equal(t, StateDone, st2.State)
 	assert.Equal(t, st.Files.Total, st2.Files.Fetched)
 	assertSameTree(t, filepath.Join(src, "results"), filepath.Join(other, "results"))
 
-	_, err = ResumeRestore(context.Background(), f, "20260101T000000Z-0000", "")
+	_, err = ResumeRestore(context.Background(), f, "20260101T000000Z-0000", other, false)
 	assert.Error(t, err)
 }
 

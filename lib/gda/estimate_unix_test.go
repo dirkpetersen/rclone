@@ -7,47 +7,17 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/rclone/rclone/fs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// tierFs reports every object as stored in one storage class, as S3
-// does for archived objects.
-type tierFs struct {
-	fs.Fs
-	tier string
-}
-
-type tierObject struct {
-	fs.Object
-	tier string
-}
-
-func (o tierObject) GetTier() string { return o.tier }
-
-func (f *tierFs) Features() *fs.Features {
-	features := *f.Fs.Features()
-	features.GetTier = true
-	return &features
-}
-
-func (f *tierFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
-	entries, err := f.Fs.List(ctx, dir)
-	for i, e := range entries {
-		if o, ok := e.(fs.Object); ok {
-			entries[i] = tierObject{Object: o, tier: f.tier}
-		}
-	}
-	return entries, err
-}
 
 func TestEstimateRestore(t *testing.T) {
 	fakeClock(t)
 	src := makeTree(t)
 	dst := filepath.Join(t.TempDir(), "lab")
 	runBackup(t, src, dst, testOptions())
-	archived := &tierFs{Fs: newDst(t, dst), tier: "DEEP_ARCHIVE"}
+	archived := &pendingFs{Fs: newDst(t, dst)}
+	archiveAll(t, archived, dst)
 	eopt := EstimateOptions{Prices: DefaultPrices(), EgressPath: EgressInternet}
 	target := t.TempDir()
 
@@ -80,6 +50,14 @@ func TestEstimateRestore(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, est.Selection.NoRetrievalFiles)
 	assert.Equal(t, 0, est.Selection.ObjectsToRestore)
+	assert.Equal(t, NoTier, est.Options[0].Tier)
+
+	// Objects with a restored copy need no retrieval.
+	archived.pending = nil
+	est, err = EstimateRestore(context.Background(), archived, t.TempDir(), DefaultRestoreOptions(), eopt)
+	require.NoError(t, err)
+	assert.Equal(t, 0, est.Selection.ObjectsToRestore)
+	assert.Equal(t, 5, est.Selection.NoRetrievalFiles)
 	assert.Equal(t, NoTier, est.Options[0].Tier)
 
 	// Objects which aren't archived are available now.

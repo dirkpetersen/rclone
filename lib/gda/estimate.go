@@ -80,16 +80,47 @@ func DefaultPrices() Prices {
 	}
 }
 
-// LoadPrices reads a price table from a JSON file. Fields missing from
-// the file keep their default values.
+// LoadPrices reads a price table from a JSON file. Anything missing from
+// the file keeps its default value: a retrieval tier replaces only that
+// tier of that storage class, and an egress path only that path.
 func LoadPrices(path string) (Prices, error) {
 	prices := DefaultPrices()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return prices, err
 	}
-	if err := json.Unmarshal(data, &prices); err != nil {
+	var file Prices
+	if err := json.Unmarshal(data, &file); err != nil {
 		return prices, fmt.Errorf("parse prices %q: %w", path, err)
+	}
+	if file.Region != "" {
+		prices.Region = file.Region
+	}
+	if file.Date != "" {
+		prices.Date = file.Date
+	}
+	if file.Currency != "" {
+		prices.Currency = file.Currency
+	}
+	for class, tiers := range file.Retrieval {
+		if prices.Retrieval[class] == nil {
+			prices.Retrieval[class] = map[string]RetrievalPrice{}
+		}
+		for tier, price := range tiers {
+			prices.Retrieval[class][tier] = price
+		}
+	}
+	// Zero rates are valid, so these are only replaced when present.
+	var present map[string]json.RawMessage
+	_ = json.Unmarshal(data, &present)
+	if _, ok := present["temporary_copy_per_gb_month"]; ok {
+		prices.TemporaryCopyPerGBMonth = file.TemporaryCopyPerGBMonth
+	}
+	if _, ok := present["get_per_1000"]; ok {
+		prices.GetPer1000 = file.GetPer1000
+	}
+	for path, tiers := range file.Egress {
+		prices.Egress[path] = tiers
 	}
 	return prices, nil
 }

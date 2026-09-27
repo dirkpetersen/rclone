@@ -62,7 +62,7 @@ read, which takes up to 48 hours for Deep Archive with the default
 !--tier Bulk!. So a restore runs in two steps:
 
     rclone gda restore s3:bucket/lab /restore results/plots
-    rclone gda restore --resume <id> s3:bucket/lab
+    rclone gda restore --resume <id> s3:bucket/lab /restore
 
 The first command requests the restores, saves the plan in the GDA root
 under !_gda/restores/<id>! and fetches whatever is already readable.
@@ -82,7 +82,12 @@ in the target directory: a symlink or file where the backup has a
 directory is a conflict like any other.
 
 If restored copies expire before they are fetched, !--resume! requests
-them again.
+them again. !--resume! always takes the target directory and
+!--overwrite! from its own command line, never from the saved restore,
+and only one run of a restore fetches at a time.
+
+Don't restore as root into a directory which other users can write to,
+as they could swap directories for symlinks while the restore runs.
 
 With !--estimate! nothing is restored: it prints what each retrieval
 tier would cost and how long it would take, broken down into retrieval,
@@ -101,20 +106,17 @@ other programs, such as Motuz.
 	RunE: func(command *cobra.Command, args []string) error {
 		var target string
 		if resumeID != "" {
-			cmd.CheckArgs(1, 2, command, args)
-			if len(args) == 2 {
-				target = args[1]
-			}
+			cmd.CheckArgs(2, 2, command, args)
 		} else {
 			cmd.CheckArgs(2, max(len(args), 2), command, args)
-			target = args[1]
 			opt.Paths = args[2:]
 		}
+		target = args[1]
 		dst := cmd.NewFsDir(args[0:1])
 		cmd.Run(false, false, command, func() error {
 			ctx := context.Background()
 			if resumeID != "" {
-				st, err := libgda.ResumeRestore(ctx, dst, resumeID, target)
+				st, err := libgda.ResumeRestore(ctx, dst, resumeID, target, opt.Overwrite)
 				if err != nil {
 					return err
 				}
@@ -128,7 +130,11 @@ other programs, such as Motuz.
 				}
 				eopt.Prices = prices
 			}
-			est, err := libgda.EstimateRestore(ctx, dst, target, opt, eopt)
+			plan, err := libgda.PlanRestore(ctx, dst, target, opt)
+			if err != nil {
+				return err
+			}
+			est, err := plan.Estimate(ctx, eopt)
 			if err != nil {
 				return err
 			}
@@ -151,7 +157,7 @@ other programs, such as Motuz.
 					return err
 				}
 			}
-			st, err := libgda.StartRestore(ctx, dst, target, opt)
+			st, err := plan.Start(ctx)
 			if err != nil {
 				return err
 			}
@@ -183,7 +189,7 @@ func report(st *libgda.RestoreStatus) error {
 	fmt.Printf("Objects: %d needed, %d fetched, %d still being restored\n", st.Objects.Requested, st.Objects.Fetched, st.Objects.Restoring)
 	fmt.Printf("Files: %d total, %d in place (%d were already), %d failed\n", st.Files.Total, st.Files.Fetched, st.Files.SkippedIdentical, st.Files.Failed)
 	if st.State == libgda.StateRestoring {
-		fmt.Printf("Ready by %s. Fetch the rest with: rclone gda restore --resume %s <gda root>\n", st.ReadyBy.Local().Format("2006-01-02 15:04 MST"), st.RestoreID)
+		fmt.Printf("Ready by %s. Fetch the rest with: rclone gda restore --resume %s <gda root> <target>\n", st.ReadyBy.Local().Format("2006-01-02 15:04 MST"), st.RestoreID)
 	}
 	if st.State == libgda.StateFailed {
 		return fmt.Errorf("%d files failed to restore", st.Files.Failed)

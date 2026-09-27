@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,11 +17,13 @@ import (
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
-// pendingFs makes objects unreadable until they are released, as S3 does
-// for archived objects until they are restored, and records restore
-// requests made through its restore command.
+// pendingFs reports every object as DEEP_ARCHIVE and makes the pending
+// ones unreadable until they are released, as S3 does for archived
+// objects until they are restored, and records restore requests made
+// through its restore command.
 type pendingFs struct {
 	fs.Fs
 	pending  map[string]bool // keys which can't be read yet
@@ -32,6 +35,8 @@ type pendingObject struct {
 	fs.Object
 	f *pendingFs
 }
+
+func (o pendingObject) GetTier() string { return "DEEP_ARCHIVE" }
 
 func (o pendingObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	if o.f.pending[o.Remote()] {
@@ -48,9 +53,20 @@ func (f *pendingFs) NewObject(ctx context.Context, remote string) (fs.Object, er
 	return pendingObject{Object: o, f: f}, nil
 }
 
+func (f *pendingFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	entries, err := f.Fs.List(ctx, dir)
+	for i, e := range entries {
+		if o, ok := e.(fs.Object); ok {
+			entries[i] = pendingObject{Object: o, f: f}
+		}
+	}
+	return entries, err
+}
+
 func (f *pendingFs) Features() *fs.Features {
 	features := *f.Fs.Features()
 	features.Command = f.command
+	features.GetTier = true
 	return &features
 }
 
@@ -117,7 +133,7 @@ func TestRestorePendingThenResume(t *testing.T) {
 	// resume mustn't replace it without --overwrite.
 	require.NoError(t, os.WriteFile(filepath.Join(target, "results/a.dat"), []byte("mine"), 0o644))
 	f.pending = nil
-	st, err = ResumeRestore(context.Background(), f, st.RestoreID, "")
+	st, err = ResumeRestore(context.Background(), f, st.RestoreID, target, false)
 	require.NoError(t, err)
 	assert.Equal(t, StateFailed, st.State)
 	assert.Equal(t, 1, st.Files.Failed)
@@ -129,7 +145,7 @@ func TestRestorePendingThenResume(t *testing.T) {
 	// Once that file is out of the way everything matches the source,
 	// including the directory metadata held back while waiting.
 	require.NoError(t, os.Remove(filepath.Join(target, "results/a.dat")))
-	st, err = ResumeRestore(context.Background(), f, st.RestoreID, "")
+	st, err = ResumeRestore(context.Background(), f, st.RestoreID, target, false)
 	require.NoError(t, err)
 	assert.Equal(t, StateDone, st.State)
 	assertSameTree(t, src, target)
@@ -152,12 +168,13 @@ func TestRestoreExpired(t *testing.T) {
 	runBackup(t, src, dst, testOptions())
 	f := &pendingFs{Fs: newDst(t, dst)}
 	archiveAll(t, f, dst)
-	st, err := StartRestore(context.Background(), f, t.TempDir(), DefaultRestoreOptions())
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
 	require.NoError(t, err)
 	require.Len(t, f.requests, 1)
 
 	// Before the restore is due, resuming doesn't ask again.
-	_, err = ResumeRestore(context.Background(), f, st.RestoreID, "")
+	_, err = ResumeRestore(context.Background(), f, st.RestoreID, target, false)
 	require.NoError(t, err)
 	assert.Len(t, f.requests, 1)
 
@@ -166,7 +183,7 @@ func TestRestoreExpired(t *testing.T) {
 	old := timeNow
 	timeNow = func() time.Time { return later }
 	defer func() { timeNow = old }()
-	st2, err := ResumeRestore(context.Background(), f, st.RestoreID, "")
+	st2, err := ResumeRestore(context.Background(), f, st.RestoreID, target, false)
 	require.NoError(t, err)
 	require.Len(t, f.requests, 2)
 	assert.ElementsMatch(t, st2.Pending, f.requests[1])
@@ -179,6 +196,7 @@ func TestRestoreRequestFailures(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "lab")
 	runBackup(t, src, dst, testOptions())
 	f := &pendingFs{Fs: newDst(t, dst), status: "operation error S3: RestoreObject, AccessDenied"}
+	archiveAll(t, f, dst)
 	target := t.TempDir()
 
 	_, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
@@ -249,4 +267,144 @@ func TestValidTarget(t *testing.T) {
 	for _, rel := range []string{"", "/a", "a/../b", "..", "a//b", "./a", "a/."} {
 		assert.Error(t, validTarget(rel), rel)
 	}
+}
+
+func TestRestoreSkipsRestoredObjects(t *testing.T) {
+	fakeClock(t)
+	src := makeTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	runBackup(t, src, dst, testOptions())
+	f := &pendingFs{Fs: newDst(t, dst)}
+	archiveAll(t, f, dst)
+	// big.bin has a restored copy already, so it isn't requested again.
+	delete(f.pending, "results/big.bin")
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	require.Len(t, f.requests, 1)
+	assert.NotContains(t, f.requests[0], "results/big.bin")
+	assert.FileExists(t, filepath.Join(target, "results/big.bin"))
+	assert.Equal(t, StateRestoring, st.State)
+}
+
+func TestRestoreResumeTakesTargetFromCaller(t *testing.T) {
+	fakeClock(t)
+	src := makeTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	runBackup(t, src, dst, testOptions())
+	f := &pendingFs{Fs: newDst(t, dst)}
+	archiveAll(t, f, dst)
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
+	require.NoError(t, err)
+
+	// Someone with write access to the bucket points the saved restore
+	// somewhere else; resuming still writes only to the caller's target.
+	elsewhere := t.TempDir()
+	recPath := filepath.Join(dst, MetaDir, "restores", st.RestoreID+".json")
+	data, err := os.ReadFile(recPath)
+	require.NoError(t, err)
+	data = []byte(strings.ReplaceAll(string(data), target, elsewhere))
+	require.NoError(t, os.WriteFile(recPath, data, 0o644))
+	f.pending = nil
+	st, err = ResumeRestore(context.Background(), f, st.RestoreID, target, false)
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	left, _ := os.ReadDir(elsewhere)
+	assert.Empty(t, left)
+	assertSameTree(t, src, target)
+
+	_, err = ResumeRestore(context.Background(), f, st.RestoreID, "", false)
+	assert.Error(t, err)
+}
+
+func TestRestoreConcurrentResume(t *testing.T) {
+	fakeClock(t)
+	src := makeTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	runBackup(t, src, dst, testOptions())
+	f := &pendingFs{Fs: newDst(t, dst)}
+	archiveAll(t, f, dst)
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
+	require.NoError(t, err)
+
+	// Hold the lock another run would hold.
+	lock, err := os.OpenFile(filepath.Join(target, ".gda-restore-"+st.RestoreID+".lock"), os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer func() { _ = lock.Close() }()
+	require.NoError(t, unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB))
+	f.pending = nil
+	st2, err := ResumeRestore(context.Background(), f, st.RestoreID, target, false)
+	require.NoError(t, err)
+	assert.Equal(t, StateRestoring, st2.State)
+	require.NotEmpty(t, st2.Errors)
+	assert.Contains(t, st2.Errors[0], "another run")
+	assert.NoFileExists(t, filepath.Join(target, "results/a.dat"))
+
+	require.NoError(t, unix.Flock(int(lock.Fd()), unix.LOCK_UN))
+	st3, err := ResumeRestore(context.Background(), f, st.RestoreID, target, false)
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st3.State)
+	assert.Equal(t, st3.Objects.Requested, st3.Objects.Fetched)
+}
+
+func TestRestoreRequestsObjectsNeededLater(t *testing.T) {
+	fakeClock(t)
+	src := makeTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	runBackup(t, src, dst, testOptions())
+	target := t.TempDir()
+	// a.dat is in place, so its pack isn't requested at the start.
+	_, err := StartRestore(context.Background(), newDst(t, dst), target, restoreOptions("results/big.bin", "results/a.dat"))
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(filepath.Join(target, "results/big.bin")))
+	f := &pendingFs{Fs: newDst(t, dst)}
+	archiveAll(t, f, dst)
+	st, err := StartRestore(context.Background(), f, target, restoreOptions("results/big.bin", "results/a.dat"))
+	require.NoError(t, err)
+	require.Len(t, f.requests, 1)
+	assert.Equal(t, []string{"results/big.bin"}, f.requests[0])
+
+	// If a.dat goes before the restore finishes, the next resume asks for
+	// its pack straight away rather than after the restore is due.
+	require.NoError(t, os.Remove(filepath.Join(target, "results/a.dat")))
+	st, err = ResumeRestore(context.Background(), f, st.RestoreID, target, false)
+	require.NoError(t, err)
+	require.Len(t, f.requests, 2)
+	assert.Len(t, f.requests[1], 1)
+	assert.NotEqual(t, "results/big.bin", f.requests[1][0])
+
+	// The record keeps what was requested, and when it should be ready.
+	st, err = ResumeRestore(context.Background(), f, st.RestoreID, target, false)
+	require.NoError(t, err)
+	assert.Len(t, f.requests, 2)
+	assert.Equal(t, st.ReadyBy, st.ReadyBy.Truncate(time.Second))
+}
+
+func TestRestoreDirectoryInTheWay(t *testing.T) {
+	fakeClock(t)
+	src := makeTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	runBackup(t, src, dst, testOptions())
+	f := newDst(t, dst)
+	target := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(target, "results/a.dat"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(target, "results/link/full"), 0o755))
+
+	_, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
+	assert.ErrorContains(t, err, "results/a.dat")
+
+	// With --overwrite an empty directory is replaced; one with contents
+	// isn't.
+	opt := DefaultRestoreOptions()
+	opt.Overwrite = true
+	st, err := StartRestore(context.Background(), f, target, opt)
+	require.NoError(t, err)
+	assert.Equal(t, StateFailed, st.State)
+	assert.Equal(t, 1, st.Files.Failed)
+	have, err := os.ReadFile(filepath.Join(target, "results/a.dat"))
+	require.NoError(t, err)
+	assert.Len(t, have, 3000)
+	assert.DirExists(t, filepath.Join(target, "results/link/full"))
 }

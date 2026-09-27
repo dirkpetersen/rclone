@@ -953,8 +953,12 @@ estimate for the chosen tier, which Motuz stores with the job:
 #### 3. Progress: polled by a Celery job
 
 ```text
-rclone gda restore --resume <restore_id> --json
+rclone gda restore --resume <restore_id> --json <gda root> <target>
 ```
+
+The target directory and `--overwrite` always come from this command
+line, never from the restore saved in the bucket, and only one call per
+restore fetches at a time: an overlapping call just reports `restoring`.
 
 fetches whatever is ready and reports progress, so the Celery job just
 calls it every few minutes until `state` is `done`:
