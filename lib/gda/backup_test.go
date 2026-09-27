@@ -19,6 +19,7 @@ import (
 
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -551,4 +552,39 @@ func TestBackupDirectoryChanges(t *testing.T) {
 	assert.Equal(t, int64(0), l3.Stats.Errors)
 	assert.Equal(t, TypeFile, readIndexFile(t, dst, "")["thing"].Type)
 	assert.Empty(t, readIndexFile(t, dst, "thing"))
+}
+
+// corruptFs reports a wrong MD5 for every object it stores, like a
+// backend whose stored bytes differ from what was sent.
+type corruptFs struct {
+	fs.Fs
+}
+
+type corruptObject struct {
+	fs.Object
+}
+
+func (corruptObject) Hash(ctx context.Context, ty hash.Type) (string, error) {
+	return "00000000000000000000000000000000", nil
+}
+
+func (f *corruptFs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	o, err := f.Fs.Put(ctx, in, src, options...)
+	if err != nil {
+		return nil, err
+	}
+	return corruptObject{Object: o}, nil
+}
+
+func TestBackupStandaloneMD5Mismatch(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	writeFile(t, src, "big.bin", 9000)
+	_, err := Backup(context.Background(), src, &corruptFs{Fs: newDst(t, dst)}, opt)
+	assert.ErrorContains(t, err, "errors")
+	// The corrupt object is removed and nothing refers to it.
+	assert.NoFileExists(t, filepath.Join(dst, "big.bin"))
+	assert.NoFileExists(t, filepath.Join(dst, IndexName))
 }
