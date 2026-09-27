@@ -31,13 +31,6 @@ func (b *backup) summarizeAll() {
 	b.summarize("", sem)
 }
 
-// processAll backs up every directory with its own index, starting at
-// the root. Each directory is processed by exactly one worker, so its
-// changeset and index have a single writer.
-func (b *backup) processAll(ctx context.Context) {
-	b.processItems(ctx, []childDir{{}})
-}
-
 // processItems backs up the directories in items, and the directories
 // with their own index below those which aren't shallow, with the run's
 // workers taking directories from a shared queue.
