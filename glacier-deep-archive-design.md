@@ -425,8 +425,12 @@ use that instead:
   change runs even if it has shrunk enough to be rolled up; the next full
   run makes that change.
 - **Local index cache:** each worker keeps copies of the indexes it owns,
-  checked against their S3 ETags, so a run doesn't download millions of
-  indexes just to compare them.
+  so a run doesn't download millions of indexes just to compare them. As
+  implemented, the copies are trusted when the latest run on the
+  destination is the one which last finished with the cache, as then no
+  other run has written indexes since; otherwise the cache starts afresh.
+  This needs one listing of `_gda/runs` rather than a request per index.
+  Runs split over several hosts don't use it yet.
 - **Back up from snapshots** wherever the file system has them. Otherwise a
   run lasting hours captures different files at different moments.
 
@@ -1232,7 +1236,7 @@ the local and memory backends and production uses S3 or Ceph.
 | 5. Parallel workers | `--workers` on one host; `rclone gda plan`, `--run`/`--partition` and `rclone gda finish` across hosts | Done; resource limits per host left |
 | 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done, including `rclone gda prices` to refresh the table |
 | 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz | Done |
-| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; orphan removal and the compaction report done; local index cache, catalog compaction, rebasing and compaction left |
+| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; orphan removal, the compaction report and the local index cache done; catalog compaction, rebasing and compaction left |
 
 Milestone 1 limits, each lifted by a later milestone:
 
