@@ -4,6 +4,7 @@ package gda
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/rclone/rclone/fs"
@@ -64,4 +65,75 @@ func TestNameTakenVersioned(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, taken, "%+v", prev)
 	}
+}
+
+// versionStore is a versioned bucket holding versions of keys, which
+// records what is removed.
+type versionStore struct {
+	fs.Fs
+	versions map[string][]string
+	removed  []string
+	markers  []string
+}
+
+type storedVersion struct {
+	fs.Object
+	s       *versionStore
+	key     string
+	version string
+}
+
+func (o storedVersion) Remove(ctx context.Context) error {
+	if o.version == "" {
+		o.s.markers = append(o.s.markers, o.key)
+	} else {
+		o.s.removed = append(o.s.removed, versionKey(o.key, o.version))
+	}
+	return nil
+}
+
+func (s *versionStore) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	if len(s.versions[remote]) == 0 {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return storedVersion{s: s, key: remote}, nil
+}
+
+func (s *versionStore) NewObjectVersion(ctx context.Context, remote, versionID string) (fs.Object, error) {
+	if !slices.Contains(s.versions[remote], versionID) {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return storedVersion{s: s, key: remote, version: versionID}, nil
+}
+
+func (s *versionStore) IsVersioned(ctx context.Context) (bool, error) { return true, nil }
+
+func (s *versionStore) ObjectVersionIDs(ctx context.Context, remote string) ([]string, error) {
+	return s.versions[remote], nil
+}
+
+func TestRemoveData(t *testing.T) {
+	ctx := context.Background()
+	s := &versionStore{versions: map[string][]string{
+		"pack.tar": {"v1"},
+		"old.bin":  {"v3", "v2", "null"},
+		"new.bin":  {"v5", "v4"},
+	}}
+
+	// Without versioning a key is deleted.
+	require.NoError(t, removeData(ctx, s, false, "pack.tar"))
+	assert.Equal(t, []string{"pack.tar"}, s.markers)
+	s.markers = nil
+
+	// With versioning the version is deleted: the one named, the only
+	// one, or the one stored before versioning.
+	require.NoError(t, removeData(ctx, s, true, versionKey("new.bin", "v4")))
+	require.NoError(t, removeData(ctx, s, true, "pack.tar"))
+	require.NoError(t, removeData(ctx, s, true, "old.bin"))
+	assert.Equal(t, []string{versionKey("new.bin", "v4"), versionKey("pack.tar", "v1"), versionKey("old.bin", "null")}, s.removed)
+
+	// A key with several versions, none from before versioning, is kept.
+	assert.ErrorContains(t, removeData(ctx, s, true, "new.bin"), "2 versions")
+	assert.ErrorIs(t, removeData(ctx, s, true, "gone.bin"), fs.ErrorObjectNotFound)
+	assert.Empty(t, s.markers)
 }

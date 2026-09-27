@@ -380,11 +380,21 @@ func replaceDedup(ctx context.Context, d *dest, idx *dedupIndex, files []fs.Obje
 			continue
 		}
 		if err := o.Remove(ctx); err != nil {
-			return fmt.Errorf("remove merged dedup index %q: %w", o.Remote(), err)
+			return fmt.Errorf("remove merged dedup index %q: %w: %w", o.Remote(), errDedupRemove, err)
 		}
 	}
 	return nil
 }
+
+// errDedupRemove is returned when merged dedup index files can't be
+// removed.
+var errDedupRemove = errors.New("can't remove merged files")
+
+// dedupGCKey marks that backups can't remove the dedup index files they
+// merge, so that merging them is left to gc. As merged files which
+// aren't removed hold the whole index, merging them every run would
+// make the index grow run by run.
+var dedupGCKey = joinRemote(dedupDir, "merge-in-gc")
 
 // dedupCompactAt is the number of dedup index files above which a run
 // merges them into one. Tests lower it.
@@ -394,23 +404,48 @@ var dedupCompactAt = 50
 // than dedupCompactAt, then removes the merged ones. It must be called
 // while holding the destination lock. Readers take the union of the
 // files, so a copy listed twice while this runs does no harm.
-func compactDedup(ctx context.Context, d *dest, runID string) error {
+//
+// Backups leave merging to gc once they have failed to remove merged
+// files; gc, with inGC set, takes it back if it can remove them.
+func compactDedup(ctx context.Context, d *dest, runID string, inGC bool) error {
 	if d.dryRun {
 		return nil
 	}
+	_, err := d.f.NewObject(ctx, dedupGCKey)
+	leftToGC := err == nil
+	if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+		return err
+	}
+	if leftToGC && !inGC {
+		return nil
+	}
 	files, err := dedupFiles(ctx, d)
-	if err != nil || len(files) <= dedupCompactAt {
+	if err != nil {
 		return err
 	}
-	idx := newDedupIndex()
-	for _, o := range files {
-		if err := idx.load(ctx, o); err != nil {
-			return fmt.Errorf("read dedup index %q: %w", o.Remote(), err)
+	if len(files) > dedupCompactAt {
+		idx := newDedupIndex()
+		for _, o := range files {
+			if err := idx.load(ctx, o); err != nil {
+				return fmt.Errorf("read dedup index %q: %w", o.Remote(), err)
+			}
 		}
+		err = replaceDedup(ctx, d, idx, files, runID)
+		if errors.Is(err, errDedupRemove) && !inGC {
+			fs.Logf(nil, "gda: leaving merging the dedup index to gc, as this run can't remove files: %v", err)
+			return d.putBytes(ctx, dedupGCKey, nil, d.metaTier)
+		}
+		if err != nil {
+			return err
+		}
+		fs.Infof(nil, "gda: merged %d dedup index files", len(files))
 	}
-	if err := replaceDedup(ctx, d, idx, files, runID); err != nil {
+	if leftToGC {
+		o, err := d.f.NewObject(ctx, dedupGCKey)
+		if err == nil {
+			err = o.Remove(ctx)
+		}
 		return err
 	}
-	fs.Infof(nil, "gda: merged %d dedup index files", len(files))
 	return nil
 }

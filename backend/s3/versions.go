@@ -68,3 +68,37 @@ func (f *Fs) IsVersioned(ctx context.Context) (bool, error) {
 	}
 	return status == "Enabled", nil
 }
+
+// ObjectVersionIDs returns the IDs of the versions of the object at
+// remote, newest first, leaving out delete markers.
+func (f *Fs) ObjectVersionIDs(ctx context.Context, remote string) ([]string, error) {
+	bucket, key := f.split(remote)
+	req := s3.ListObjectVersionsInput{Bucket: &bucket, Prefix: &key}
+	if f.opt.RequesterPays {
+		req.RequestPayer = types.RequestPayerRequester
+	}
+	var ids []string
+	for {
+		var resp *s3.ListObjectVersionsOutput
+		err := f.pacer.Call(func() (bool, error) {
+			var err error
+			resp, err = f.c.ListObjectVersions(ctx, &req)
+			return f.shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list versions of %q: %w", remote, err)
+		}
+		// Keys come in order and key is the first with its prefix, so
+		// another key means there are no more versions of it.
+		for _, v := range resp.Versions {
+			if deref(v.Key) != key {
+				return ids, nil
+			}
+			ids = append(ids, deref(v.VersionId))
+		}
+		if !deref(resp.IsTruncated) || deref(resp.NextKeyMarker) != key {
+			return ids, nil
+		}
+		req.KeyMarker, req.VersionIdMarker = resp.NextKeyMarker, resp.NextVersionIdMarker
+	}
+}

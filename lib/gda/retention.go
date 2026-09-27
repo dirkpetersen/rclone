@@ -134,6 +134,11 @@ func clearRebase(ctx context.Context, d *dest) {
 		err = o.Remove(ctx)
 	}
 	if err != nil {
-		fs.Errorf(nil, "gda: remove %q: %v", rebaseKey, err)
+		// Credentials for backups may not be allowed to delete anything.
+		fs.Infof(nil, "gda: can't remove %q, so emptying it: %v", rebaseKey, err)
+		err = d.putBytes(ctx, rebaseKey, nil, d.metaTier)
+	}
+	if err != nil {
+		fs.Errorf(nil, "gda: clear %q: %v", rebaseKey, err)
 	}
 }

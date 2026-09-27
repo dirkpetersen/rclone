@@ -529,7 +529,7 @@ func FinishRun(ctx context.Context, dst fs.Fs, runID string, opt Options) (*Ledg
 		// Every partition has finished, so every marked directory has
 		// been packed again.
 		clearRebase(ctx, d)
-		if err := compactDedup(ctx, d, runID); err != nil {
+		if err := compactDedup(ctx, d, runID, false); err != nil {
 			fs.Errorf(nil, "gda: compact dedup index: %v", err)
 		}
 		b.unlock(ctx)

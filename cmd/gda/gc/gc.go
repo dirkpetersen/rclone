@@ -81,6 +81,13 @@ older than !--min-age!, holding the destination lock so that no backup
 adds data meanwhile. Nothing else is ever removed, and nothing is
 removed if any directory couldn't be read. Without !--keep-history!,
 superseded and deleted files stay, as all history is kept.
+
+In a bucket with versioning enabled, removing data deletes the stored
+version itself, as deleting the key would only hide it behind a delete
+marker and leave it billed.
+
+When removing anything, gc also merges the dedup index files if backups
+left that to it, as they do when their credentials can't delete.
 `, "!", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",
