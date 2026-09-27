@@ -31,6 +31,14 @@ func TestParseChanges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"d01/x", "d02/y"}, got)
 
+	// A source in a snapshot, and one below the snapshot's root.
+	got, err = ParseChanges(strings.NewReader("M\t/pool/src/d07/f1.dat\n"), ChangesZFS, "/pool/src/.zfs/snapshot/today")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"d07/f1.dat"}, got)
+	got, err = ParseChanges(strings.NewReader("M\t/pool/src/d07/f1.dat\n"), ChangesZFS, "/pool/src/.zfs/snapshot/today/d07")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"f1.dat"}, got)
+
 	_, err = ParseChanges(strings.NewReader("x"), "gpfs", root)
 	assert.Error(t, err)
 }

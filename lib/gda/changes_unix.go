@@ -26,14 +26,27 @@ const (
 
 // ParseChanges reads a change list in format and returns the changed
 // paths below srcRoot, relative to it. Paths outside srcRoot are left out.
+//
+// zfs diff names paths below where the file system is mounted, so for a
+// source in a snapshot, such as /pool/data/.zfs/snapshot/today, they are
+// taken as below /pool/data.
 func ParseChanges(r io.Reader, format, srcRoot string) ([]string, error) {
 	srcRoot = filepath.Clean(srcRoot)
+	pathRoot := srcRoot
+	if format == ChangesZFS {
+		if i := strings.Index(srcRoot, "/.zfs/snapshot/"); i >= 0 {
+			mount := srcRoot[:i]
+			rest := strings.TrimPrefix(srcRoot[i:], "/.zfs/snapshot/")
+			_, below, _ := strings.Cut(rest, "/")
+			pathRoot = filepath.Join(mount, below)
+		}
+	}
 	var out []string
 	add := func(p string) {
 		if !filepath.IsAbs(p) {
-			p = filepath.Join(srcRoot, p)
+			p = filepath.Join(pathRoot, p)
 		}
-		rel, err := filepath.Rel(srcRoot, filepath.Clean(p))
+		rel, err := filepath.Rel(pathRoot, filepath.Clean(p))
 		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
 			return
 		}
