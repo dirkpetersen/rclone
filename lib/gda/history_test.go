@@ -279,6 +279,8 @@ func TestRandomHistory(t *testing.T) {
 				opt := testOptions()
 				opt.RollupMax = []int64{0, 64, 4096}[r.Intn(3)]
 				opt.Workers = 1 + r.Intn(4)
+				// Random changes can empty the tree.
+				opt.AllowEmpty = true
 				opt.DedupMin = []int64{-1, 1000}[r.Intn(2)]
 				if r.Intn(2) == 0 {
 					opt.Compression = CodecZstd
@@ -404,6 +406,8 @@ func TestRandomFailures(t *testing.T) {
 				opt := testOptions()
 				opt.RollupMax = []int64{0, 64, 4096}[r.Intn(3)]
 				opt.Workers = 1 + r.Intn(4)
+				// Random changes can empty the tree.
+				opt.AllowEmpty = true
 				opt.DedupMin = 1000
 				opt.Retries = 1
 				// A run which fails part way, then one which completes.
