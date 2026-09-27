@@ -378,11 +378,22 @@ UTF-8 are percent-encoded, with a `name_encoding` column to mark them.
 
   At 10 billion files there are hundreds of millions of index files, and
   just listing them takes hours. So every worker also writes the rows of its
-  changesets to one Parquet file per run, under
-  `_gda/catalog/runs/<run>/<worker>.parquet`. The catalog is the union of
-  those files, compacted periodically into files sorted by path. It is
-  derived and can always be rebuilt from the CSVs, but it never needs a scan
-  of them.
+  changesets, with full paths and object keys, to one file per run,
+  `_gda/catalog/runs/<run>/<worker>.csv.zst` (implemented). The catalog is
+  the union of those files; the current state is the latest row per path
+  which isn't a deletion:
+
+  ```sql
+  SELECT path, size, object FROM (
+    SELECT *, row_number() OVER (PARTITION BY path ORDER BY run DESC) AS n
+    FROM read_csv('s3://bucket/lab/_gda/catalog/runs/*/*.csv.zst')
+  ) WHERE n = 1 AND action <> 'delete';
+  ```
+
+  The files are zstd compressed CSV because rclone's Parquet writer would
+  add a new dependency (Apache Thrift); switching to Parquet, and
+  compacting the files sorted by path, are open. The catalog is derived
+  and can always be rebuilt from the changesets.
 - **Cost of keeping all metadata hot:** 10 million files make about 2 GB of
   indexes plus a similar amount of changesets, roughly $0.09 per month in S3
   Standard. At 10 billion files it is about 4 TB, roughly $90 per month.
@@ -1202,7 +1213,7 @@ the local and memory backends and production uses S3 or Ceph.
 | 5. Parallel workers | `--workers` on one host; `rclone gda plan`, `--run`/`--partition` and `rclone gda finish` across hosts | Done; resource limits per host left |
 | 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done; Price List API refresh left |
 | 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz | Done |
-| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction | Change runs, checkpoints and dedup compaction done; local index cache, Parquet catalog, rebasing and garbage collection left |
+| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; local index cache, catalog compaction, rebasing and garbage collection left |
 
 Milestone 1 limits, each lifted by a later milestone:
 

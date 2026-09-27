@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/csv"
 	"errors"
 	"io"
 	"os"
@@ -174,4 +175,35 @@ func TestFrameCuts(t *testing.T) {
 	assert.Equal(t, []int64{0}, frameCuts(1000, []int64{0, 500}))
 	assert.Equal(t, []int64{0, 5000, 10000}, frameCuts(12000, []int64{0, 3000, 5000, 7000, 10000}))
 	assert.Equal(t, []int64{0, 16384, 32768}, frameCuts(40000, []int64{0}))
+}
+
+func TestCatalog(t *testing.T) {
+	fakeClock(t)
+	src := makeTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	l := runBackup(t, src, dst, opt)
+	in, err := os.Open(filepath.Join(dst, MetaDir, "catalog", "runs", l.RunID, "w01.csv.zst"))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, in.Close()) }()
+	dec, err := zstd.NewReader(in)
+	require.NoError(t, err)
+	defer dec.Close()
+	records, err := csv.NewReader(dec).ReadAll()
+	require.NoError(t, err)
+	require.Greater(t, len(records), 1)
+	assert.Equal(t, catalogColumns, records[0])
+	rows := map[string][]string{}
+	for _, r := range records[1:] {
+		rows[r[0]] = r
+	}
+	a := rows["results/a.dat"]
+	require.NotNil(t, a)
+	assert.Equal(t, ActionAdd, a[2])
+	assert.Equal(t, "3000", a[4])
+	// The object column is the full key of the object holding the data.
+	assert.FileExists(t, filepath.Join(dst, filepath.FromSlash(a[10])))
+	assert.Equal(t, "results/big.bin", rows["results/big.bin"][10])
+	assert.Equal(t, int64(len(records)-1), l.Stats.Added+l.Stats.Modified+l.Stats.MetaOnly+l.Stats.Deleted)
 }
