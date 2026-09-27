@@ -53,7 +53,9 @@ If this is left empty, the root is used as the remote, so that
 			Name: "at",
 			Help: `Show the backups as they were at the end of this run.
 
-A run ID like 20260926T120000Z or an RFC 3339 time.`,
+A run ID like 20260926T120000Z or an RFC 3339 time. In a connection
+string, quote a time as it contains ":", e.g.
+:gda,at="2026-09-01T00:00:00Z":remote:path.`,
 		}, {
 			Name:     "show_internals",
 			Help:     `Show the objects GDA stores rather than the files they hold.`,
@@ -109,7 +111,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err := configstruct.Set(m, opt); err != nil {
 		return nil, err
 	}
-	remote := opt.Remote
+	remote, origRoot := opt.Remote, root
 	if remote == "" {
 		remote, root = root, ""
 	}
@@ -120,13 +122,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
-	if outerName == "" {
-		// A local path: wrap the file system root.
+	switch {
+	case outerName == "":
+		// A local path: wrap the root of its volume.
 		abs, err := filepath.Abs(prefix)
 		if err != nil {
 			return nil, err
 		}
-		outerName, prefix = "/", filepath.ToSlash(abs)
+		volume := filepath.VolumeName(abs)
+		outerName, prefix = volume+"/", filepath.ToSlash(abs[len(volume):])
+	case strings.HasPrefix(prefix, "/"):
+		// An absolute path on a remote with a home directory.
+		outerName += "/"
 	}
 	outer, err := cache.Get(ctx, outerName)
 	if err != nil {
@@ -136,7 +143,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
-	f := &Fs{name: name, root: root, opt: *opt, outer: outer, prefix: strings.Trim(prefix, "/"), browser: browser}
+	// Root is the path as given, so that different paths are different
+	// remotes to the Fs cache.
+	f := &Fs{name: name, root: origRoot, opt: *opt, outer: outer, prefix: strings.Trim(prefix, "/"), browser: browser}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 		ReadMetadata:            true,
@@ -148,7 +157,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if f.prefix != "" {
 		if _, err := f.NewObject(ctx, ""); err == nil {
 			f.prefix = parentOf(f.prefix)
-			f.root = parentOf(strings.Trim(f.root, "/"))
+			if f.root = path.Dir(strings.TrimRight(f.root, "/")); f.root == "." {
+				f.root = ""
+			}
 			return f, fs.ErrorIsFile
 		}
 	}
@@ -284,8 +295,13 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	if l.Type != libgda.TypeFile {
+	switch l.Type {
+	case libgda.TypeFile:
+	case libgda.TypeDir:
 		return nil, fs.ErrorIsDir
+	default:
+		// Symlinks and special files aren't shown.
+		return nil, fs.ErrorObjectNotFound
 	}
 	o := &Object{fs: f, remote: remote, entry: *l}
 	if o.tier, err = f.tier(ctx, l); err != nil {
@@ -411,12 +427,49 @@ func (o *passObject) Remove(ctx context.Context) error {
 	return errReadOnly
 }
 
+// GetTier returns the storage class of the wrapped object
+func (o *passObject) GetTier() string {
+	if t, ok := o.Object.(fs.GetTierer); ok {
+		return t.GetTier()
+	}
+	return ""
+}
+
+// Metadata returns the metadata of the wrapped object
+func (o *passObject) Metadata(ctx context.Context) (fs.Metadata, error) {
+	if m, ok := o.Object.(fs.Metadataer); ok {
+		return m.Metadata(ctx)
+	}
+	return nil, nil
+}
+
+// ID returns the ID of the wrapped object
+func (o *passObject) ID() string {
+	if i, ok := o.Object.(fs.IDer); ok {
+		return i.ID()
+	}
+	return ""
+}
+
+// MimeType returns the MIME type of the wrapped object
+func (o *passObject) MimeType(ctx context.Context) string {
+	return fs.MimeType(ctx, o.Object)
+}
+
+// UnWrap returns the wrapped object
+func (o *passObject) UnWrap() fs.Object { return o.Object }
+
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs         = (*Fs)(nil)
-	_ fs.Object     = (*Object)(nil)
-	_ fs.MimeTyper  = (*Object)(nil)
-	_ fs.GetTierer  = (*Object)(nil)
-	_ fs.Metadataer = (*Object)(nil)
-	_ fs.Object     = (*passObject)(nil)
+	_ fs.Fs              = (*Fs)(nil)
+	_ fs.Object          = (*Object)(nil)
+	_ fs.MimeTyper       = (*Object)(nil)
+	_ fs.GetTierer       = (*Object)(nil)
+	_ fs.Metadataer      = (*Object)(nil)
+	_ fs.Object          = (*passObject)(nil)
+	_ fs.GetTierer       = (*passObject)(nil)
+	_ fs.Metadataer      = (*passObject)(nil)
+	_ fs.IDer            = (*passObject)(nil)
+	_ fs.MimeTyper       = (*passObject)(nil)
+	_ fs.ObjectUnWrapper = (*passObject)(nil)
 )
