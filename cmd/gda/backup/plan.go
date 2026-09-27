@@ -4,6 +4,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -21,6 +22,7 @@ func init() {
 	flags.IntVarP(PlanCommand.Flags(), &partitions, "partitions", "", partitions, "Number of workers to plan for", "")
 	gda.Command.AddCommand(PlanCommand)
 	FinishCommand.Flags().AddFlag(Command.Flags().Lookup("run"))
+	FinishCommand.Flags().AddFlag(Command.Flags().Lookup("ledger-file"))
 	gda.Command.AddCommand(FinishCommand)
 }
 
@@ -85,7 +87,7 @@ before finishing, as they can't be run once the run is finished.
 		cmd.Run(false, false, command, func() error {
 			ledger, err := libgda.FinishRun(context.Background(), dst, runID, opt)
 			logLedger(ledger)
-			return err
+			return errors.Join(err, writeReport(outcomeOK, ledger, err))
 		})
 		return nil
 	},
