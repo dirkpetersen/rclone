@@ -914,3 +914,25 @@ func TestBackupEmptySource(t *testing.T) {
 	l := runBackup(t, src, dst, opt)
 	assert.Equal(t, int64(1), l.Stats.Deleted)
 }
+
+func TestBackupChecksum(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	writeFile(t, src, "a.dat", 100)
+	runBackup(t, src, dst, opt)
+
+	// Change the content but not the size or time.
+	p := filepath.Join(src, "a.dat")
+	info, err := os.Stat(p)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p, bytes.Repeat([]byte("z"), 100), 0o644))
+	require.NoError(t, os.Chtimes(p, info.ModTime(), info.ModTime()))
+	l := runBackup(t, src, dst, opt)
+	assert.Zero(t, l.Stats.Modified)
+	opt.Checksum = true
+	l = runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(1), l.Stats.Modified)
+	l = runBackup(t, src, dst, opt)
+	assert.Zero(t, l.Stats.Modified+l.Stats.MetaOnly)
+}

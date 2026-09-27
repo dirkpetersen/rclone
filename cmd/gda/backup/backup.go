@@ -88,6 +88,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
 	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
 	flags.FVarP(flagSet, &compressMax, "compress-max", "", "Store standalone files bigger than this uncompressed", "")
+	flags.BoolVarP(flagSet, &opt.Checksum, "checksum", "", opt.Checksum, "Read files whose size and time are unchanged to compare their MD5 too", "")
 	flags.BoolVarP(flagSet, &opt.AllowEmpty, "allow-empty", "", opt.AllowEmpty, "Back up an empty source over a backup which isn't empty", "")
 	flags.BoolVarP(flagSet, &opt.Xattrs, "xattrs", "", opt.Xattrs, "Keep extended attributes, including ACLs (Linux only)", "")
 	flags.StringVarP(flagSet, &pricesFile, "prices", "", pricesFile, "JSON file with the prices to use for the cost estimate (default built in)", "")
@@ -263,7 +264,8 @@ empty, as that is usually a file system which isn't mounted; use
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose
 modification time changed but whose content didn't are recorded without
-uploading them again.
+uploading them again. A file whose content changed while its size and
+time didn't is only found with !--checksum!, which reads every file.
 
 The source must be a local path, as it is read directly with POSIX
 calls to keep owners, permissions, symlinks, hard links and special
