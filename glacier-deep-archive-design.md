@@ -759,6 +759,14 @@ run. Nothing shared is written by two processes.
 | Source file system | 15 workers scanning and reading at once load NFS servers and the Lustre metadata server | A throttle per source file system |
 | S3 request rates | S3 scales per key prefix; keys that mirror the directory tree spread well | rclone's pacer handles "slow down" responses |
 
+Measured on the implementation (2026-09-27, local disk, 16 cores): a tree
+of 100,000 files in 2,000 directories backs up in 2 s and an unchanged
+rerun takes 0.6 s; a single directory of 300,000 files takes 10 s and
+2 GB of memory, as a directory is held in memory while it is compared
+and committed, at about 3 KB per file plus 16 MiB of compression
+history per worker. Directories of tens of millions of files would need
+the comparison to stream instead.
+
 ### Initial upload
 
 With 40 to 100 Gbit/s to AWS (decided 2026-09-26), 5 PB takes about 12 days
