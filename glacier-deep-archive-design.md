@@ -1266,11 +1266,12 @@ the local and memory backends and production uses S3 or Ceph.
 | **1. Core backup, single process** | `rclone gda backup`: two-pass scan (subtree totals, then per-directory processing), standalone/packed/rollup planning, PAX tar packs with offsets, member MD5s and an embedded manifest, changesets and `gda-index.csv` (split above 100,000 rows), commit protocol, incremental runs by scan, the destination lock, the run ledger, dry-run | Done |
 | 2. Restore | `rclone gda restore` and `rclone gda ls`: plan from indexes, restore requests, wait, ranged or whole fetch, extract, verify; point-in-time with `--at` | Done |
 | 3. Compression | zstd in independent frames, skip heuristics, `stored_*` columns filled | Done |
-| 4. Deduplication | Dedup index per destination for files of 1 MiB or more | Done; shard compaction left for milestone 8 |
+| 4. Deduplication | Dedup index per destination for files of 1 MiB or more | Done, with compaction of the index files |
 | 5. Parallel workers | `--workers` on one host; `rclone gda plan`, `--run`/`--partition` and `rclone gda finish` across hosts | Done; resource limits per host left |
 | 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done, including `rclone gda prices` to refresh the table |
 | 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz | Done |
 | 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; orphan removal, the compaction report, the local index cache and rebasing done; catalog compaction and compaction left |
+| 9. Operations and fidelity | `rclone gda check`, `find` and `gc`, backup cost estimates, hard links, extended attributes and ACLs, randomized history and failure tests | Done (2026-09-27); extended attributes on Linux only |
 
 Milestone 1 limits, each lifted by a later milestone:
 
