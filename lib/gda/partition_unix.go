@@ -95,7 +95,9 @@ func Plan(ctx context.Context, srcRoot string, dst fs.Fs, opt Options, workers i
 	if err := sw.Error(); err != nil {
 		return "", err
 	}
-	planOpt, err := json.MarshalIndent(b.opt, "", "  ")
+	saved := b.opt
+	saved.IndexCache = ""
+	planOpt, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		b.unlock(ctx)
 		return "", err
@@ -209,6 +211,8 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 		return nil, fmt.Errorf("parse plan of run %s: %w", runID, err)
 	}
 	planOpt.Worker, planOpt.Workers, planOpt.TempDir, planOpt.Retries = opt.Worker, opt.Workers, opt.TempDir, opt.Retries
+	// Split runs don't use the index cache.
+	planOpt.IndexCache = ""
 	b, ledger, err := newBackup(ctx, srcRoot, dst, planOpt)
 	if err != nil {
 		return nil, err

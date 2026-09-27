@@ -199,7 +199,8 @@ afresh. Runs split over several hosts don't use it. Don't edit indexes
 by hand while a cache holds them.
 
 When a directory's unchanged files are spread over more than 20 packs,
-as happens after many small changes, the run packs them again from the
+and over more than twice the packs they would fill, as happens after
+many small changes, the run packs them again from the
 source, so restoring the directory needs fewer objects. The old packs
 are kept for the history.
 

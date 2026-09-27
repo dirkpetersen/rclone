@@ -16,9 +16,9 @@ import (
 // run needn't read the indexes which the previous run from the same
 // cache wrote.
 //
-// The copies are trusted only if the latest run on the destination is
-// the one which last finished with this cache, as then nothing else has
-// written indexes since. Otherwise the cache starts empty.
+// The copies are trusted only if the runs on the destination are those
+// there when the last run with this cache finished, as then nothing else
+// has written indexes since. Otherwise the cache starts empty.
 type indexCache struct {
 	dir     string
 	trusted bool
@@ -31,19 +31,20 @@ type indexCache struct {
 type cacheState struct {
 	Destination string
 	Run         string
+	Runs        string // digest of the destination's run IDs when it finished
 }
 
 const cacheStateName = "state.json"
 
-// openIndexCache opens the cache below root for destination, whose
-// latest run is latestRun.
-func openIndexCache(root, destination, latestRun string) (*indexCache, error) {
+// openIndexCache opens the cache below root for destination, whose runs
+// have the digest runs.
+func openIndexCache(root, destination, runs string) (*indexCache, error) {
 	sum := sha256.Sum256([]byte(destination))
 	c := &indexCache{dir: filepath.Join(root, hex.EncodeToString(sum[:16]))}
 	statePath := filepath.Join(c.dir, cacheStateName)
 	var state cacheState
 	if data, err := os.ReadFile(statePath); err == nil && json.Unmarshal(data, &state) == nil {
-		c.trusted = latestRun != "" && state.Run == latestRun && state.Destination == destination
+		c.trusted = runs != "" && state.Runs == runs && state.Destination == destination
 	}
 	// Until this run finishes, the copies may be ahead of or behind the
 	// destination.
@@ -59,7 +60,7 @@ func openIndexCache(root, destination, latestRun string) (*indexCache, error) {
 		return nil, err
 	}
 	if c.trusted {
-		fs.Infof(nil, "gda: using the index cache from run %s", latestRun)
+		fs.Infof(nil, "gda: using the index cache from run %s", state.Run)
 	}
 	return c, nil
 }
@@ -117,15 +118,15 @@ func (c *indexCache) fail() {
 }
 
 // finish records that run runID finished with the cache matching
-// destination.
-func (c *indexCache) finish(destination, runID string) {
+// destination, whose runs then have the digest runs.
+func (c *indexCache) finish(destination, runID, runs string) {
 	c.mu.Lock()
 	failed := c.failed
 	c.mu.Unlock()
 	if failed {
 		return
 	}
-	data, err := json.Marshal(cacheState{Destination: destination, Run: runID})
+	data, err := json.Marshal(cacheState{Destination: destination, Run: runID, Runs: runs})
 	if err == nil {
 		err = writeFileAtomic(filepath.Join(c.dir, cacheStateName), data)
 	}
