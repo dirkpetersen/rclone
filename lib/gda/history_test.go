@@ -410,13 +410,31 @@ func TestRandomFailures(t *testing.T) {
 				opt.AllowEmpty = true
 				opt.DedupMin = 1000
 				opt.Retries = 1
-				// A run which fails part way, then one which completes.
 				flaky := &flakyFs{Fs: f, r: rand.New(rand.NewSource(seed*100 + int64(run))), rate: 0.2}
-				_, _ = Backup(context.Background(), src, flaky, opt)
 				states = append(states, treeState(t, src))
-				l, err := Backup(context.Background(), src, f, opt)
-				require.NoError(t, err, "run %d", run)
-				runs = append(runs, l.RunID)
+				if r.Intn(2) == 0 {
+					// A split run whose partitions fail part way and are
+					// run again.
+					runID, err := Plan(context.Background(), src, f, opt, 2)
+					require.NoError(t, err, "plan run %d", run)
+					for i := range 2 {
+						wopt := opt
+						wopt.Worker = fmt.Sprintf("p%d", i)
+						if _, err := BackupPartition(context.Background(), src, flaky, wopt, runID, i); err != nil {
+							_, err = BackupPartition(context.Background(), src, f, wopt, runID, i)
+							require.NoError(t, err, "run %d partition %d again", run, i)
+						}
+					}
+					_, err = FinishRun(context.Background(), f, runID, opt)
+					require.NoError(t, err, "finish run %d", run)
+					runs = append(runs, runID)
+				} else {
+					// A run which fails part way, then one which completes.
+					_, _ = Backup(context.Background(), src, flaky, opt)
+					l, err := Backup(context.Background(), src, f, opt)
+					require.NoError(t, err, "run %d", run)
+					runs = append(runs, l.RunID)
+				}
 				m.mutate(15)
 			}
 			gc, err := GC(context.Background(), f, GCOptions{DeleteOrphans: true, LockTimeout: time.Hour})
