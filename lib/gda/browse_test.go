@@ -5,6 +5,7 @@ package gda
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -62,4 +63,28 @@ func TestBrowserBucketRootAndTiers(t *testing.T) {
 	for key, tier := range tiers {
 		assert.Equal(t, "DEEP_ARCHIVE", tier, key)
 	}
+}
+
+func TestBrowseUnderRetiredIndexes(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 64
+	writeFile(t, src, "other.txt", 100)
+	writeFile(t, src, "p/d/big.txt", 100)
+	writeFile(t, src, "p/d/sub/x.txt", 5)
+	runBackup(t, src, dst, opt)
+	// p shrinks enough to be packed as one unit, retiring the indexes
+	// of the directories below it.
+	require.NoError(t, os.Remove(filepath.Join(src, "p/d/big.txt")))
+	runBackup(t, src, dst, opt)
+	require.Equal(t, ListingRollup, readIndexFile(t, dst, "p")["d/sub"].Listing)
+
+	b, err := NewBrowser(newDst(t, dst), "")
+	require.NoError(t, err)
+	entries, ok, err := b.List(context.Background(), "p/d/sub")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "x.txt", entries[0].Path)
 }

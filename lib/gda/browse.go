@@ -102,7 +102,9 @@ func (b *Browser) List(ctx context.Context, dir string) (entries []Located, ok b
 		if err != nil {
 			return nil, false, err
 		}
-		if rows == nil {
+		if len(rows) == 0 {
+			// No index, or the empty one of a directory which has since
+			// been rolled up into one further up.
 			continue
 		}
 		rel := strings.TrimPrefix(dir, ancestor+"/")
