@@ -799,6 +799,12 @@ Archive, an on-premises Ceph RGW bucket, or both (decided 2026-09-26).
 - **Ceph has a different cost model:** no request fees, no 180-day minimum
   and no restore step. For destinations that aren't archive storage classes,
   GDA skips restores, and garbage collection and rebasing can run freely.
+- **File system destinations** (a local disk or NAS, mostly for tests and
+  staging) work too, with one limit: a standalone file keeps its native
+  name, and a file can't share a name with a directory there, so if a
+  large file is later replaced by a directory of the same name, that
+  directory can't be backed up to such a destination. Object stores have no
+  such limit.
 - **Bundling still pays off on Ceph:** fewer RADOS objects and smaller bucket
   indexes (large RGW buckets need their indexes resharded), and less wasted
   space, because each small object is padded to Ceph's minimum allocation
