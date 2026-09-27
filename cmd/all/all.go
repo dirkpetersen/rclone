@@ -30,6 +30,7 @@ import (
 	_ "github.com/rclone/rclone/cmd/deletefile"
 	_ "github.com/rclone/rclone/cmd/gda"
 	_ "github.com/rclone/rclone/cmd/gda/backup"
+	_ "github.com/rclone/rclone/cmd/gda/check"
 	_ "github.com/rclone/rclone/cmd/gda/find"
 	_ "github.com/rclone/rclone/cmd/gda/gc"
 	_ "github.com/rclone/rclone/cmd/gda/ls"
