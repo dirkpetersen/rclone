@@ -135,8 +135,12 @@ type Located struct {
 	LocalPath string `json:"local_path"` // Path with names decoded to their original bytes
 }
 
-// ObjectKey returns the key of the object holding the entry's data.
+// ObjectKey returns the key of the object holding the entry's data,
+// which for a duplicate is the stored copy's.
 func (l *Located) ObjectKey() string {
+	if l.DedupOf != "" {
+		return l.DedupOf
+	}
 	return joinRemote(l.IndexKey, l.Location)
 }
 

@@ -37,6 +37,7 @@ type Options struct {
 	Level         int           // zstd compression level, 1 to 22
 	Workers       int           // directories processed in parallel
 	Changes       []string      // if set, back up only the directories these source paths are in
+	DedupMin      int64         // identical files of at least this size are stored once; -1 disables
 }
 
 // DefaultOptions returns the default options.
@@ -53,27 +54,30 @@ func DefaultOptions() Options {
 		Compression:   CodecZstd,
 		Level:         3,
 		Workers:       1,
+		DedupMin:      1024 * 1024,
 	}
 }
 
 // Stats counts what a run did.
 type Stats struct {
-	IndexedDirs     int64 // directories with their own index
-	RollupDirs      int64 // directories packed inside a rollup
-	Unchanged       int64 // entries unchanged since the last run
-	Added           int64 // entries added
-	Modified        int64 // entries whose data changed
-	MetaOnly        int64 // entries whose metadata changed but not their data
-	Deleted         int64 // entries no longer in the source
-	Packs           int64 // packs uploaded
-	PackBytes       int64 // bytes in packs uploaded, as stored
-	CompressedFrom  int64 // bytes of compressed packs and files before compression
-	Standalone      int64 // standalone objects uploaded
-	StandaloneBytes int64 // bytes in standalone objects uploaded
-	MetaObjects     int64 // changesets and index objects written
-	Skipped         int64 // entries skipped, for example because of reserved names
-	Deferred        int64 // entries that changed while being read, left for the next run
-	Errors          int64 // errors
+	IndexedDirs       int64 // directories with their own index
+	RollupDirs        int64 // directories packed inside a rollup
+	Unchanged         int64 // entries unchanged since the last run
+	Added             int64 // entries added
+	Modified          int64 // entries whose data changed
+	MetaOnly          int64 // entries whose metadata changed but not their data
+	Deleted           int64 // entries no longer in the source
+	Packs             int64 // packs uploaded
+	PackBytes         int64 // bytes in packs uploaded, as stored
+	CompressedFrom    int64 // bytes of compressed packs and files before compression
+	Standalone        int64 // standalone objects uploaded
+	StandaloneBytes   int64 // bytes in standalone objects uploaded
+	MetaObjects       int64 // changesets and index objects written
+	Deduplicated      int64 // files which were copies of stored content, so weren't stored again
+	DeduplicatedBytes int64 // bytes in those files
+	Skipped           int64 // entries skipped, for example because of reserved names
+	Deferred          int64 // entries that changed while being read, left for the next run
+	Errors            int64 // errors
 }
 
 // Ledger records a run. It is written to _gda/runs/<run>/<worker>.json.
@@ -129,6 +133,8 @@ type backup struct {
 
 	dirty   map[string]bool // for change runs, directories to process
 	newDirs map[string]bool // for change runs, directories new since the last run
+
+	dedup *dedupIndex // stored copies, nil if not deduplicating
 }
 
 // stop stops the run after the directory in progress.
@@ -158,6 +164,9 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		return nil, err
 	}
 	defer b.unlock(ctx)
+	if err := b.loadDedup(ctx); err != nil {
+		return nil, err
+	}
 	if len(opt.Changes) > 0 {
 		fs.Infof(nil, "gda: run %s: backing up %d changes in %s", b.runID, len(opt.Changes), b.srcRoot)
 		if err := b.backupChanges(ctx, opt.Changes); err != nil {
@@ -242,6 +251,16 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 	return b, ledger, nil
 }
 
+// loadDedup reads the dedup index if deduplicating.
+func (b *backup) loadDedup(ctx context.Context) error {
+	if b.opt.DedupMin < 0 {
+		return nil
+	}
+	var err error
+	b.dedup, err = loadDedup(ctx, b.d)
+	return err
+}
+
 // close releases what the run holds.
 func (b *backup) close() {
 	if b.enc != nil {
@@ -279,6 +298,11 @@ func (b *backup) finishLedger(ctx context.Context, ledger *Ledger) (*Ledger, err
 	data, err := json.MarshalIndent(ledger, "", "  ")
 	if err != nil {
 		return ledger, err
+	}
+	if b.dedup != nil && !b.d.dryRun {
+		if err := b.dedup.save(ctx, b.d, b.runID, b.opt.Worker); err != nil {
+			b.errorf("write dedup index: %v", err)
+		}
 	}
 	ledgerKey := joinRemote(MetaDir, "runs", b.runID, b.opt.Worker+".json")
 	if err := b.d.putBytes(ctx, ledgerKey, data, b.opt.MetaTier); err != nil {
@@ -849,6 +873,12 @@ func (b *backup) storeData(ctx context.Context, w, key, label string, entries []
 		b.planData(w, label, entries, stored)
 		return stored, false
 	}
+	entries = b.dedupEntries(entries, stored)
+	defer func() {
+		if !failed {
+			b.recordCopies(key, stored)
+		}
+	}()
 	var packed []*sourceEntry
 	for _, e := range entries {
 		if e.Type == TypeSocket {
