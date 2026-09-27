@@ -1263,7 +1263,7 @@ func applyMeta(e *Entry, p string, isRoot bool) error {
 	// Last, so a failure to set one, as for a namespace only root can
 	// write, doesn't stop the rest.
 	if e.Xattrs != "" {
-		err = errors.Join(err, writeXattrs(p, e.Xattrs))
+		err = errors.Join(err, writeXattrs(p, e.Xattrs, isRoot))
 	}
 	return err
 }

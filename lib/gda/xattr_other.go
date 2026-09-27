@@ -10,7 +10,7 @@ func readXattrs(p string) (string, error) {
 	return "", errNoXattrs
 }
 
-func writeXattrs(p, xattrs string) error {
+func writeXattrs(p, xattrs string, isRoot bool) error {
 	return errNoXattrs
 }
 
