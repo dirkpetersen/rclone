@@ -140,6 +140,17 @@ func TestCanonicalTier(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestLoadPricesStorage(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "prices.json")
+	require.NoError(t, os.WriteFile(p, []byte(`{"storage":{"DEEP_ARCHIVE":{"per_gb_month":0.001}}}`), 0o644))
+	prices, err := LoadPrices(p)
+	require.NoError(t, err)
+	want := DefaultPrices().Storage["DEEP_ARCHIVE"]
+	want.PerGBMonth = 0.001
+	assert.Equal(t, want, prices.Storage["DEEP_ARCHIVE"])
+	assert.Equal(t, DefaultPrices().Storage["GLACIER"], prices.Storage["GLACIER"])
+}
+
 func TestEstimateBackup(t *testing.T) {
 	p := DefaultPrices()
 	// A million 256 MiB packs is 256 TiB.
