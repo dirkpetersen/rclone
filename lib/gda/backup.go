@@ -35,6 +35,7 @@ type Options struct {
 	Retries       int           // upload attempts per object
 	Compression   string        // CodecZstd to compress data where it helps, or CodecNone
 	Level         int           // zstd compression level, 1 to 22
+	Workers       int           // directories processed in parallel
 }
 
 // DefaultOptions returns the default options.
@@ -50,6 +51,7 @@ func DefaultOptions() Options {
 		Retries:       3,
 		Compression:   CodecZstd,
 		Level:         3,
+		Workers:       1,
 	}
 }
 
@@ -148,6 +150,9 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	if opt.Retries < 1 {
 		opt.Retries = 1
 	}
+	if opt.Workers < 1 {
+		opt.Workers = 1
+	}
 	if opt.Compression != CodecZstd && opt.Compression != CodecNone {
 		return nil, fmt.Errorf("unknown compression %q: use %s or %s", opt.Compression, CodecZstd, CodecNone)
 	}
@@ -222,10 +227,10 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		return nil, err
 	}
 	defer b.unlock(ctx)
-	fs.Infof(nil, "gda: run %s: scanning %s", b.runID, srcRoot)
-	b.summarize("")
+	fs.Infof(nil, "gda: run %s: scanning %s with %d workers", b.runID, srcRoot, opt.Workers)
+	b.summarizeAll()
 	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, fs.ConfigString(dst))
-	b.processDir(ctx, "", "", b.isRollupRoot(""))
+	b.processAll(ctx)
 	if b.isStopped() {
 		fs.Errorf(nil, "gda: run %s stopped early", b.runID)
 	}
@@ -330,15 +335,26 @@ func (b *backup) unlock(ctx context.Context) {
 	}
 }
 
-// summarize computes the summaries of the subtree at rel.
-func (b *backup) summarize(rel string) *dirSummary {
+// summarize computes the summaries of the subtree at rel. If sem isn't
+// nil, subdirectories are summarized in parallel while it has room.
+func (b *backup) summarize(rel string, sem chan struct{}) *dirSummary {
 	s := &dirSummary{}
-	b.summaries[rel] = s
+	b.setSummary(rel, s)
 	names, err := readDir(sourcePath(b.srcRoot, rel))
 	if err != nil {
 		b.errorf("read directory %q: %v", rel, err)
 		s.unreadable = true
 		return s
+	}
+	var (
+		wg       sync.WaitGroup
+		children []*dirSummary
+		childMu  sync.Mutex
+	)
+	addChild := func(child *dirSummary) {
+		childMu.Lock()
+		children = append(children, child)
+		childMu.Unlock()
 	}
 	for _, name := range names {
 		childRel := joinRemote(rel, name)
@@ -352,12 +368,17 @@ func (b *backup) summarize(rel string) *dirSummary {
 			continue
 		}
 		if info.IsDir() {
-			child := b.summarize(childRel)
-			s.treeSize += child.treeSize
-			s.treeFiles += child.treeFiles
-			s.standalone = s.standalone || child.standalone
-			s.unreadable = s.unreadable || child.unreadable
-			s.badName = s.badName || child.badName
+			select {
+			case sem <- struct{}{}:
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer func() { <-sem }()
+					addChild(b.summarize(childRel, sem))
+				}()
+			default:
+				addChild(b.summarize(childRel, sem))
+			}
 			continue
 		}
 		s.treeFiles++
@@ -368,7 +389,21 @@ func (b *backup) summarize(rel string) *dirSummary {
 			}
 		}
 	}
+	wg.Wait()
+	for _, child := range children {
+		s.treeSize += child.treeSize
+		s.treeFiles += child.treeFiles
+		s.standalone = s.standalone || child.standalone
+		s.unreadable = s.unreadable || child.unreadable
+		s.badName = s.badName || child.badName
+	}
 	return s
+}
+
+func (b *backup) setSummary(rel string, s *dirSummary) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.summaries[rel] = s
 }
 
 // rollupEligible returns true if the subtree at rel could be packed as
@@ -402,38 +437,37 @@ type childDir struct {
 	rel, key string
 }
 
-// processDir backs up the directory at rel, whose destination key is key.
-// If rollup is set, the whole subtree is packed as one unit.
-func (b *backup) processDir(ctx context.Context, rel, key string, rollup bool) {
+// processDir backs up the directory at rel, whose destination key is key,
+// as worker w. If rollup is set, the whole subtree is packed as one unit.
+// It returns the subdirectories with their own index, to process next.
+func (b *backup) processDir(ctx context.Context, w, rel, key string, rollup bool) []childDir {
 	if ctx.Err() != nil || b.isStopped() {
-		return
+		return nil
 	}
 	prevEntries, err := b.d.readIndex(ctx, key)
 	if err != nil {
 		b.errorf("%v", err)
-		return
+		return nil
 	}
 	b.count(func(s *Stats) *int64 { return &s.IndexedDirs }, 1)
 	prev := make(map[string]Entry, len(prevEntries))
 	for _, e := range prevEntries {
 		prev[e.Name] = e
 	}
-	cur, keep, err := b.collect(rel, key, rollup)
+	cur, keep, err := b.collect(w, rel, key, rollup)
 	if err != nil {
 		b.errorf("%v", err)
-		return
+		return nil
 	}
 	change := b.compare(key, prev, cur, keep)
-	b.commitDir(ctx, rel, key, prevEntries, change)
-	for _, child := range change.recurse {
-		b.processDir(ctx, child.rel, child.key, b.isRollupRoot(child.rel))
-	}
+	b.commitDir(ctx, w, rel, key, prevEntries, change)
+	return change.recurse
 }
 
 // collect reads the entries of the directory at rel. For a rollup it
 // reads the whole subtree, naming entries relative to rel. keep holds the
 // names of entries that couldn't be read, whose previous rows are kept.
-func (b *backup) collect(rel, key string, rollup bool) (cur []sourceEntry, keep map[string]bool, err error) {
+func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, keep map[string]bool, err error) {
 	keep = map[string]bool{}
 	names, err := readDir(sourcePath(b.srcRoot, rel))
 	if err != nil {
@@ -471,7 +505,7 @@ func (b *backup) collect(rel, key string, rollup bool) (cur []sourceEntry, keep 
 		if rollup {
 			e.Listing = ListingRollup
 			cur = append(cur, e)
-			sub, subKeep, err := b.collect(childRel, "", true)
+			sub, subKeep, err := b.collect(w, childRel, "", true)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -487,7 +521,7 @@ func (b *backup) collect(rel, key string, rollup bool) (cur []sourceEntry, keep 
 		}
 		childKey := joinRemote(key, encName)
 		// The longest key this directory produces is a pack's manifest name.
-		if keyTooLong(b.rootKey, joinRemote(childKey, packName(dirLabel(childKey, b.opt.RootLabel), b.runID, b.opt.Worker, 99999)+".csv")) {
+		if keyTooLong(b.rootKey, joinRemote(childKey, packName(dirLabel(childKey, b.opt.RootLabel), b.runID, w, 99999)+".csv")) {
 			b.errorf("skipping directory %q: its keys would be longer than %d bytes", childRel, maxKeyLength)
 			keep[encName] = true
 			continue
@@ -656,9 +690,9 @@ func hashFile(p string) (sum string, err error) {
 // one, and writes its index, in that order. It returns false if the
 // directory couldn't be committed, in which case its previous index stays
 // in place and the next run tries again.
-func (b *backup) commitDir(ctx context.Context, rel, key string, prevEntries []Entry, c *dirChange) bool {
+func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries []Entry, c *dirChange) bool {
 	label := dirLabel(key, b.opt.RootLabel)
-	stored, failed := b.storeData(ctx, key, label, c.store)
+	stored, failed := b.storeData(ctx, w, key, label, c.store)
 	if failed {
 		return false
 	}
@@ -703,7 +737,7 @@ func (b *backup) commitDir(ctx context.Context, rel, key string, prevEntries []E
 	}
 	if len(changes) > 0 {
 		sortEntries(changes)
-		if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(label, b.runID, b.opt.Worker)), changes, columns); err != nil {
+		if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(label, b.runID, w)), changes, columns); err != nil {
 			b.errorf("write changeset of %q: %v", rel, err)
 			return false
 		}
@@ -712,7 +746,7 @@ func (b *backup) commitDir(ctx context.Context, rel, key string, prevEntries []E
 	// Retire before writing this index: if that fails, the previous index
 	// still lists the subdirectories, so the next run retires them again.
 	for _, childKey := range c.retire {
-		if !b.retireIndex(ctx, childKey) {
+		if !b.retireIndex(ctx, w, childKey) {
 			return false
 		}
 	}
@@ -770,10 +804,10 @@ func indexChanged(prev, next []Entry) (bool, error) {
 // storeData stores the data of entries in packs and standalone objects.
 // It returns the stored entries by name. failed is set if an upload
 // failed, in which case nothing from this directory may be committed.
-func (b *backup) storeData(ctx context.Context, key, label string, entries []*sourceEntry) (stored map[string]Entry, failed bool) {
+func (b *backup) storeData(ctx context.Context, w, key, label string, entries []*sourceEntry) (stored map[string]Entry, failed bool) {
 	stored = map[string]Entry{}
 	if b.d.dryRun {
-		b.planData(label, entries, stored)
+		b.planData(w, label, entries, stored)
 		return stored, false
 	}
 	var packed []*sourceEntry
@@ -786,7 +820,7 @@ func (b *backup) storeData(ctx context.Context, key, label string, entries []*so
 			continue
 		}
 		if e.Type == TypeFile && e.Size >= b.opt.StandaloneMin && isDirectChild(e.Name) {
-			if !b.storeStandalone(ctx, key, e, stored) {
+			if !b.storeStandalone(ctx, w, key, e, stored) {
 				return nil, true
 			}
 			continue
@@ -816,7 +850,7 @@ func (b *backup) storeData(ctx context.Context, key, label string, entries []*so
 		if pw == nil {
 			part++
 			var err error
-			pw, err = newPackWriter(packName(label, b.runID, b.opt.Worker, part), b.opt.TempDir)
+			pw, err = newPackWriter(packName(label, b.runID, w, part), b.opt.TempDir)
 			if err != nil {
 				b.errorf("%v", err)
 				return nil, true
@@ -842,7 +876,7 @@ func (b *backup) storeData(ctx context.Context, key, label string, entries []*so
 
 // planData fills in stored as storeData would, without reading or
 // uploading any data. It is used for --dry-run.
-func (b *backup) planData(label string, entries []*sourceEntry, stored map[string]Entry) {
+func (b *backup) planData(w, label string, entries []*sourceEntry, stored map[string]Entry) {
 	var packSize int64
 	part := 0
 	for _, e := range entries {
@@ -863,7 +897,7 @@ func (b *backup) planData(label string, entries []*sourceEntry, stored map[strin
 			}
 			packSize += size
 			b.count(func(s *Stats) *int64 { return &s.PackBytes }, size)
-			row.Location = packName(label, b.runID, b.opt.Worker, part)
+			row.Location = packName(label, b.runID, w, part)
 		}
 		stored[e.Name] = row
 	}
@@ -950,7 +984,7 @@ func (b *backup) uploadPack(ctx context.Context, key string, pw *packWriter, sto
 
 // storeStandalone uploads a large file as its own object, never
 // overwriting an existing object.
-func (b *backup) storeStandalone(ctx context.Context, key string, e *sourceEntry, stored map[string]Entry) bool {
+func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEntry, stored map[string]Entry) bool {
 	compress, err := b.compressStandalone(e)
 	if err != nil {
 		b.errorf("read %q: %v", e.path, err)
@@ -971,7 +1005,7 @@ func (b *backup) storeStandalone(ctx context.Context, key string, e *sourceEntry
 		return false
 	}
 	if exists {
-		name = versionedName(e.Name, b.runID, b.opt.Worker) + suffix
+		name = versionedName(e.Name, b.runID, w) + suffix
 		remote = joinRemote(key, name)
 	}
 	if keyTooLong(b.rootKey, remote) {
@@ -1082,7 +1116,7 @@ func readStart(p string, n int64) (data []byte, err error) {
 // deleted, becomes part of a rollup or is replaced by a file.
 // Subdirectories with their own index are retired first. It returns
 // false if anything failed.
-func (b *backup) retireIndex(ctx context.Context, key string) bool {
+func (b *backup) retireIndex(ctx context.Context, w, key string) bool {
 	entries, err := b.d.readIndex(ctx, key)
 	if err != nil {
 		b.errorf("%v", err)
@@ -1095,12 +1129,12 @@ func (b *backup) retireIndex(ctx context.Context, key string) bool {
 	for _, e := range entries {
 		changes = append(changes, changeRow(e, ActionDelete))
 		if e.IsDir() && e.Listing == ListingIndex && isDirectChild(e.Name) {
-			if !b.retireIndex(ctx, joinRemote(key, e.Name)) {
+			if !b.retireIndex(ctx, w, joinRemote(key, e.Name)) {
 				return false
 			}
 		}
 	}
-	if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(dirLabel(key, b.opt.RootLabel), b.runID, b.opt.Worker)), changes, columns); err != nil {
+	if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(dirLabel(key, b.opt.RootLabel), b.runID, w)), changes, columns); err != nil {
 		b.errorf("write changeset of %q: %v", key, err)
 		return false
 	}

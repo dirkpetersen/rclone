@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/rclone/rclone/cmd"
@@ -25,6 +26,7 @@ var (
 )
 
 func init() {
+	opt.Workers = min(runtime.NumCPU(), 15)
 	flagSet := Command.Flags()
 	flags.FVarP(flagSet, &packSize, "pack-size", "", "Maximum size of a pack of small files", "")
 	flags.FVarP(flagSet, &standaloneMin, "standalone-min", "", "Store files at least this big as their own objects", "")
@@ -38,6 +40,7 @@ func init() {
 	flags.IntVarP(flagSet, &opt.Retries, "upload-retries", "", opt.Retries, "Upload attempts per object", "")
 	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
 	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
+	flags.IntVarP(flagSet, &opt.Workers, "workers", "", opt.Workers, "Directories to back up in parallel (default one per CPU, up to 15)", "")
 	gda.Command.AddCommand(Command)
 }
 
@@ -74,6 +77,11 @@ standalone file when its name doesn't show a compressed format (such as
 is written as independent frames, so a single file can still be read
 without the rest of its pack, and a compressed pack is a normal
 !.tar.zst! file. !--compression none! turns this off.
+
+!--workers! directories are scanned and backed up in parallel. Each
+directory is handled by one worker, whose ID is part of the names of
+the packs it writes, so workers never write the same object. Each
+worker may have a pack of up to !--pack-size! in !--temp-dir! at once.
 
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose
