@@ -822,7 +822,10 @@ million files (20 GB) in 40,000 directories with a median file of about
 600 bytes, backs up in 5 min 47 s with at most 970 MB of memory, mostly
 compressing and writing; an unchanged rerun takes 5 to 9 s and 330 to
 420 MB, and a change run of 3,000 changed, added and deleted files 15 s
-and 590 MB, after which a full compare finds nothing left. Restoring all of it takes 8 min 29 s but 2.6 GB of memory, as a restore holds its whole plan, about 2.5 KB per file: an open issue, as 10 million files would need about 25 GB. A directory is
+and 590 MB, after which a full compare finds nothing left. Restoring
+all of it takes 8 min 29 s but 2.6 GB of memory, as a restore holds its
+whole plan, about 2.5 KB per file: an open issue, as 10 million files
+would need about 25 GB. A directory is
 held in memory while it is compared and committed, at about 3 KB per
 file plus 16 MiB of compression history per worker, but directories of
 more than 200,000 entries are compared and committed 50,000 at a time,
