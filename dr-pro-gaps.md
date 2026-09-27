@@ -41,8 +41,10 @@ Section references such as "plan §10.7" point into `rclone-plan.md`.
   `ENABLE=0` handling, email reports, the LOG files the reports site
   reads, stale-backup detection, snapshot handling and scheduling.
   rclone-gda provides none of these and should not.
-- Two gaps sit in rclone-gda itself: `rclone gda backup` takes one source
-  directory per run, and reads only local paths (no SSH sources). Exclude
+- Two limits sit in rclone-gda itself: `rclone gda backup` takes one
+  source directory per run, and reads only local paths (no SSH sources).
+  Neither matters in the recommended cascade, which backs up the rsync
+  copy on `backup2`, all of a config's sources in one run. Exclude
   filters, missing when this was first drafted, now work.
 - The largest risks are maturity (the code was written over two days and
   has not run at CGRB scale), the not yet waited-out AWS restore of a
@@ -199,7 +201,7 @@ rclone-gda closes it: **Closed** (fully, mostly, partly, or in code only),
 
 | DR Pro capability | Plain rclone | rclone-gda | Plan gap | Notes and what closes it |
 | --- | --- | --- | --- | --- |
-| Several source directories per config (`source.txt`) with `-R` layout | Partly: map each source to an explicit sub-path (§5.1) | Partly | Remains | `rclone gda backup` takes one source directory. The wrapper runs it once per source line with destination `<prefix>/<source path without leading />`. Each becomes its own GDA root with its own lock, ledger and dedup index, so there is no dedup across sources. |
+| Several source directories per config (`source.txt`) with `-R` layout | Partly: map each source to an explicit sub-path (§5.1) | Covered in the cascade | Closed for topology (c) | `rclone gda backup` takes one source directory. In the cascade that is `CURRENT/SRC`, which rsync `-R` already lays out with every source under its full path, so one GDA root per config holds all its sources, with one lock, ledger and dedup index. Reading sources directly would need one root per source, or a common parent with filters. |
 | Exclude and include lists | Partly: syntax matches, semantics differ, patterns must be rewritten (§5.4) | Covered | Closed | Since commit `c641d580b`, rclone's filter flags (`--exclude`, `--exclude-from`, `--include`, `--exclude-if-present` and the rest) apply to backups, matched against paths relative to the source; an entry left out that was backed up before is recorded as deleted. The plan's §5.4 lesson still holds: rsync patterns anchored at `/` must be rewritten per source, and each rule wants a test. No live lab uses excludes today. |
 | Source pre-flight: exists, is an NFS mount, not a symlink | Reusable in wrapper (§3 C5) | Partly | | GDA requires a local directory and refuses to back up an empty source over a non-empty backup unless `--allow-empty`, which catches an unmounted source. The NFS type and symlink checks (and bug B5, §14) stay in the wrapper. |
 | SSH sources (`SRC_PROTOCOL='SSH'`), `/etc` and `/var` of remote hosts (§7) | Partly: `--sftp-server-command`, no delta transfer (§4.2) | Gap | Remains | GDA reads local paths only. No live config uses SSH. Options: back up the rsync-made local copy (topology c), or run `rclone gda` on the host itself, which puts S3 credentials there. |
@@ -253,13 +255,13 @@ rclone-gda closes it: **Closed** (fully, mostly, partly, or in code only),
 
 | Rank | Gap or risk | Why it matters | Next step | Where |
 | --- | --- | --- | --- | --- |
-| 1 | GDA is new and unproven at CGRB scale | The code was written on 2026-09-26 and 27 (90 commits on `gda` since `master`). Measured runs are 100,000 files locally and against S3. The 10% cloud target is about 369M files. | Pilot one lab (below). Run a full `--dry-run` over a real lab tree to measure time and memory. Pin one fork build for production. | rclone-gda, operational |
+| 1 | GDA is new and unproven at CGRB scale | The code was written on 2026-09-26 and 27 (90 commits on `gda` since `master`). Measured runs are 100,000 files against S3 and, locally, a synthetic census-shaped tree of 1.04M files: full backup 5 min 47 s at 970 MB, unchanged rerun 5 to 9 s, change run of 3,000 changes 15 s. The 10% cloud target is about 369M files. | Pilot one lab (below). Run a full `--dry-run` over a real lab tree to measure time and memory. Pin one fork build for production. | rclone-gda, operational |
 | 2 | Restoring a noncurrent Deep Archive version hasn't been waited out on AWS | Plan §11.5's top risk. The same path worked on AWS for a noncurrent GLACIER version with Expedited retrieval; Deep Archive differs only in the retrieval tier and wait. | Plan Phase 0d on `osu-drpro-scratch`: back up a large file, change it twice, then `rclone gda restore --at` the middle run with Bulk and resume it after 48 hours. | rclone-gda test |
 | 3 | IAM, Object Lock and lifecycle to set up | Backups now need no delete right, and the design doc lists the actions per command, but the policies and rules for `osu-drpro` aren't written. | Two identities: backup (no `DeleteObject` or `DeleteObjectVersion`) and gc. A lifecycle rule expiring noncurrent versions after the history period, with `gc --keep-history` of the same period; delete marker and incomplete multipart cleanup; Object Lock retention shorter than the history kept. | AWS setup |
 | 4 | No reporting or alerting for the cloud stage | A GDA failure after the INFO email is invisible (plan §15.1), and absent runs raise nothing (§15.2). | Wrapper writes `s3-*.txt` LOG files from the ledger, adds a `CLOUD :` block to the email, maps a non-zero exit to WARNING, and a status job checks `_gda/runs/`. `gda backup --ledger-file` writes the outcome and the run's ledger locally as JSON for the wrapper to read. | Wrapper |
 | 5 | Change runs need a high-water mark | A failed `--changes-from` run isn't retried by the next night's `zfs diff`. A change list with no paths below a source is fine: `gda backup` makes no run and succeeds (outcome `no changes` in `--ledger-file`), so one `zfs diff` can feed every source on a dataset. | Keep the last snapshot whose GDA runs all succeeded and diff from it; listing paths again is harmless, as GDA compares them with the index. Schedule a full run (no `--changes-from`) monthly or quarterly. | Wrapper |
 | 6 | Filter rules need translating and testing | `gda backup` now takes rclone's filter flags, but rsync-style `exclude.txt` rules anchored at `/` must be rewritten per source. | Translate per source and test that each rule excludes a fixture (plan §5.4's lesson). | Wrapper |
-| 7 | One source per run | Each `source.txt` line becomes its own GDA root, lock and dedup scope, and the per-config totals must be summed by the wrapper. | Accept it for the pilot. Longer term, allow several sources into one root, or use filters (rank 6) to back up a common parent. | rclone-gda, wrapper |
+| 7 | One source per run | Only matters when GDA reads sources directly. In the cascade, one run per config backs up `CURRENT/SRC`, which holds all the config's sources (see "One command per config"). | Back up `CURRENT/SRC` per config. For direct runs, use filters (rank 6) to back up a common parent. | Wrapper |
 | 8 | Restore time | Deep Archive restores take 12 to 48 hours; the 72-hour RTO is tight with Bulk (plan §10.4). | Keep the local ZFS tier (topology c). Document when to pay for Standard retrieval. | Operational |
 | 9 | SSH, `/etc` and `/var` sources | GDA reads only local paths. | Cascade from the rsync-made local copy (topology c), as the plan already recommends for OS directories (§7). | Wrapper |
 | 10 | Very large directories and per-host limits | Directories of more than 200,000 entries are now committed in chunks of 50,000, so memory no longer grows with the directory (300,000 files went from 2 GB to 0.8 GB), and full runs read each file's metadata once. The dedup index still takes about 300 bytes per stored file of 1 MiB or more in each process, and per-host resource limits aren't built. | Profile the filers for files per directory and for files of 1 MiB or more with the design's DuckDB query ("Profiling a file system") or the plan's `drpro-profile.bash` (Phase 0a). | rclone-gda, profiling |
@@ -288,11 +290,15 @@ working. After it finishes, a wrapper snapshots the lab's ZFS dataset on
 the cloud stage like the plan's rule in §15.6: cloud failures raise a
 WARNING and release the lock, and never block the next local run.
 
-### Per-source commands
+### One command per config
 
-A sketch for one source of `garcia/zfs4`, assuming the dataset
-`backup2/Garcia_Lab` is mounted at `/backup2/Garcia_Lab` (verify on
-`backup2`) and the remote is `osu-drpro:` as in plan §8.1:
+In the cascade, `CURRENT/SRC` on `backup2` already holds every source of
+a config under its full path (rsync `-R`), so one GDA root per config
+covers all of them: one run, one lock, one dedup scope and one ledger,
+and the one-source-per-run limit (rank 7) doesn't arise. A sketch for
+`garcia/zfs4`, assuming the dataset `backup2/Garcia_Lab` is mounted at
+`/backup2/Garcia_Lab` (verify on `backup2`) and the remote is
+`osu-drpro:` as in plan §8.1:
 
 ```sh
 LOG=$REVISIONS_DIR/LOG   # this night's DR Pro LOG directory
@@ -301,17 +307,20 @@ NEW=gda-$(date -u +%Y%m%dT%H%M%SZ)
 zfs snapshot "$DS@$NEW"
 CUR=/backup2/Garcia_Lab/.zfs/snapshot/$NEW/drpro/zfs4.cgrb.oregonstate.local/CURRENT/SRC
 zfs diff -H "$DS@$LAST_OK" "$DS@$NEW" > /var/tmp/gda-changes.txt
-SRC=nfs5/FW_HMSC/Garcia_Lab/programs
-rclone gda backup "$CUR/$SRC" \
-  "osu-drpro:osu-drpro/garcia/zfs4.cgrb.oregonstate.local/$SRC" \
+rclone gda backup "$CUR" \
+  "osu-drpro:osu-drpro/garcia/zfs4.cgrb.oregonstate.local" \
   --changes-from /var/tmp/gda-changes.txt --changes-format zfs \
-  --lock-timeout 2h --log-file "$LOG/gda-$(echo "$SRC" | tr / _).txt"
+  --lock-timeout 2h --ledger-file "$LOG/gda-ledger.json" \
+  --log-file "$LOG/gda.txt"
 ```
 
-The wrapper repeats the last command for each `source.txt` line, skips a
-source when no changed path falls below it, advances `LAST_OK` only when
-every source succeeded, and destroys older snapshots. The first run for
-each source, and a periodic reconciliation run, drop `--changes-from`.
+`zfs diff` lists the whole dataset, and GDA keeps only the paths below
+`$CUR`; if none changed, it makes no run and reports `no changes`. The
+wrapper advances `LAST_OK` only when the run succeeded, reads the ledger
+file for the email and LOG files, and destroys older snapshots. The
+first run, and a periodic reconciliation run, drop `--changes-from`. A
+source dropped from `source.txt` stays in `CURRENT/SRC`, as it does for
+DR Pro today, and so stays in the backup until it is removed there.
 
 Plan §8.1 variables that change meaning:
 
@@ -327,7 +336,7 @@ Plan §8.1 variables that change meaning:
 
 `core/zfs4` is CGRB's own data (`LAB_NAME_SHORT='CQLS'`), so a pilot there
 affects no outside lab. It has four sources under `/nfs4/core`, which
-exercises the one-root-per-source mapping.
+exercises backing up several sources as one root.
 
 1. Profile the lab tree for file sizes and files per directory, and run a
    full `rclone gda backup --dry-run` against the snapshot to get the

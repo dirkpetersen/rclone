@@ -817,14 +817,19 @@ run. Nothing shared is written by two processes.
 
 Measured on the implementation (2026-09-27, local disk, 16 cores): a tree
 of 100,000 files in 2,000 directories backs up in 2 s and an unchanged
-rerun takes 0.6 s; a single directory of 300,000 files takes 10 s and
-2 GB of memory, as a directory is held in memory while it is compared
-and committed, at about 3 KB per file plus 16 MiB of compression
-history per worker. Directories of tens of millions of files would need
-the comparison to stream instead. The dedup index takes about 300 bytes
-per stored file of at least `--dedup-min` in every process, so tens of
-millions of such files need a larger `--dedup-min` or sharding, and the
-scan's directory totals take a few hundred bytes per directory. Against
+rerun takes 0.6 s. A synthetic tree shaped like the CGRB census, 1.04
+million files (20 GB) in 40,000 directories with a median file of about
+600 bytes, backs up in 5 min 47 s with at most 970 MB of memory, mostly
+compressing and writing; an unchanged rerun takes 5 to 9 s and 330 to
+420 MB, and a change run of 3,000 changed, added and deleted files 15 s
+and 590 MB, after which a full compare finds nothing left. A directory is
+held in memory while it is compared and committed, at about 3 KB per
+file plus 16 MiB of compression history per worker, but directories of
+more than 200,000 entries are compared and committed 50,000 at a time,
+so a flat directory of 300,000 files takes 0.8 GB. The dedup index takes
+about 300 bytes per stored file of at least `--dedup-min` in every
+process, so tens of millions of such files need a larger `--dedup-min`
+or sharding. Against
 AWS S3 in us-west-2, the same 100,000 files as 2,000 rolled up
 directories took 19 s split over four processes, an unchanged rerun 10 s
 reading every index, and under a second with the index cache.
