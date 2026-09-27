@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // makeTree creates a source tree with packed, standalone and rolled up
@@ -28,7 +28,7 @@ func makeTree(t *testing.T) string {
 	writeFile(t, src, "results/sub/deep/c.dat", 100)
 	writeFile(t, src, "tiny/a/b.txt", 5)
 	require.NoError(t, os.Symlink("../README.txt", filepath.Join(src, "results/link")))
-	require.NoError(t, syscall.Mkfifo(filepath.Join(src, "results/fifo"), 0o640))
+	require.NoError(t, unix.Mkfifo(filepath.Join(src, "results/fifo"), 0o640))
 	require.NoError(t, os.Chmod(filepath.Join(src, "results/a.dat"), 0o600))
 	require.NoError(t, os.Chmod(filepath.Join(src, "tiny/a"), 0o750))
 	setMtime(t, src, "results/a.dat", time.Hour)
