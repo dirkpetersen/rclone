@@ -4341,6 +4341,17 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	if o.storageClass != nil && (*o.storageClass == "GLACIER" || *o.storageClass == "DEEP_ARCHIVE") {
 		return fs.ErrorCantSetModTime
 	}
+	// Nor for Intelligent-Tiering objects in an archive access tier.
+	// Only HEAD reports the tier, and setMetaData doesn't keep it.
+	if o.storageClass != nil && *o.storageClass == "INTELLIGENT_TIERING" {
+		resp, err := o.headObject(ctx)
+		if err != nil {
+			return err
+		}
+		if resp.ArchiveStatus != "" {
+			return fs.ErrorCantSetModTime
+		}
+	}
 
 	// Copy the object to itself to update the metadata
 	bucket, bucketPath := o.split()

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"path"
 	"strings"
 	"testing"
@@ -912,4 +914,42 @@ func TestBufferForObjectLockMD5(t *testing.T) {
 		cleanup()
 		assert.Equal(t, inUse, pool.Global().InUse(), "pool buffers leaked")
 	})
+}
+
+func TestSetModTimeIntelligentTieringArchive(t *testing.T) {
+	archiveStatus := ""
+	copies := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			w.Header().Set("X-Amz-Storage-Class", "INTELLIGENT_TIERING")
+			if archiveStatus != "" {
+				w.Header().Set("X-Amz-Archive-Status", archiveStatus)
+			}
+			w.Header().Set("Content-Length", "10")
+		case r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "":
+			copies++
+			_, _ = io.WriteString(w, `<CopyObjectResult><ETag>"d41d8cd98f00b204e9800998ecf8427e"</ETag></CopyObjectResult>`)
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	f, err := fs.NewFs(ctx, fmt.Sprintf(":s3,provider=Other,endpoint='%s',force_path_style,access_key_id=key,secret_access_key=secret:bucket", srv.URL))
+	require.NoError(t, err)
+	for _, status := range []string{"ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACCESS"} {
+		archiveStatus = status
+		o := &Object{fs: f.(*Fs), remote: "file.bin"}
+		assert.ErrorIs(t, o.SetModTime(ctx, time.Now()), fs.ErrorCantSetModTime, status)
+	}
+	assert.Equal(t, 0, copies)
+
+	// In the frequent, infrequent or archive instant access tiers the
+	// object is copied onto itself as usual.
+	archiveStatus = ""
+	o := &Object{fs: f.(*Fs), remote: "file.bin"}
+	require.NoError(t, o.SetModTime(ctx, time.Now()))
+	assert.Equal(t, 1, copies)
 }
