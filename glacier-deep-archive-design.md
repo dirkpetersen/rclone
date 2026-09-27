@@ -1191,16 +1191,16 @@ Code lives in the fork: the format and engine in `lib/gda`, the commands in
 (decided 2026-09-26); destinations are any rclone remote, so tests can use
 the local and memory backends and production uses S3 or Ceph.
 
-| Milestone | Delivers |
-|---|---|
-| **1. Core backup, single process** | `rclone gda backup`: two-pass scan (subtree totals, then per-directory processing), standalone/packed/rollup planning, PAX tar packs with offsets, member MD5s and an embedded manifest, changesets and `gda-index.csv` (split above 100,000 rows), commit protocol, incremental runs by scan, the destination lock, the run ledger, dry-run. All CSV columns exist, including those for compression, deduplication and workers |
-| 2. Restore | `rclone gda restore` and `rclone gda ls`: plan from indexes, restore requests, wait, ranged or whole fetch, extract, verify; point-in-time with `--at` |
-| 3. Compression | zstd in independent frames, skip heuristics, `stored_*` columns filled (done) |
-| 4. Deduplication | Hash index per bucket for files of 1 MiB or more |
-| 5. Parallel workers | Coordinator, partitions, per-worker outputs, Slurm plan, resource budget |
-| 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz |
-| 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz |
-| 8. Change feeds and scale | ZFS, GPFS and Lustre change feeds, local index cache, Parquet catalog, checkpoints, rebasing, garbage collection |
+| Milestone | Delivers | Status |
+|---|---|---|
+| **1. Core backup, single process** | `rclone gda backup`: two-pass scan (subtree totals, then per-directory processing), standalone/packed/rollup planning, PAX tar packs with offsets, member MD5s and an embedded manifest, changesets and `gda-index.csv` (split above 100,000 rows), commit protocol, incremental runs by scan, the destination lock, the run ledger, dry-run | Done |
+| 2. Restore | `rclone gda restore` and `rclone gda ls`: plan from indexes, restore requests, wait, ranged or whole fetch, extract, verify; point-in-time with `--at` | Done |
+| 3. Compression | zstd in independent frames, skip heuristics, `stored_*` columns filled | Done |
+| 4. Deduplication | Dedup index per destination for files of 1 MiB or more | Done; shard compaction left for milestone 8 |
+| 5. Parallel workers | `--workers` on one host; `rclone gda plan`, `--run`/`--partition` and `rclone gda finish` across hosts | Done; resource limits per host left |
+| 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done; Price List API refresh left |
+| 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz | Done |
+| 8. Change feeds and scale | `--changes-from` for ZFS and path lists | Change runs done; local index cache, Parquet catalog, checkpoints, rebasing, garbage collection, dedup compaction left |
 
 Milestone 1 limits, each lifted by a later milestone:
 
