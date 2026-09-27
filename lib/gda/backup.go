@@ -208,7 +208,7 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	}
 	fs.Infof(nil, "gda: run %s: scanning %s with %d workers", b.runID, b.srcRoot, b.opt.Workers)
 	b.summarizeAll()
-	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, fs.ConfigString(dst))
+	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, destName(dst))
 	b.processAll(ctx)
 	ledger, err = b.finishLedger(ctx, ledger)
 	b.finishCache(ctx)
@@ -262,6 +262,7 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 			metaTier: opt.MetaTier,
 			dryRun:   ci.DryRun,
 			retries:  opt.Retries,
+			tempDir:  opt.TempDir,
 		},
 		rootKey:   strings.Trim(dst.Root(), "/"),
 		runID:     NewRunID(started),
@@ -293,7 +294,7 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 		Worker:        opt.Worker,
 		Host:          host,
 		Source:        srcRoot,
-		Destination:   fs.ConfigString(dst),
+		Destination:   destName(dst),
 		DryRun:        ci.DryRun,
 		Started:       started,
 		Options:       b.opt,
@@ -317,7 +318,7 @@ func (b *backup) openCache(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cache, err := openIndexCache(b.opt.IndexCache, fs.ConfigString(b.d.f), runs)
+	cache, err := openIndexCache(b.opt.IndexCache, destName(b.d.f), runs)
 	if err != nil {
 		return err
 	}
@@ -336,7 +337,7 @@ func (b *backup) finishCache(ctx context.Context) {
 		fs.Errorf(nil, "gda: index cache: %v", err)
 		return
 	}
-	b.d.cache.finish(fs.ConfigString(b.d.f), b.runID, runs)
+	b.d.cache.finish(destName(b.d.f), b.runID, runs)
 }
 
 // runsDigest returns a digest of the IDs of the runs on the destination,
@@ -370,8 +371,13 @@ func (b *backup) checkNotEmpty(ctx context.Context) error {
 		return nil
 	}
 	names, err := readDir(b.srcRoot)
-	if err != nil || len(names) > 0 {
+	if err != nil {
 		return nil
+	}
+	for _, name := range names {
+		if !isReserved(name, true) {
+			return nil
+		}
 	}
 	index, err := b.d.readIndex(ctx, "")
 	if err != nil {

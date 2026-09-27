@@ -181,3 +181,12 @@ func TestDedupOutsideRoot(t *testing.T) {
 	_, err = StartRestore(context.Background(), newDst(t, filepath.Join(dst, "b")), t.TempDir(), DefaultRestoreOptions())
 	assert.ErrorContains(t, err, "outside this GDA root")
 }
+
+func TestDedupKey(t *testing.T) {
+	_, ok := keyOf("d41d8cd98f00b204e9800998ecf8427e", 0)
+	assert.True(t, ok)
+	for _, bad := range []string{"", "xyz", "da39a3ee5e6b4b0d3255bfef95601890afd80709", "zz1d8cd98f00b204e9800998ecf8427e"} {
+		_, ok := keyOf(bad, 0)
+		assert.False(t, ok, bad)
+	}
+}

@@ -96,7 +96,7 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 	d := &dest{f: dst, metaTier: "STANDARD", retries: 3, dryRun: fs.GetConfig(ctx).DryRun}
 	// Below the root, the lock and the dedup index aren't there to see.
 	if _, err := dst.List(ctx, joinRemote(MetaDir, "runs")); err != nil {
-		return nil, fmt.Errorf("%s isn't the root of a GDA tree: %w", fs.ConfigString(dst), err)
+		return nil, fmt.Errorf("%s isn't the root of a GDA tree: %w", destName(dst), err)
 	}
 	var b *backup
 	if opt.DeleteOrphans {
@@ -316,7 +316,13 @@ func (r *GCReport) scanDir(ctx context.Context, d *dest, dir string, entries fs.
 	// The parts of split indexes which the current one doesn't use.
 	var stale []GCObject
 	current := map[string]bool{}
-	if data, err := d.get(ctx, joinRemote(dir, IndexName)); err == nil && isTOC(data) {
+	data, err := d.get(ctx, joinRemote(dir, IndexName))
+	switch {
+	case errors.Is(err, fs.ErrorObjectNotFound):
+	case err != nil:
+		// Without the table of contents every part would look stale.
+		return err
+	case isTOC(data):
 		parts, err := readTOC(bytes.NewReader(data))
 		if err != nil {
 			return err

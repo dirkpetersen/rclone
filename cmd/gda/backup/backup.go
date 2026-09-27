@@ -171,6 +171,9 @@ For S3, unless they are set, !--s3-upload-cutoff! is set above
 against its MD5, and !--s3-chunk-size! to 64 MiB, so that large files
 are uploaded in few parts; each worker may then hold four parts, 256
 MiB, in memory. Consider !--s3-no-check-bucket! when the bucket exists.
+This isn't done for S3 behind another remote, such as crypt, so set
+them yourself there. Workers of a split run should be given the plan's
+!--pack-size!, as the upload cutoff is set before the plan is read.
 
 Data is compressed with zstd where it helps: a pack is compressed when
 a trial compression of its files' data saves at least 10%, and a
@@ -259,7 +262,8 @@ enough, as a running run refreshes its lock.
 
 A run refuses to back up an empty source over a backup which isn't
 empty, as that is usually a file system which isn't mounted; use
-!--allow-empty! if the source really was emptied.
+!--allow-empty! if the source really was emptied (with !rclone gda
+plan! for a split run).
 
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose

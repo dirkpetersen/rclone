@@ -136,3 +136,14 @@ func TestRunID(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, parsed.Equal(start.Truncate(time.Second)))
 }
+
+func TestDestName(t *testing.T) {
+	for _, test := range []struct{ in, want string }{
+		{"s3{a1b2}:bucket/lab", "s3:bucket/lab"},
+		{"s3:bucket/lab", "s3:bucket/lab"},
+		{"/tmp/x{y}:z", "/tmp/x{y}:z"},
+		{":s3{a1b2}:bucket", ":s3:bucket"},
+	} {
+		assert.Equal(t, test.want, overridesRe.ReplaceAllString(test.in, "$1:"), test.in)
+	}
+}
