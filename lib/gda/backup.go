@@ -150,6 +150,8 @@ type backup struct {
 	catalog *catalogWriter // this run's catalog, nil for --dry-run
 
 	claim *partitionClaim // this worker's claim on its partition of a planned run
+
+	hardLinks map[string]Entry // stored files with more than one link, by HardLink, located by full key
 }
 
 // stop stops the run after the directory in progress.
@@ -816,7 +818,7 @@ func (b *backup) dirKeysTooLong(key string) bool {
 // sameMeta returns true if the metadata other than data and times of a and b match.
 func sameMeta(a *Entry, b *Entry) bool {
 	return a.Mode == b.Mode && a.UID == b.UID && a.GID == b.GID &&
-		a.Owner == b.Owner && a.Group == b.Group
+		a.Owner == b.Owner && a.Group == b.Group && a.HardLink == b.HardLink
 }
 
 // withMeta returns prev with the metadata of cur.
@@ -825,6 +827,7 @@ func withMeta(prev Entry, cur *Entry) Entry {
 	prev.Mode = cur.Mode
 	prev.UID, prev.GID = cur.UID, cur.GID
 	prev.Owner, prev.Group = cur.Owner, cur.Group
+	prev.HardLink = cur.HardLink
 	prev.Action = ""
 	return prev
 }
@@ -1227,9 +1230,12 @@ func (b *backup) storeData(ctx context.Context, w, key, label string, entries []
 		return stored, false
 	}
 	entries = b.dedupEntries(key, entries, stored)
+	entries, linked := b.linkedEntries(key, entries, stored)
 	defer func() {
 		if !failed {
+			b.storeLinked(key, linked, stored)
 			b.recordCopies(key, stored)
+			b.recordLinks(key, stored)
 		}
 	}()
 	var packed []*sourceEntry
@@ -1294,6 +1300,86 @@ func (b *backup) storeData(ctx context.Context, w, key, label string, entries []
 		return nil, true
 	}
 	return stored, false
+}
+
+// linkedEntries takes the files in entries whose data is stored as
+// another link to the same file out of entries, adding their rows to
+// stored, so the data of files with several links is stored once. It
+// returns the rest, and the files linked to another of entries, to be
+// recorded by storeLinked once that one is stored.
+func (b *backup) linkedEntries(key string, entries []*sourceEntry, stored map[string]Entry) (rest, linked []*sourceEntry) {
+	first := map[string]bool{}
+	for _, e := range entries {
+		if e.Type != TypeFile || e.HardLink == "" || e.Size <= 0 {
+			rest = append(rest, e)
+			continue
+		}
+		b.mu.Lock()
+		copyRow, ok := b.hardLinks[e.HardLink]
+		b.mu.Unlock()
+		switch {
+		case ok && copyRow.Size == e.Size:
+			stored[e.Name] = dedupRow(key, e, copyRow, b.runID)
+		case first[e.HardLink]:
+			linked = append(linked, e)
+		default:
+			first[e.HardLink] = true
+			rest = append(rest, e)
+		}
+	}
+	return rest, linked
+}
+
+// storeLinked adds the rows of the files in linked, whose data is another
+// link to a file stored with them, to stored.
+func (b *backup) storeLinked(key string, linked []*sourceEntry, stored map[string]Entry) {
+	if len(linked) == 0 {
+		return
+	}
+	byLink := map[string]Entry{}
+	for _, row := range stored {
+		if row.HardLink != "" && row.Type == TypeFile {
+			byLink[row.HardLink] = row
+		}
+	}
+	for _, e := range linked {
+		row, ok := byLink[e.HardLink]
+		if !ok || row.Size != e.Size {
+			// Not stored, so this link is left for the next run too.
+			continue
+		}
+		stored[e.Name] = dedupRow(key, e, fullRow(key, row), b.runID)
+	}
+}
+
+// recordLinks remembers where the files with several links in stored,
+// from the directory at key, are stored, for the other links elsewhere.
+func (b *backup) recordLinks(key string, stored map[string]Entry) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, row := range stored {
+		if row.HardLink == "" || row.Type != TypeFile || row.Size <= 0 {
+			continue
+		}
+		if b.hardLinks == nil {
+			b.hardLinks = map[string]Entry{}
+		}
+		if _, ok := b.hardLinks[row.HardLink]; !ok {
+			b.hardLinks[row.HardLink] = fullRow(key, row)
+		}
+	}
+}
+
+// fullRow returns row, from the index at key, with its location as the
+// full key of the object holding its data.
+func fullRow(key string, row Entry) Entry {
+	if row.DedupOf != "" {
+		row.Location = strings.TrimPrefix(path.Join("/", key, row.DedupOf), "/")
+	} else {
+		row.Location = joinRemote(key, row.Location)
+	}
+	row.DedupOf = ""
+	return row
 }
 
 // planData fills in stored as storeData would, without reading or

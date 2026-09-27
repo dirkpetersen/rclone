@@ -321,3 +321,56 @@ func TestListAndWalk(t *testing.T) {
 	err = Walk(context.Background(), f, "results", "", func(*Located) error { return nil })
 	assert.Error(t, err)
 }
+
+func TestHardLinks(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	writeFile(t, src, "a/x.dat", 3000)
+	writeFile(t, src, "a/big.bin", 9000)
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "b"), 0o755))
+	require.NoError(t, os.Link(filepath.Join(src, "a/x.dat"), filepath.Join(src, "b/y.dat")))
+	require.NoError(t, os.Link(filepath.Join(src, "a/x.dat"), filepath.Join(src, "a/x2.dat")))
+	require.NoError(t, os.Link(filepath.Join(src, "a/big.bin"), filepath.Join(src, "b/big2.bin")))
+	runBackup(t, src, dst, opt)
+
+	// The data of each file is stored once, and the rows say which are
+	// links to the same file.
+	a, b := readIndexFile(t, dst, "a"), readIndexFile(t, dst, "b")
+	assert.NotEmpty(t, a["x.dat"].HardLink)
+	assert.Equal(t, a["x.dat"].HardLink, b["y.dat"].HardLink)
+	assert.Equal(t, a["x.dat"].HardLink, a["x2.dat"].HardLink)
+	assert.NotEqual(t, a["x.dat"].HardLink, a["big.bin"].HardLink)
+	stored := func(rows ...Entry) (n int) {
+		for _, row := range rows {
+			if row.DedupOf == "" {
+				n++
+			}
+		}
+		return n
+	}
+	assert.Equal(t, 1, stored(a["x.dat"], a["x2.dat"], b["y.dat"]))
+	assert.Equal(t, 1, stored(a["big.bin"], b["big2.bin"]))
+
+	// Nothing changes on the next run.
+	l := runBackup(t, src, dst, opt)
+	assert.Zero(t, l.Stats.Added+l.Stats.Modified+l.Stats.MetaOnly)
+
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), newDst(t, dst), target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+	same := func(p, q string) bool {
+		pi, err := os.Stat(filepath.Join(target, p))
+		require.NoError(t, err)
+		qi, err := os.Stat(filepath.Join(target, q))
+		require.NoError(t, err)
+		return os.SameFile(pi, qi)
+	}
+	assert.True(t, same("a/x.dat", "b/y.dat"))
+	assert.True(t, same("a/x.dat", "a/x2.dat"))
+	assert.True(t, same("a/big.bin", "b/big2.bin"))
+	assert.False(t, same("a/x.dat", "a/big.bin"))
+}

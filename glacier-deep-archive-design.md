@@ -341,6 +341,7 @@ manifests.
 | `run` | `20260926T120000Z` | Run that wrote this version |
 | `tree_size`, `tree_files` | `52428800`, `913` | Directory rows only: total bytes and files in the whole subtree, so a browser can show folder sizes without walking |
 | `listing` | `index` | Directory rows only: `index` (has its own `gda-index.csv`) or `rollup` (listed in this index by path prefix) |
+| `hard_link` | `fd01:1a2b3c` | Files with more than one link: device and inode, the same for every link |
 | `action` | `add` | Changesets only: `add`, `modify`, `meta`, `delete`, `rebase` (unchanged content packed again) |
 
 Encoding: RFC 4180 CSV, UTF-8, header row, fields quoted when needed. This
@@ -1262,8 +1263,10 @@ Milestone 1 limits, each lifted by a later milestone:
 
 - changed standalone files always get `<name>.gda.<run>` keys; using bucket
   versioning when it is enabled comes later;
-- hard links are stored as separate files, and extended attributes are not
-  stored;
+- hard links were stored as separate files (lifted: files with several
+  links record their device and inode in `hard_link`, the data is stored
+  once per run, and restores link them again), and extended attributes
+  are not stored;
 - paths whose S3 key would exceed 1,024 bytes are reported and skipped rather
   than moved into an ancestor's pack;
 - the scan reads file metadata twice (once for subtree totals, once to

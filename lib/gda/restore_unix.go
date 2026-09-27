@@ -799,6 +799,8 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, ta
 		}
 	}
 
+	linkFiles(plan, done, failed, localPath, errorf, pattern)
+
 	// Symlinks and special files need no data.
 	for i := range plan {
 		e := &plan[i]
@@ -876,6 +878,51 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, ta
 		st.State = StateDone
 	}
 	return st
+}
+
+// linkFiles makes the restored files which were links to the same file
+// when backed up into links to the same file again.
+func linkFiles(plan []Entry, done, failed []bool, localPath func(*Entry) string, errorf func(string, ...any), pattern string) {
+	groups := map[string][]int{}
+	var order []string
+	for i := range plan {
+		e := &plan[i]
+		if e.Type != TypeFile || e.HardLink == "" || !done[i] {
+			continue
+		}
+		if groups[e.HardLink] == nil {
+			order = append(order, e.HardLink)
+		}
+		groups[e.HardLink] = append(groups[e.HardLink], i)
+	}
+	for _, link := range order {
+		members := groups[link]
+		first := localPath(&plan[members[0]])
+		firstInfo, err := os.Lstat(first)
+		if err != nil {
+			errorf("link %q: %v", plan[members[0]].Target, err)
+			continue
+		}
+		for _, i := range members[1:] {
+			p := localPath(&plan[i])
+			if info, err := os.Lstat(p); err == nil && os.SameFile(firstInfo, info) {
+				continue
+			}
+			// Link under a temporary name and rename over the copy, so
+			// a symlink at p is replaced rather than followed.
+			tmp := filepath.Join(filepath.Dir(p), strings.Replace(pattern, "*", "link", 1))
+			_ = os.Remove(tmp)
+			err := os.Link(first, tmp)
+			if err == nil {
+				err = os.Rename(tmp, p)
+			}
+			if err != nil {
+				_ = os.Remove(tmp)
+				errorf("link %q to %q: %v", plan[i].Target, plan[members[0]].Target, err)
+				failed[i], done[i] = true, false
+			}
+		}
+	}
 }
 
 // tempPattern names the temporary files restore id writes into.
