@@ -94,7 +94,8 @@ tier would cost and how long it would take, broken down into retrieval,
 restore requests, the temporary restored copy, download requests and
 egress. !--egress-path! and !--egress-waiver! say how downloads are
 charged, and !--prices! replaces the built in price table, which holds
-AWS list prices as of the date it shows. !--max-cost! refuses to start a
+AWS list prices as of the date it shows; !rclone gda prices! writes a
+current one. !--max-cost! refuses to start a
 restore whose estimate is higher, counting egress only without a waiver.
 
 With !--json! the estimate and the progress are printed as JSON for

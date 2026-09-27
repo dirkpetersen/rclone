@@ -873,7 +873,9 @@ total monthly AWS bill.
     temporary storage and egress tiers.
   - It ships with defaults, can be overridden per destination, for example
     for negotiated rates or Ceph (where most items are zero), and can be
-    refreshed from the AWS Price List API.
+    refreshed from the AWS Price List bulk files with `rclone gda prices`.
+    Those files don't list Deep Archive restore request fees or Direct
+    Connect egress, so those keep their table values.
   - Each estimate states the date of the prices it used.
 - **The network path defaults to internet egress** (decided 2026-09-26). A
   destination can override it with Direct Connect or same-region AWS, and
@@ -1218,7 +1220,7 @@ the local and memory backends and production uses S3 or Ceph.
 | 3. Compression | zstd in independent frames, skip heuristics, `stored_*` columns filled | Done |
 | 4. Deduplication | Dedup index per destination for files of 1 MiB or more | Done; shard compaction left for milestone 8 |
 | 5. Parallel workers | `--workers` on one host; `rclone gda plan`, `--run`/`--partition` and `rclone gda finish` across hosts | Done; resource limits per host left |
-| 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done; Price List API refresh left |
+| 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done, including `rclone gda prices` to refresh the table |
 | 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz | Done |
 | 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction, per-run catalog | Change runs, checkpoints, dedup compaction and the catalog (as `.csv.zst`) done; local index cache, catalog compaction, rebasing and garbage collection left |
 
