@@ -862,10 +862,62 @@ Archive, an on-premises Ceph RGW bucket, or both (decided 2026-09-26).
   indexes (large RGW buckets need their indexes resharded), and less wasted
   space, because each small object is padded to Ceph's minimum allocation
   size, with more padding under erasure coding.
-- **Protection without versioning:** backup runs only need PUT, GET and LIST.
-  Their credentials get no delete permission, and garbage collection runs
+- **Protection without versioning:** backup runs don't need to delete
+  anything (see [Access rights](#access-rights-and-bucket-rules)), so
+  their credentials get no delete permission, and garbage collection runs
   with separate credentials. Protection against overwrites by a compromised
   key needs conditional writes, which still have to be checked on Ceph.
+
+### Access rights and bucket rules
+
+Each command needs these S3 actions on the bucket (`s3:ListBucket`,
+`s3:GetBucketVersioning`) and its objects (the rest):
+
+| Command | Always | In a versioned bucket, also |
+|---|---|---|
+| `backup`, `plan`, `finish` | `ListBucket`, `GetBucketVersioning`, `GetObject`, `PutObject`, `AbortMultipartUpload`; `DeleteObject` optional | `DeleteObjectVersion` optional |
+| `gc` reporting, `ls`, `find`, `check`, the `gda` backend | `ListBucket`, `GetObject` | `GetObjectVersion` |
+| `restore` | `ListBucket`, `GetObject`, `PutObject` (the saved plan under `_gda/restores`), `RestoreObject` | `GetObjectVersion` |
+| `gc --delete-orphans`, `gc --delete-expired` | as `backup`, plus `DeleteObject` | `ListBucketVersions`, `DeleteObjectVersion` |
+
+Backups delete only their own bookkeeping, and cope without the right to:
+
+- the lock is marked released instead of removed, so the next run
+  doesn't wait for it to time out;
+- the rebase marks `gc --compact` leaves are emptied instead of removed;
+- merging the dedup index files is left to the next `gc` which deletes
+  anything, as merged files which can't be removed would pile up;
+- an upload which fails its check, or of a file which changed while it
+  was read, stays behind for `gc --delete-orphans`, or in a versioned
+  bucket as the key's current version, which no index refers to.
+
+So backups can run with credentials which can't delete anything, and
+`gc` with separate ones. Set `no_check_bucket = true` on the remote for
+credentials which can't create buckets.
+
+In a versioned bucket, deleting a key only hides its data behind a
+delete marker, still billed. So `gc` deletes versions: the one a row
+names, or else the key's only version, or else the one stored before
+versioning was enabled. It leaves a key with several later versions and
+no row naming one alone, and reports it.
+
+Bucket rules which suit GDA:
+
+- **Versioning** keeps every version of standalone files and indexes.
+  Every run rewrites the indexes of the directories it changed, so their
+  earlier versions accumulate: a lifecycle rule expiring noncurrent
+  versions after N days removes them. The same rule expires earlier
+  versions of standalone files, which is how history is kept in a
+  versioned bucket, so N has to be as long as the history to keep, and
+  `gc --keep-history` with the same period records the cutoff, so that
+  `--at` refuses times before it. With Deep Archive, N should be at
+  least 180 to avoid early deletion charges.
+- **Delete marker and multipart cleanup:** lifecycle rules removing
+  expired delete markers and aborting incomplete multipart uploads after
+  a few days keep leftovers from failed runs from being billed.
+- **Object Lock** works with backups, as they never need to delete a
+  locked version. Its retention has to end before `gc --delete-expired`
+  removes data, so it should be shorter than the history kept.
 
 ## Restore
 

@@ -46,8 +46,9 @@ Section references such as "plan §10.7" point into `rclone-plan.md`.
   filters, missing when this was first drafted, now work.
 - The largest risks are maturity (the code was written over two days and
   has not run at CGRB scale), the not yet waited-out AWS restore of a
-  noncurrent Deep Archive version, and how GDA's deletes interact with the
-  planned IAM deny list, Object Lock and lifecycle rules on `osu-drpro`.
+  noncurrent Deep Archive version, and settling the IAM deny list, Object
+  Lock and lifecycle rules on `osu-drpro`. The design doc now lists the S3
+  actions each command needs, and backups work without any delete right.
 - Deep Archive restores still take 12 to 48 hours. The local ZFS copy
   that DR Pro keeps today remains the fast restore path, so the
   recommended shape is plan topology (c): rsync to ZFS as now, then GDA
@@ -243,8 +244,8 @@ rclone-gda closes it: **Closed** (fully, mostly, partly, or in code only),
 | Email report INFO/NOTICE/WARNING | Wrapper; stderr contract breaks (§5.5) | Wrapper | Remains | rclone logging still goes to stderr, so plan §5.5 applies. `rclone gda backup` does exit non-zero when a run had errors (`lib/gda/backup.go`), unlike `drpro.bash` bug B7. |
 | Destination capacity (`df`, thresholds, `backup2du.bash`) | N/A on S3 | N/A on S3 | | Replace with cost reporting and AWS Budgets. `gda gc` reports stored, live and historical data. |
 | Detecting a backup that stopped (§15.2) | Gap | Gap | Remains | A status job can read the newest run under `_gda/runs/` per GDA root, as well as the local LOG trees. |
-| Credentials and blast radius (§15.4) | Deny list proposed | Partly | New conflict | Backup runs never overwrite committed data, but they do delete: the `_gda/lock` object at the end of a run, uploads that fail their MD5 check (`lib/gda/dest.go`), and a standalone upload whose source changed while being read, which in a versioned bucket removes that version (`lib/gda/backup.go`). `gc --delete-expired` and `--delete-orphans` delete by design. This conflicts with denying `DeleteObjectVersion` to `backup2`. |
-| Object Lock and lifecycle on `osu-drpro` (§0, §10.3) | Planned | Partly | New | Every run rewrites `gda-index.csv` of each changed directory and the lock object, so a versioned bucket keeps small noncurrent STANDARD versions. A lifecycle expiry of noncurrent versions would remove old standalone versions without recording a history cutoff, so a restore `--at` an older run would fail part way instead of being refused. |
+| Credentials and blast radius (§15.4) | Deny list proposed | Covered | Closed | Backup runs never overwrite committed data and cope without any delete right: the lock is marked released instead of removed, rebase marks are emptied, merging the dedup index is left to `gc`, and failed uploads stay for `gc` to remove (tested on AWS with a bucket policy denying `DeleteObject` and `DeleteObjectVersion`). `gc --delete-expired` and `--delete-orphans` delete by design, so they run under a separate identity. The design doc's "Access rights and bucket rules" lists the actions per command. |
+| Object Lock and lifecycle on `osu-drpro` (§0, §10.3) | Planned | Partly | New | Every run rewrites `gda-index.csv` of each changed directory and the lock object, so a versioned bucket keeps small noncurrent STANDARD versions. A lifecycle expiry of noncurrent versions would remove old standalone versions without recording a history cutoff, so a restore `--at` an older run would fail part way instead of being refused; pair it with `gc --keep-history` of the same period. In a versioned bucket `gc` deletes the versions it removes, not just the keys, so expired data stops being billed. Object Lock retention must end before `gc` removes data. |
 | Reports site (`rsynclogs.bash`) | Broken today (§12) | Broken today | Remains | Unrelated to the engine; fix as plan Phase 0b. |
 | Tool pinning and support (§15.6) | Pin 1.75.0 | Fork build | New | GDA exists only in the fork (commands annotated `v1.76`), format version 1. |
 
@@ -254,7 +255,7 @@ rclone-gda closes it: **Closed** (fully, mostly, partly, or in code only),
 | --- | --- | --- | --- | --- |
 | 1 | GDA is new and unproven at CGRB scale | The code was written on 2026-09-26 and 27 (90 commits on `gda` since `master`). Measured runs are 100,000 files locally and against S3. The 10% cloud target is about 369M files. | Pilot one lab (below). Run a full `--dry-run` over a real lab tree to measure time and memory. Pin one fork build for production. | rclone-gda, operational |
 | 2 | Restoring a noncurrent Deep Archive version hasn't been waited out on AWS | Plan §11.5's top risk. The same path worked on AWS for a noncurrent GLACIER version with Expedited retrieval; Deep Archive differs only in the retrieval tier and wait. | Plan Phase 0d on `osu-drpro-scratch`: back up a large file, change it twice, then `rclone gda restore --at` the middle run with Bulk and resume it after 48 hours. | rclone-gda test |
-| 3 | IAM, Object Lock and lifecycle don't yet fit GDA | Backup runs delete the lock and failed uploads; `gc` deletes expired data. A deny on `DeleteObjectVersion` or a governance retention would make these fail. | List the exact S3 actions `backup` and `gc` need. Use two identities: backup (no `DeleteObjectVersion`, if GDA can live with leftover failed uploads) and a separate gc identity. Choose one retention mechanism: `gc --keep-history` rather than a noncurrent-version lifecycle on data. | rclone-gda, AWS setup |
+| 3 | IAM, Object Lock and lifecycle to set up | Backups now need no delete right, and the design doc lists the actions per command, but the policies and rules for `osu-drpro` aren't written. | Two identities: backup (no `DeleteObject` or `DeleteObjectVersion`) and gc. A lifecycle rule expiring noncurrent versions after the history period, with `gc --keep-history` of the same period; delete marker and incomplete multipart cleanup; Object Lock retention shorter than the history kept. | AWS setup |
 | 4 | No reporting or alerting for the cloud stage | A GDA failure after the INFO email is invisible (plan §15.1), and absent runs raise nothing (§15.2). | Wrapper writes `s3-*.txt` LOG files from the ledger, adds a `CLOUD :` block to the email, maps a non-zero exit to WARNING, and a status job checks `_gda/runs/`. `gda backup --ledger-file` writes the outcome and the run's ledger locally as JSON for the wrapper to read. | Wrapper |
 | 5 | Change runs need a high-water mark | A failed `--changes-from` run isn't retried by the next night's `zfs diff`. A change list with no paths below a source is fine: `gda backup` makes no run and succeeds (outcome `no changes` in `--ledger-file`), so one `zfs diff` can feed every source on a dataset. | Keep the last snapshot whose GDA runs all succeeded and diff from it; listing paths again is harmless, as GDA compares them with the index. Schedule a full run (no `--changes-from`) monthly or quarterly. | Wrapper |
 | 6 | Filter rules need translating and testing | `gda backup` now takes rclone's filter flags, but rsync-style `exclude.txt` rules anchored at `/` must be rewritten per source. | Translate per source and test that each rule excludes a fixture (plan §5.4's lesson). | Wrapper |
@@ -372,9 +373,8 @@ rsync local stage stays in every case.
 
 1. Can AWS restore a noncurrent DEEP_ARCHIVE version through GDA's new
    `RequestRestore`, and does `gda check --at` read it (rank 2)?
-2. Which S3 actions do `gda backup`, `gda restore` (it writes
-   `_gda/restores/<id>.csv`) and `gda gc` need, and can backup runs work
-   without `DeleteObjectVersion` on an Object Lock bucket?
+2. Answered: the design doc's "Access rights and bucket rules" lists the
+   S3 actions per command, and backup runs work without any delete right.
 3. Do the NFS mounts on `backup2` expose POSIX or NFSv4 ACLs and SELinux
    labels, and does the rsync copy on ZFS keep them (it doesn't today,
    without `-A`/`-X`)? If not, `--xattrs` on the cascade adds nothing.

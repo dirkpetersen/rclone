@@ -226,7 +226,7 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	ledger, err = b.finishLedger(ctx, ledger)
 	b.finishCache(ctx)
 	if b.dedup != nil {
-		if cErr := compactDedup(ctx, b.d, b.runID); cErr != nil {
+		if cErr := compactDedup(ctx, b.d, b.runID, false); cErr != nil {
 			fs.Errorf(nil, "gda: compact dedup index: %v", cErr)
 		}
 	}
@@ -535,6 +535,7 @@ type lockInfo struct {
 	Started   time.Time
 	Refreshed time.Time     // when the run last showed it is still going
 	Timeout   time.Duration // the holder's LockTimeout
+	Released  bool          `json:",omitempty"` // the run has finished, but couldn't remove the lock
 }
 
 // age returns how long ago the run holding the lock last refreshed it.
@@ -559,7 +560,7 @@ func (b *backup) lock(ctx context.Context, host string) error {
 	data, err := b.d.get(ctx, lockKey)
 	if err == nil {
 		var held lockInfo
-		if jsonErr := json.Unmarshal(data, &held); jsonErr == nil {
+		if jsonErr := json.Unmarshal(data, &held); jsonErr == nil && !held.Released {
 			age := held.age()
 			if age < max(b.opt.LockTimeout, held.Timeout) {
 				return fmt.Errorf("destination is locked by run %s on %s (pid %d) since %s", held.RunID, held.Host, held.PID, held.Started.Format(time.RFC3339))
@@ -675,8 +676,17 @@ func (b *backup) unlock(ctx context.Context) {
 	if err == nil {
 		err = o.Remove(ctx)
 	}
+	if err == nil {
+		return
+	}
+	// Credentials for backups may not be allowed to delete anything.
+	fs.Infof(nil, "gda: can't remove the lock, so marking it released: %v", err)
+	held = lockInfo{RunID: b.runID, Refreshed: time.Now().UTC(), Released: true}
+	if data, err = json.Marshal(held); err == nil {
+		err = b.d.putBytes(ctx, lockKey, data, b.opt.MetaTier)
+	}
 	if err != nil {
-		fs.Errorf(nil, "gda: failed to remove lock: %v", err)
+		fs.Errorf(nil, "gda: failed to release lock: %v", err)
 	}
 }
 

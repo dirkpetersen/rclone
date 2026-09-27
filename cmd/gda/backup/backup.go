@@ -305,6 +305,10 @@ behind, and the next run takes it over once it is older than
 !--lock-timeout! (default 24 hours); for nightly runs, 2 hours is
 enough, as a running run refreshes its lock.
 
+Backups can run with credentials which can't delete anything: the lock
+is then marked released rather than removed, and merging the dedup index
+files is left to !rclone gda gc!.
+
 rclone's filter flags, such as !--exclude!, !--exclude-from!,
 !--include! and !--exclude-if-present!, leave files and directories out.
 Their patterns are matched against paths relative to the source, so a

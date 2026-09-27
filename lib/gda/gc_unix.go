@@ -203,7 +203,18 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		// A directory that couldn't be read may hold references.
 		return r.GCReport, errors.New("not removing anything as the tree couldn't be read in full")
 	}
+	versioned := false
+	if opt.DeleteOrphans || opt.DeleteExpired {
+		var err error
+		if versioned, err = isVersioned(ctx, dst); err != nil {
+			return r.GCReport, fmt.Errorf("check bucket versioning: %w", err)
+		}
+	}
 	if opt.DeleteOrphans {
+		stale := map[string]bool{}
+		for _, o := range r.StaleIndexes {
+			stale[o.Key] = true
+		}
 		for _, o := range append(r.Orphans, r.StaleIndexes...) {
 			if b.isStopped() {
 				// Another run may be writing objects which look like orphans.
@@ -223,9 +234,16 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 				fs.Logf(o.Key, "Not deleting as --dry-run is set")
 				continue
 			}
-			obj, err := dst.NewObject(ctx, o.Key)
-			if err == nil {
-				err = obj.Remove(ctx)
+			var err error
+			if stale[o.Key] {
+				// Earlier versions of an index are left to the bucket's
+				// lifecycle rules.
+				var obj fs.Object
+				if obj, err = dst.NewObject(ctx, o.Key); err == nil {
+					err = obj.Remove(ctx)
+				}
+			} else {
+				err = removeData(ctx, dst, versioned, o.Key)
 			}
 			if err != nil {
 				r.errorf("remove %q: %v", o.Key, err)
@@ -235,7 +253,12 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		}
 	}
 	if opt.DeleteExpired && r.HistoryFrom != "" {
-		r.deleteExpired(ctx, d, b)
+		r.deleteExpired(ctx, d, b, versioned)
+	}
+	if b != nil && !b.isStopped() {
+		if err := compactDedup(ctx, d, b.runID, true); err != nil {
+			r.errorf("merge dedup index: %v", err)
+		}
 	}
 	if len(r.Errors) > 0 {
 		return r.GCReport, fmt.Errorf("gc finished with %d errors", len(r.Errors))
@@ -267,7 +290,7 @@ func (r *gcScan) markCompactable(ctx context.Context, d *dest) error {
 // deleteExpired removes the expired data, records from which run history
 // is kept, and takes the removed objects out of the dedup index, so no
 // later run refers to them.
-func (r *gcScan) deleteExpired(ctx context.Context, d *dest, b *backup) {
+func (r *gcScan) deleteExpired(ctx context.Context, d *dest, b *backup, versioned bool) {
 	if d.dryRun {
 		for _, o := range r.Expired {
 			fs.Logf(o.Key, "Not deleting as --dry-run is set")
@@ -285,10 +308,7 @@ func (r *gcScan) deleteExpired(ctx context.Context, d *dest, b *backup) {
 			r.errorf("stopped removing expired data as the destination lock was lost")
 			break
 		}
-		obj, err := newDataObject(ctx, d.f, o.Key)
-		if err == nil {
-			err = obj.Remove(ctx)
-		}
+		err := removeData(ctx, d.f, versioned, o.Key)
 		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
 			r.errorf("remove %q: %v", o.Key, err)
 			continue

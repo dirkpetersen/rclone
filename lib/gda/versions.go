@@ -3,6 +3,8 @@ package gda
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/rclone/rclone/fs"
@@ -26,6 +28,13 @@ type versionedFs interface {
 type versionedObject interface {
 	// VersionID returns the ID of the object's version, or "".
 	VersionID() string
+}
+
+// versionLister is a backend which can list the versions of an object.
+type versionLister interface {
+	// ObjectVersionIDs returns the IDs of the versions of the object at
+	// remote, leaving out delete markers.
+	ObjectVersionIDs(ctx context.Context, remote string) ([]string, error)
 }
 
 // restorableObject is an archived object whose restore can be requested
@@ -78,4 +87,39 @@ func isVersioned(ctx context.Context, f fs.Fs) (bool, error) {
 		return false, nil
 	}
 	return vf.IsVersioned(ctx)
+}
+
+// removeData deletes the data a reference made by versionKey refers to.
+// Deleting a key in a versioned bucket only hides its data behind a
+// delete marker, so there the version itself is deleted: the one the
+// reference names, or else the key's only version, or else the one
+// stored before versioning was enabled, which is the one a reference
+// without a version refers to when a key has several.
+func removeData(ctx context.Context, f fs.Fs, versioned bool, ref string) error {
+	key, version := splitVersionKey(ref)
+	if version == "" && versioned {
+		vl, ok := f.(versionLister)
+		if !ok {
+			return errors.New("the destination can't list object versions")
+		}
+		ids, err := vl.ObjectVersionIDs(ctx, key)
+		if err != nil {
+			return err
+		}
+		switch {
+		case len(ids) == 0:
+			return fs.ErrorObjectNotFound
+		case len(ids) == 1:
+			version = ids[0]
+		case slices.Contains(ids, "null"):
+			version = "null"
+		default:
+			return fmt.Errorf("not removing it, as it has %d versions and none was stored before versioning was enabled", len(ids))
+		}
+	}
+	o, err := newDataObject(ctx, f, versionKey(key, version))
+	if err != nil {
+		return err
+	}
+	return o.Remove(ctx)
 }
