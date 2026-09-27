@@ -741,6 +741,23 @@ Archive, an on-premises Ceph RGW bucket, or both (decided 2026-09-26).
 Without the GDA tool: download the index, restore the named packs with the
 AWS CLI, then `tar xf`.
 
+### Command behaviour (decided 2026-09-26)
+
+- **Submit, exit, re-run to fetch.** The first run of `rclone gda restore`
+  plans the restore, requests it, saves the plan as
+  `_gda/restores/<id>.csv` (the entries, their packs or objects, and the
+  target paths) and exits. Running the same command again, or
+  `rclone gda restore --resume <id>`, fetches whatever is ready and reports
+  what is still being restored. It is safe to run from cron, and Motuz
+  polls it the same way from a Celery job.
+- **Existing files at the target:** files whose size and MD5 match are
+  skipped. If any differ, the restore stops with a list of them unless
+  `--overwrite` is given.
+- **Metadata:** permissions and modification times are always restored.
+  Owner and group are restored only when running as root, by name first and
+  by numeric ID if the name doesn't exist; setuid and setgid bits likewise
+  only as root.
+
 ## Cost estimates before restoring or copying out
 
 Before any restore or copy out of Deep Archive, the user sees what it will
@@ -1098,6 +1115,12 @@ Decided on 2026-09-26:
 | Egress path | Internet egress by default; destinations can override |
 | Egress waiver | Configured per destination; both totals shown; no 15% cap check |
 | Prices | Bundled price table, overridable per destination, refreshable from the AWS Price List API |
+| Restore flow | Submit and exit; re-run or `--resume <id>` to fetch what is ready |
+| Existing files on restore | Skip identical files; stop on differing files unless `--overwrite` |
+| Restored metadata | Mode and mtime always; owner, group and setuid/setgid only as root |
+| Source access | Direct POSIX reads; destinations through rclone backends |
+| First milestone | Core backup, single process (implemented in `38f260d8f`) |
+| Deduplication scope | Within each lab's bucket |
 
 ### First step: upstream S3 fixes
 
@@ -1119,9 +1142,3 @@ In order, smallest and most clearly a bug first:
 6. **A guard against overwriting or deleting archived objects**, modelled on
    azureblob's `archive_tier_delete`. This is a new feature, so discuss it
    upstream in an issue first.
-
-## Open questions
-
-1. **Deduplication across labs:** deduplicate only within each lab's bucket
-   (the default here), or across all buckets, accepting that one lab's
-   restores can depend on another lab's bucket?
