@@ -136,6 +136,8 @@ type backup struct {
 	newDirs map[string]bool // for change runs, directories new since the last run
 
 	dedup *dedupIndex // stored copies, nil if not deduplicating
+
+	catalog *catalogWriter // this run's catalog, nil for --dry-run
 }
 
 // stop stops the run after the directory in progress.
@@ -235,6 +237,11 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 			return nil, nil, err
 		}
 	}
+	if !ci.DryRun {
+		if b.catalog, err = newCatalogWriter(opt.TempDir); err != nil {
+			return nil, nil, fmt.Errorf("create catalog: %w", err)
+		}
+	}
 	if b.opt.RootLabel == "" {
 		// The last element of the destination path, or "root" when the
 		// destination is a bucket or file system root.
@@ -273,6 +280,9 @@ func (b *backup) close() {
 	if b.enc != nil {
 		_ = b.enc.Close()
 	}
+	if b.catalog != nil {
+		b.catalog.remove()
+	}
 }
 
 // chooseRunID makes sure the run ID isn't shared with a run which
@@ -310,6 +320,13 @@ func (b *backup) finishLedger(ctx context.Context, ledger *Ledger) (*Ledger, err
 		if err := b.dedup.save(ctx, b.d, b.runID, b.opt.Worker); err != nil {
 			b.errorf("write dedup index: %v", err)
 		}
+	}
+	if b.catalog != nil {
+		key := joinRemote(MetaDir, "catalog", "runs", b.runID, b.opt.Worker+".csv.zst")
+		if err := b.catalog.finish(ctx, b.d, key); err != nil {
+			b.errorf("write catalog: %v", err)
+		}
+		b.catalog = nil
 	}
 	ledgerKey := joinRemote(MetaDir, "runs", b.runID, b.opt.Worker+".json")
 	if err := b.d.putBytes(ctx, ledgerKey, data, b.opt.MetaTier); err != nil {
@@ -812,6 +829,11 @@ func (b *backup) commitDir(ctx context.Context, w, rel, key string, prevEntries 
 			return false
 		}
 		b.count(func(s *Stats) *int64 { return &s.MetaObjects }, 1)
+		if b.catalog != nil {
+			if err := b.catalog.add(key, changes); err != nil {
+				b.errorf("catalog: %v", err)
+			}
+		}
 	}
 	// Retire before writing this index: if that fails, the previous index
 	// still lists the subdirectories, so the next run retires them again.
