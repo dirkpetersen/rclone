@@ -60,6 +60,12 @@ func (b *backup) processItems(ctx context.Context, items []childDir) {
 				children := b.processDir(ctx, w, item.rel, item.key, b.isRollupRoot(item.rel))
 				if !item.shallow {
 					for _, child := range children {
+						if child.unrolled && b.dirty != nil {
+							// A change run only has totals for this
+							// subtree, so it scans it before indexing it.
+							b.summarize(child.rel, nil)
+							b.markNew(child.rel)
+						}
 						if b.wanted(child.rel) {
 							q.push(child)
 						}

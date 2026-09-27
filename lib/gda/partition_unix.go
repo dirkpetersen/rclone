@@ -195,8 +195,9 @@ func (b *backup) childDirs(rel, key string) []partition {
 // from opt.
 //
 // A partition which didn't finish, or finished with errors, can be run
-// again with the same worker ID. Its objects are written under the same
-// names, replacing those of the earlier attempt.
+// again with the same worker ID. Each attempt names its objects with its
+// own suffix on the worker ID, such as -r2, so it never replaces what an
+// earlier attempt committed.
 func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options, runID string, index int) (*Ledger, error) {
 	d := &dest{f: dst, retries: 1}
 	data, err := d.get(ctx, runKey(runID, "plan.json"))
@@ -224,11 +225,16 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 	if err != nil {
 		return nil, err
 	}
-	if err := b.checkLedger(ctx, index); err != nil {
+	attempt, err := b.checkLedger(ctx, index)
+	if err != nil {
 		return nil, err
 	}
 	if err := b.claimPartition(ctx, index, ledger.Host); err != nil {
 		return nil, err
+	}
+	if attempt > 1 {
+		ledger.Attempt = attempt
+		b.opt.Worker = fmt.Sprintf("%s-r%d", b.opt.Worker, attempt)
 	}
 	defer b.keepLock(ctx)()
 	// A ledger without a finish time shows the partition is under way.
@@ -276,24 +282,29 @@ func isRunFile(name string) bool {
 }
 
 // checkLedger checks that the worker ID isn't used by another partition
-// of the run and that this partition hasn't finished already.
-func (b *backup) checkLedger(ctx context.Context, index int) error {
+// of the run and that this partition hasn't finished already. It returns
+// the number of this attempt at the partition.
+func (b *backup) checkLedger(ctx context.Context, index int) (attempt int, err error) {
 	data, err := b.d.get(ctx, runKey(b.runID, b.opt.Worker+".json"))
 	if errors.Is(err, fs.ErrorObjectNotFound) {
-		return nil
+		return 1, nil
 	}
 	if err != nil {
-		return fmt.Errorf("read run ledger: %w", err)
+		return 0, fmt.Errorf("read run ledger: %w", err)
 	}
 	var prev Ledger
 	if err := json.Unmarshal(data, &prev); err != nil || prev.Partition == nil || *prev.Partition != index {
-		return fmt.Errorf("worker ID %q is used by another partition of run %s; give each worker its own ID", b.opt.Worker, b.runID)
+		return 0, fmt.Errorf("worker ID %q is used by another partition of run %s; give each worker its own ID", b.opt.Worker, b.runID)
 	}
 	if !prev.Finished.IsZero() && prev.Stats.Errors == 0 {
-		return fmt.Errorf("partition %d of run %s has finished already", index, b.runID)
+		return 0, fmt.Errorf("partition %d of run %s has finished already", index, b.runID)
 	}
-	fs.Logf(nil, "gda: run %s: running partition %d again, started at %s", b.runID, index, prev.Started.Format(time.RFC3339))
-	return nil
+	attempt = max(prev.Attempt, 1) + 1
+	if attempt > maxAttempts {
+		return 0, fmt.Errorf("partition %d of run %s has been run %d times; plan a new run", index, b.runID, maxAttempts)
+	}
+	fs.Logf(nil, "gda: run %s: running partition %d again, attempt %d", b.runID, index, attempt)
+	return attempt, nil
 }
 
 // claimPartition records that this worker backs up partition index,
@@ -338,8 +349,8 @@ func (b *backup) checkClaim(ctx context.Context, index int) error {
 		return fmt.Errorf("read claim of partition %d: %w", index, err)
 	}
 	var held partitionClaim
-	if err := json.Unmarshal(data, &held); err != nil || held.Worker != b.opt.Worker ||
-		(b.claim != nil && (held.Host != b.claim.Host || held.PID != b.claim.PID || !held.Started.Equal(b.claim.Started))) {
+	if err := json.Unmarshal(data, &held); err != nil || b.claim == nil || held.Worker != b.claim.Worker ||
+		held.Host != b.claim.Host || held.PID != b.claim.PID || !held.Started.Equal(b.claim.Started) {
 		return fmt.Errorf("partition %d of run %s was taken by worker %q on %s", index, b.runID, held.Worker, held.Host)
 	}
 	return nil

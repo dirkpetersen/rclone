@@ -167,10 +167,30 @@ type Located struct {
 // ObjectKey returns the key of the object holding the entry's data,
 // which for a duplicate is the stored copy's.
 func (l *Located) ObjectKey() string {
+	if l.outsideRoot() {
+		return ""
+	}
 	if l.DedupOf != "" {
 		return strings.TrimPrefix(path.Join("/", l.IndexKey, l.DedupOf), "/")
 	}
 	return joinRemote(l.IndexKey, l.Location)
+}
+
+// outsideRoot returns true if l refers to a stored copy above the root
+// the tree is read from, as a dedup_of reference can when the tree is
+// read from below the directory it was written from.
+func (l *Located) outsideRoot() bool {
+	if l.DedupOf == "" {
+		return false
+	}
+	p := path.Join(l.IndexKey, l.DedupOf)
+	return p == ".." || strings.HasPrefix(p, "../")
+}
+
+// errOutsideRoot returns the error for a file whose data is stored
+// above the root.
+func (l *Located) errOutsideRoot() error {
+	return fmt.Errorf("the data of %q is a copy of a file stored outside this GDA root; read it from a higher root", l.Path)
 }
 
 // relKey returns the path from the directory at key from to the object

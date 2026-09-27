@@ -727,8 +727,12 @@ coordinator with workers for large ones (decided 2026-09-26).
   so a second worker for the same partition, or a worker ID used twice, is
   refused, and `rclone gda finish` refuses to release the lock until every
   planned partition has a finished ledger. A partition whose worker crashed
-  or reported errors is run again with the same worker ID; it writes under
-  the same names, replacing the earlier attempt's objects.
+  or reported errors is run again with the same worker ID; each attempt
+  adds its own suffix to the worker ID in object names, such as `-r2`, so it
+  never replaces what an earlier attempt committed. User worker IDs are
+  letters, digits and `_`, so generated suffixes can't collide with them.
+  Claims are written and read back, which doesn't rule out two workers
+  starting the same partition at the same moment; conditional writes would.
 - **No locks in S3 per directory.** They would need conditional writes
   (`If-None-Match`), which AWS supports but which I haven't confirmed for
   Ceph RGW.

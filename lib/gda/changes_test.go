@@ -76,3 +76,30 @@ func TestBackupChanges(t *testing.T) {
 	_, err = Backup(context.Background(), src, f, changed)
 	assert.ErrorContains(t, err, "errors")
 }
+
+func TestBackupChangesUnrollsSubtree(t *testing.T) {
+	fakeClock(t)
+	src := parallelTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 16
+	runBackup(t, src, dst, opt)
+	require.Equal(t, ListingRollup, readIndexFile(t, dst, "d11/sub")["deep"].Listing)
+
+	// The rolled up subtree grows too big to roll up, so the directory
+	// below it, which the change list doesn't name, needs its own index.
+	writeFile(t, src, "d11/sub/new.dat", 100)
+	changed := opt
+	changed.Changes = []string{"d11/sub/new.dat"}
+	l := runBackup(t, src, dst, changed)
+	assert.Equal(t, int64(0), l.Stats.Errors)
+
+	full := filepath.Join(t.TempDir(), "lab")
+	runBackup(t, src, full, opt)
+	assert.Equal(t, indexRows(t, full), indexRows(t, dst))
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), newDst(t, dst), target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+}

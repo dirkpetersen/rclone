@@ -193,3 +193,60 @@ func TestBackupPartitioned(t *testing.T) {
 	assert.Contains(t, string(parts), ",dir,")
 	assert.Greater(t, strings.Count(string(parts), "\n"), 10)
 }
+
+func TestBackupPartitionRetry(t *testing.T) {
+	fakeClock(t)
+	src := parallelTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 16
+	f := newDst(t, dst)
+	runID, err := Plan(context.Background(), src, f, opt, 1)
+	require.NoError(t, err)
+	wopt := opt
+	wopt.Worker = "p0"
+	_, err = BackupPartition(context.Background(), src, f, wopt, runID, 0)
+	require.NoError(t, err)
+
+	// The partition is recorded as having failed after committing, and
+	// a file changes before it is run again.
+	ledgerPath := filepath.Join(dst, MetaDir, "runs", runID, "p0.json")
+	data, err := os.ReadFile(ledgerPath)
+	require.NoError(t, err)
+	var l Ledger
+	require.NoError(t, json.Unmarshal(data, &l))
+	l.Stats.Errors = 1
+	data, err = json.Marshal(l)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(ledgerPath, data, 0o644))
+	before := readIndexFile(t, dst, "d07")
+	writeFile(t, src, "d07/f1.dat", 99)
+
+	l2, err := BackupPartition(context.Background(), src, f, wopt, runID, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 2, l2.Attempt)
+	assert.Equal(t, "p0", l2.Worker)
+	_, err = FinishRun(context.Background(), f, runID, opt)
+	require.NoError(t, err)
+
+	// The retry wrote under new names, so what the first attempt
+	// committed is intact, and history agrees with the index.
+	index := readIndexFile(t, dst, "d07")
+	assert.Equal(t, before["f0.dat"], index["f0.dat"])
+	assert.Contains(t, index["f1.dat"].Location, ".p0-r2.")
+	checkStored(t, dst, "d07", index)
+	listed, err := List(context.Background(), f, "d07", runID)
+	require.NoError(t, err)
+	assert.Len(t, listed, len(index))
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+
+	// Worker IDs can't hold the separator of generated suffixes.
+	bad := opt
+	bad.Worker = "p0-r2"
+	_, err = BackupPartition(context.Background(), src, f, bad, runID, 0)
+	assert.ErrorContains(t, err, "invalid worker ID")
+}

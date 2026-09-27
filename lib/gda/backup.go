@@ -98,6 +98,7 @@ type Ledger struct {
 	Finished      time.Time
 	Options       Options
 	Partition     *int `json:",omitempty"` // index of the partition of a planned run
+	Attempt       int  `json:",omitempty"` // attempt at the partition, from 2 when it is run again
 	Stats         Stats
 	Errors        []string
 }
@@ -203,8 +204,8 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 	if opt.PackSize < opt.StandaloneMin {
 		return nil, nil, fmt.Errorf("pack size %d must be at least the standalone minimum %d", opt.PackSize, opt.StandaloneMin)
 	}
-	if opt.Worker == "" || strings.ContainsAny(opt.Worker, "./") {
-		return nil, nil, fmt.Errorf("invalid worker ID %q", opt.Worker)
+	if !workerIDRe.MatchString(opt.Worker) {
+		return nil, nil, fmt.Errorf("invalid worker ID %q: use letters, digits and _", opt.Worker)
 	}
 	if opt.Retries < 1 {
 		opt.Retries = 1
@@ -350,26 +351,12 @@ func (b *backup) putLedger(ctx context.Context, ledger *Ledger) error {
 	if err != nil {
 		return err
 	}
-	return b.d.putBytes(ctx, joinRemote(MetaDir, "runs", b.runID, b.opt.Worker+".json"), data, b.opt.MetaTier)
+	return b.d.putBytes(ctx, joinRemote(MetaDir, "runs", b.runID, ledger.Worker+".json"), data, b.opt.MetaTier)
 }
 
-// saveCatalog uploads the run's catalog. A partition run again gets a
-// catalog of its own, as the one from its earlier attempt holds the
-// changes of the directories that attempt committed.
+// saveCatalog uploads the run's catalog.
 func (b *backup) saveCatalog(ctx context.Context) error {
-	dir := joinRemote(MetaDir, "catalog", "runs", b.runID)
-	key := joinRemote(dir, b.opt.Worker+".csv.zst")
-	for attempt := 2; ; attempt++ {
-		exists, err := b.d.exists(ctx, key)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			break
-		}
-		key = joinRemote(dir, fmt.Sprintf("%s.%d.csv.zst", b.opt.Worker, attempt))
-	}
-	return b.catalog.finish(ctx, b.d, key)
+	return b.catalog.finish(ctx, b.d, joinRemote(MetaDir, "catalog", "runs", b.runID, b.opt.Worker+".csv.zst"))
 }
 
 // errorf records an error.
@@ -631,6 +618,7 @@ type dirChange struct {
 type childDir struct {
 	rel, key string
 	shallow  bool // process only this directory, not the ones below it
+	unrolled bool // was inside a rollup, so has no index of its own yet
 }
 
 // processDir backs up the directory at rel, whose destination key is key,
@@ -801,7 +789,8 @@ func (b *backup) compare(key string, prev map[string]Entry, cur []sourceEntry, k
 				}
 			}
 			if row.Listing == ListingIndex {
-				c.recurse = append(c.recurse, childDir{rel: e.rel, key: joinRemote(key, e.Name)})
+				unrolled := had && p.Type == TypeDir && p.Listing == ListingRollup
+				c.recurse = append(c.recurse, childDir{rel: e.rel, key: joinRemote(key, e.Name), unrolled: unrolled})
 			}
 			if !stored {
 				c.index = append(c.index, row)
@@ -1402,6 +1391,11 @@ func (b *backup) retireIndex(ctx context.Context, w, key string) bool {
 	if err := b.d.writeEntries(ctx, joinRemote(key, changesetName(dirLabel(key, b.opt.RootLabel), b.runID, w)), changes, columns); err != nil {
 		b.errorf("write changeset of %q: %v", key, err)
 		return false
+	}
+	if b.catalog != nil {
+		if err := b.catalog.add(key, changes); err != nil {
+			b.errorf("catalog: %v", err)
+		}
 	}
 	if err := b.d.writeIndex(ctx, key, []Entry{}, b.runID); err != nil {
 		b.errorf("write index of %q: %v", key, err)

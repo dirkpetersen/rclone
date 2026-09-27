@@ -76,7 +76,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.FVarP(flagSet, &dedupMin, "dedup-min", "", "Store identical files at least this big once (off to disable)", "")
 	flags.StringVarP(flagSet, &opt.DataTier, "data-tier", "", opt.DataTier, "Storage class for packs and standalone files", "")
 	flags.StringVarP(flagSet, &opt.MetaTier, "meta-tier", "", opt.MetaTier, "Storage class for changesets, indexes and run files", "")
-	flags.StringVarP(flagSet, &opt.Worker, "worker", "", opt.Worker, "Worker ID used in pack names", "")
+	flags.StringVarP(flagSet, &opt.Worker, "worker", "", opt.Worker, "Worker ID used in pack names (letters, digits and _)", "")
 	flags.StringVarP(flagSet, &opt.TempDir, "temp-dir", "", opt.TempDir, "Directory for pack spool files (default system temp directory)", "")
 	flags.StringVarP(flagSet, &opt.RootLabel, "root-label", "", opt.RootLabel, "Name used for the top directory in pack names (default last element of the destination)", "")
 	flags.DurationVarP(flagSet, &opt.LockTimeout, "lock-timeout", "", opt.LockTimeout, "Take over a destination lock older than this", "")
@@ -160,7 +160,8 @@ which prints its run ID, run one !rclone gda backup --run ID --partition
 N! per worker, each with its own !--worker! ID of at most 16 bytes, and
 end it with !rclone gda finish!, which fails until every partition has
 finished. A partition which failed or didn't finish can be run again
-with the same !--worker! ID. For example with a Slurm job array:
+with the same !--worker! ID; the objects it writes then get a suffix
+such as !-r2!. For example with a Slurm job array:
 
     RUN=$(rclone gda plan /data s3:bucket/lab --partitions 20)
     sbatch --array=0-19 --wrap "rclone gda backup /data s3:bucket/lab \
