@@ -51,6 +51,7 @@ See the following for detailed instructions for
 - [Files.com](/filescom/)
 - [FTP](/ftp/)
 - [Gofile](/gofile/)
+- [GDA](/gda/) (read only view of GDA backups)
 - [Google Cloud Storage](/googlecloudstorage/)
 - [Google Drive](/drive/)
 - [Google Photos](/googlephotos/)
