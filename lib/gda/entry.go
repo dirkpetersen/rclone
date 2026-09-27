@@ -348,36 +348,50 @@ func writeColumns(w io.Writer, entries []Entry, cols []string) error {
 // ReadEntries reads CSV written by WriteEntries. Columns it doesn't know
 // are ignored so that files written by newer versions can still be read.
 func ReadEntries(r io.Reader) ([]Entry, error) {
+	entries := []Entry{}
+	err := readEntriesFunc(r, func(e *Entry) error {
+		entries = append(entries, *e)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// readEntriesFunc reads entries written by WriteEntries, calling fn for
+// each, so that a large file needn't be held in memory.
+func readEntriesFunc(r io.Reader, fn func(*Entry) error) error {
 	cr := csv.NewReader(r)
 	cr.ReuseRecord = true
 	header, err := cr.Read()
 	if errors.Is(err, io.EOF) {
-		return nil, errors.New("empty CSV: missing header row")
+		return errors.New("empty CSV: missing header row")
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 	header = append([]string(nil), header...)
 	cr.FieldsPerRecord = len(header)
-	entries := []Entry{}
 	for {
 		record, err := cr.Read()
 		if errors.Is(err, io.EOF) {
-			break
+			return nil
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 		e := NewEntry("", "")
 		for i, v := range record {
 			if err := e.setField(header[i], v); err != nil {
 				line, _ := cr.FieldPos(i)
-				return nil, fmt.Errorf("line %d: %w", line, err)
+				return fmt.Errorf("line %d: %w", line, err)
 			}
 		}
-		entries = append(entries, e)
+		if err := fn(&e); err != nil {
+			return err
+		}
 	}
-	return entries, nil
 }
 
 // encodeName returns name as valid UTF-8 without control characters,
