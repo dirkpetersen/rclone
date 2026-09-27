@@ -4,11 +4,15 @@ package gda
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/rclone/rclone/fs"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -157,4 +161,48 @@ func TestGCStaleIndexParts(t *testing.T) {
 	r, err = GC(context.Background(), f, GCOptions{})
 	require.NoError(t, err)
 	assert.Empty(t, r.StaleIndexes)
+}
+
+// secondReadFails fails the second read of an object.
+type secondReadFails struct {
+	fs.Fs
+	key   string
+	mu    sync.Mutex
+	reads int
+}
+
+func (f *secondReadFails) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	if remote == f.key {
+		f.mu.Lock()
+		f.reads++
+		n := f.reads
+		f.mu.Unlock()
+		if n == 2 {
+			return nil, errors.New("injected read failure")
+		}
+	}
+	return f.Fs.NewObject(ctx, remote)
+}
+
+func TestGCStaleIndexReadError(t *testing.T) {
+	fakeClock(t)
+	old := maxIndexRows
+	maxIndexRows = 2
+	t.Cleanup(func() { maxIndexRows = old })
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	for i := range 5 {
+		writeFile(t, src, fmt.Sprintf("d/f%d", i), 10)
+	}
+	runBackup(t, src, dst, opt)
+
+	// Without the table of contents nothing is taken to be stale.
+	f := &secondReadFails{Fs: newDst(t, dst), key: "d/" + IndexName}
+	r, err := GC(context.Background(), f, GCOptions{DeleteOrphans: true, LockTimeout: time.Hour})
+	assert.Error(t, err)
+	assert.Zero(t, r.Deleted)
+	entries, err := List(context.Background(), newDst(t, dst), "d", "")
+	require.NoError(t, err)
+	assert.Len(t, entries, 5)
 }

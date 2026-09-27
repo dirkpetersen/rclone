@@ -57,6 +57,9 @@ type dedupCopy struct {
 // md5sum isn't a hex MD5.
 func keyOf(md5sum string, size int64) (dedupKey, bool) {
 	k := dedupKey{size: size}
+	if len(md5sum) != 2*md5.Size {
+		return k, false
+	}
 	n, err := hex.Decode(k.md5[:], []byte(md5sum))
 	return k, err == nil && n == md5.Size
 }
@@ -181,7 +184,7 @@ func copyRow(k dedupKey, c dedupCopy) Entry {
 // write uploads every copy in the index to remote, through a temporary
 // file, as it can be large.
 func (idx *dedupIndex) write(ctx context.Context, d *dest, remote string) (err error) {
-	tmp, err := os.CreateTemp("", "gda-dedup-*.csv")
+	tmp, err := os.CreateTemp(d.tempDir, "gda-dedup-*.csv")
 	if err != nil {
 		return err
 	}

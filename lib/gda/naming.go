@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/rclone/rclone/fs"
 )
 
 // Names of objects GDA writes.
@@ -111,6 +113,17 @@ func joinRemote(elem ...string) string {
 // name for bucket based remotes, which makes the check conservative.
 func keyTooLong(rootPrefix, remote string) bool {
 	return len(joinRemote(rootPrefix, remote)) > maxKeyLength
+}
+
+// overridesRe matches the suffix rclone adds to the name of a remote
+// created with connection string overrides, such as s3{a1b2c3}.
+var overridesRe = regexp.MustCompile(`^(:?[\w. -]+)\{[^}]*\}:`)
+
+// destName returns the name of the destination f as the user gave it,
+// without the suffix rclone adds for connection string overrides, so
+// that tuning upload settings doesn't change which destination it is.
+func destName(f fs.Fs) string {
+	return overridesRe.ReplaceAllString(fs.ConfigString(f), "$1:")
 }
 
 // parentRel returns the parent of the "/" separated path rel, or "".

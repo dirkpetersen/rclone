@@ -41,6 +41,7 @@ type dest struct {
 	dryRun   bool
 	retries  int
 	cache    *indexCache // local copies of indexes, nil if not caching
+	tempDir  string      // directory for temporary files; "" for the system default
 }
 
 func (d *dest) info(remote string, size int64, modTime time.Time, md5sum, tier string) tieredInfo {

@@ -97,6 +97,8 @@ func Plan(ctx context.Context, srcRoot string, dst fs.Fs, opt Options, workers i
 	}
 	saved := b.opt
 	saved.IndexCache = ""
+	// Workers back up whole directories, not a change list.
+	saved.Changes = nil
 	planOpt, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		b.unlock(ctx)
@@ -454,7 +456,7 @@ func FinishRun(ctx context.Context, dst fs.Fs, runID string, opt Options) (*Ledg
 	if err != nil {
 		return nil, fmt.Errorf("list run %s: %w", runID, err)
 	}
-	merged := &Ledger{FormatVersion: FormatVersion, RunID: runID, Worker: "all", Destination: fs.ConfigString(dst)}
+	merged := &Ledger{FormatVersion: FormatVersion, RunID: runID, Worker: "all", Destination: destName(dst)}
 	done := map[int]string{} // worker by partition
 	for _, e := range entries {
 		name := path.Base(e.Remote())
