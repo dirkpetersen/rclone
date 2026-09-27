@@ -99,12 +99,18 @@ func TestBrowse(t *testing.T) {
 	// Directories carry the subtree totals.
 	entries, err = f.List(ctx, "")
 	require.NoError(t, err)
+	found := false
 	for _, e := range entries {
 		if d, ok := e.(fs.Directory); ok && d.Remote() == "results" {
+			found = true
 			assert.Equal(t, int64(12000), d.Size())
 			assert.Equal(t, int64(3), d.Items())
 		}
 	}
+	assert.True(t, found)
+	// Symlinks aren't shown, so aren't found either.
+	_, err = f.NewObject(ctx, "results/link")
+	assert.ErrorIs(t, err, fs.ErrorObjectNotFound)
 
 	// Files read back whole and in part, from packs and standalone.
 	for _, rel := range []string{"results/a.dat", "results/big.bin", "README.txt", "tiny/a/b.txt"} {
@@ -275,4 +281,103 @@ func TestBrowseRoots(t *testing.T) {
 	assert.Equal(t, "notes.txt", o.Remote())
 	assert.Equal(t, int64(7), o.Size())
 	assert.ErrorIs(t, o.Remove(ctx), errReadOnly)
+}
+
+func TestBrowseRetiredAndRenamed(t *testing.T) {
+	ctx := context.Background()
+	src := makeSource(t)
+	writeFile(t, src, "gone/sub/x.txt", 5)
+	writeFile(t, src, "100%.txt", 4)
+	dst := filepath.Join(t.TempDir(), "lab")
+	backup(t, src, dst)
+	f, err := fs.NewFs(ctx, ":gda:"+dst)
+	require.NoError(t, err)
+	entries, err := f.List(ctx, "")
+	require.NoError(t, err)
+	// A valid name containing "%" is shown as it is.
+	assert.Contains(t, names(t, entries), "100%.txt")
+	o, err := f.NewObject(ctx, "100%.txt")
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), o.Size())
+
+	// A deleted directory is gone, not an empty directory, even though
+	// its retired index is still there.
+	require.NoError(t, os.RemoveAll(filepath.Join(src, "gone")))
+	backup(t, src, dst)
+	f, err = fs.NewFs(ctx, ":gda:"+dst)
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(dst, "gone", "gda-index.csv"))
+	_, err = f.List(ctx, "gone")
+	assert.ErrorIs(t, err, fs.ErrorDirNotFound)
+	_, err = f.List(ctx, "gone/sub")
+	assert.ErrorIs(t, err, fs.ErrorDirNotFound)
+}
+
+func TestBrowseForeignIndexAndAt(t *testing.T) {
+	ctx := context.Background()
+	src := makeSource(t)
+	root := t.TempDir()
+	dst := filepath.Join(root, "lab")
+	first := backup(t, src, dst)
+	writeFile(t, src, "results/new.dat", 50)
+	backup(t, src, dst)
+
+	// A gda-index.csv which isn't GDA's doesn't hide its directory.
+	writeFile(t, root, "foreign/real.txt", 3)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "foreign", "gda-index.csv"), []byte("x,y\n1,2\n"), 0o644))
+	f, err := fs.NewFs(ctx, ":gda:"+root)
+	require.NoError(t, err)
+	entries, err := f.List(ctx, "foreign")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"foreign/gda-index.csv", "foreign/real.txt"}, names(t, entries))
+
+	// at takes an RFC 3339 time when quoted in a connection string.
+	start, err := libgda.ParseRunID(first)
+	require.NoError(t, err)
+	at := start.Add(500 * time.Millisecond).Format(time.RFC3339)
+	f, err = fs.NewFs(ctx, `:gda,at="`+at+`":`+dst)
+	require.NoError(t, err)
+	entries, err = f.List(ctx, "results")
+	require.NoError(t, err)
+	assert.NotContains(t, names(t, entries), "results/new.dat")
+}
+
+func TestBrowseTwoRemotes(t *testing.T) {
+	ctx := context.Background()
+	srcA, srcB := makeSource(t), t.TempDir()
+	writeFile(t, srcB, "only-in-b.txt", 5)
+	dstA, dstB := filepath.Join(t.TempDir(), "a"), filepath.Join(t.TempDir(), "b")
+	backup(t, srcA, dstA)
+	backup(t, srcB, dstB)
+	fA, err := fs.NewFs(ctx, ":gda:"+dstA)
+	require.NoError(t, err)
+	fB, err := fs.NewFs(ctx, ":gda:"+dstB)
+	require.NoError(t, err)
+	assert.NotEqual(t, fs.ConfigString(fA), fs.ConfigString(fB))
+	out := t.TempDir()
+	local, err := fs.NewFs(ctx, out)
+	require.NoError(t, err)
+	require.NoError(t, sync.CopyDir(ctx, local, fB, false))
+	assert.FileExists(t, filepath.Join(out, "only-in-b.txt"))
+	assert.NoFileExists(t, filepath.Join(out, "README.txt"))
+}
+
+func TestBrowseConcurrent(t *testing.T) {
+	ctx := context.Background()
+	src := makeSource(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	backup(t, src, dst)
+	f, err := fs.NewFs(ctx, ":gda:"+dst)
+	require.NoError(t, err)
+	errs := make(chan error, 20)
+	for i := range 20 {
+		go func() {
+			dirs := []string{"", "results", "tiny/a", "tiny"}
+			_, err := f.List(ctx, dirs[i%len(dirs)])
+			errs <- err
+		}()
+	}
+	for range 20 {
+		assert.NoError(t, <-errs)
+	}
 }

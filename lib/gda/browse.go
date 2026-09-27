@@ -8,8 +8,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rclone/rclone/fs"
+	"golang.org/x/sync/singleflight"
 )
 
 // browseCacheTime is how long a Browser keeps indexes and listings, so
@@ -23,9 +25,10 @@ type Browser struct {
 	at string
 
 	mu      sync.Mutex
-	t       *tree
+	indexes map[string][]Entry           // index rows by key, nil for no index
 	tiers   map[string]map[string]string // storage class by object key, by directory
 	expires time.Time
+	reads   singleflight.Group // index reads in progress, by key
 }
 
 // NewBrowser returns a Browser for the GDA trees below the root of f, as
@@ -38,24 +41,41 @@ func NewBrowser(f fs.Fs, at string) (*Browser, error) {
 	return &Browser{f: f, at: runID}, nil
 }
 
-// tree returns the tree to read, starting a fresh cache when the old
-// one has expired.
-func (b *Browser) tree() *tree {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.t == nil || time.Now().After(b.expires) {
-		b.t = newTree(&dest{f: b.f, retries: 1}, b.at)
+// resetExpired starts fresh caches when the old ones have expired. It
+// must be called with b.mu held.
+func (b *Browser) resetExpired() {
+	if b.indexes == nil || time.Now().After(b.expires) {
+		b.indexes = map[string][]Entry{}
 		b.tiers = map[string]map[string]string{}
 		b.expires = time.Now().Add(browseCacheTime)
 	}
-	return b.t
 }
 
 // entries returns the rows of the index at key, or nil if there is none.
-func (b *Browser) entries(ctx context.Context, t *tree, key string) ([]Entry, error) {
+// Concurrent reads of the same index are done once.
+func (b *Browser) entries(ctx context.Context, key string) ([]Entry, error) {
+	if key == "" && b.f.Features().BucketBased {
+		// Above the buckets there are no objects, so no index.
+		return nil, nil
+	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return t.entries(ctx, key)
+	b.resetExpired()
+	rows, ok := b.indexes[key]
+	b.mu.Unlock()
+	if ok {
+		return rows, nil
+	}
+	v, err, _ := b.reads.Do(key, func() (any, error) {
+		return newTree(&dest{f: b.f, retries: 1}, b.at).entries(ctx, key)
+	})
+	if err != nil {
+		return nil, err
+	}
+	rows = v.([]Entry)
+	b.mu.Lock()
+	b.indexes[key] = rows
+	b.mu.Unlock()
+	return rows, nil
 }
 
 // List returns the entries directly in dir, which is relative to the
@@ -63,20 +83,20 @@ func (b *Browser) entries(ctx context.Context, t *tree, key string) ([]Entry, er
 // case the caller should list the Fs itself. It returns
 // fs.ErrorDirNotFound if dir is in a GDA tree but doesn't exist in it.
 func (b *Browser) List(ctx context.Context, dir string) (entries []Located, ok bool, err error) {
-	t := b.tree()
 	dir = strings.Trim(dir, "/")
-	rows, err := b.entries(ctx, t, dir)
+	own, err := b.entries(ctx, dir)
 	if err != nil {
 		return nil, false, err
 	}
-	if rows != nil {
-		return children(rows, dir, ""), true, nil
+	if len(own) > 0 {
+		return children(own, dir, ""), true, nil
 	}
-	// A rolled up directory has no index of its own: it is listed in the
-	// index of the directory at the top of the rollup.
+	// With no index, or the empty one left when a directory is deleted,
+	// rolled up or replaced, the parent's row says what dir is. A rolled
+	// up directory is listed in the index at the top of its rollup.
 	for ancestor := dir; ancestor != ""; {
 		ancestor = parentRel(ancestor)
-		rows, err := b.entries(ctx, t, ancestor)
+		rows, err := b.entries(ctx, ancestor)
 		if err != nil {
 			return nil, false, err
 		}
@@ -89,22 +109,34 @@ func (b *Browser) List(ctx context.Context, dir string) (entries []Located, ok b
 		}
 		row, found := findEntry(rows, rel)
 		switch {
-		case !found:
+		case !found || !row.IsDir():
 			return nil, true, fs.ErrorDirNotFound
-		case !row.IsDir() || row.Listing != ListingRollup:
-			// Either not a directory, or a directory whose own index
-			// is missing: not something to present as GDA.
+		case row.Listing == ListingRollup:
+			return children(rows, ancestor, rel), true, nil
+		case own != nil:
+			// It has its own index, which is empty.
+			return nil, true, nil
+		default:
+			fs.Debugf(nil, "gda: %q should have an index but has none", dir)
 			return nil, false, nil
 		}
-		return children(rows, ancestor, rel), true, nil
+	}
+	if own != nil {
+		// An empty index with nothing above it.
+		return nil, true, nil
 	}
 	return nil, false, nil
 }
 
 // children returns the rows of the index at key directly below the
 // rolled up directory prefix, or directly in the index if prefix is "".
+//
+// Path is the name to show: the original name where it is valid UTF-8,
+// otherwise the encoded one, which is also used for names which would
+// show the same.
 func children(rows []Entry, key, prefix string) []Located {
 	var out []Located
+	shown := map[string]int{}
 	for _, e := range rows {
 		name := e.Name
 		if prefix != "" {
@@ -120,7 +152,17 @@ func children(rows []Entry, key, prefix string) []Located {
 		if e.NameEncoding == NameEncodingPercent {
 			local = localName(&e)
 		}
-		out = append(out, Located{Entry: e, IndexKey: key, Path: name, LocalPath: local})
+		show := name
+		if utf8.ValidString(local) {
+			show = local
+		}
+		shown[show]++
+		out = append(out, Located{Entry: e, IndexKey: key, Path: show, LocalPath: local})
+	}
+	for i := range out {
+		if shown[out[i].Path] > 1 {
+			out[i].Path = path.Base(out[i].Name)
+		}
 	}
 	return out
 }
@@ -132,8 +174,8 @@ func (b *Browser) Tiers(ctx context.Context, key string) (map[string]string, err
 	if !b.f.Features().GetTier {
 		return nil, nil
 	}
-	b.tree()
 	b.mu.Lock()
+	b.resetExpired()
 	tiers, ok := b.tiers[key]
 	b.mu.Unlock()
 	if ok {

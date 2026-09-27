@@ -37,8 +37,10 @@ To see a backup as it was at the end of an earlier run, set `at` to the
 run ID or a time:
 
 ```console
-rclone lsf ":gda,at=2026-09-01T00:00:00Z:s3:lab-bucket/lab"
+rclone lsf ':gda,at="2026-09-01T00:00:00Z":s3:lab-bucket/lab'
 ```
+
+A time has to be quoted in a connection string, as it contains `:`.
 
 To see the objects GDA stores rather than the files they hold, set
 `show_internals`.

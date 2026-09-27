@@ -231,6 +231,11 @@ func (d *dest) readIndex(ctx context.Context, dirKey string) ([]Entry, error) {
 		return nil, fmt.Errorf("read index of %q: %w", dirKey, err)
 	}
 	if !isTOC(data) {
+		if !looksLikeIndex(data) {
+			// Not one of ours, so the directory isn't a GDA one.
+			fs.Debugf(nil, "gda: ignoring %q which isn't a GDA index", joinRemote(dirKey, IndexName))
+			return nil, nil
+		}
 		entries, err := ReadEntries(bytes.NewReader(data))
 		if err != nil {
 			return nil, fmt.Errorf("parse index of %q: %w", dirKey, err)
@@ -302,4 +307,11 @@ func (d *dest) checkTier(ctx context.Context, remote, want string) error {
 		return fmt.Errorf("%q was stored as %s, not %s: remove storage_class from the destination remote's configuration", remote, got, want)
 	}
 	return nil
+}
+
+// looksLikeIndex returns true if data starts with the header of a GDA
+// index.
+func looksLikeIndex(data []byte) bool {
+	header, _, _ := bytes.Cut(data, []byte("\n"))
+	return bytes.HasPrefix(header, []byte("name,type,"))
 }
