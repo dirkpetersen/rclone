@@ -266,3 +266,46 @@ func TestGCExpireHistory(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, report.Failed(), "%+v", report)
 }
+
+func TestGCCompact(t *testing.T) {
+	fakeClock(t)
+	oldAge, oldDead := compactMinAge, compactMinDead
+	compactMinAge, compactMinDead = 0, 1
+	t.Cleanup(func() { compactMinAge, compactMinDead = oldAge, oldDead })
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	opt.PackSize = 64 * 1024
+	for _, name := range []string{"a", "b", "c", "keep"} {
+		writeFile(t, src, "d/"+name, 1000)
+	}
+	first := runBackup(t, src, dst, opt)
+	for _, name := range []string{"a", "b", "c"} {
+		writeFile(t, src, "d/"+name, 1001)
+	}
+	runBackup(t, src, dst, opt)
+	f := newDst(t, dst)
+	firstPack := "d/d.gda." + first.RunID + ".w01.001.tar"
+
+	// The first pack is mostly dead, so its directory is marked, and the
+	// next backup packs "keep" again.
+	r, err := GC(context.Background(), f, GCOptions{Compact: true})
+	require.NoError(t, err)
+	require.Len(t, r.Compactable, 1)
+	assert.Equal(t, firstPack, r.Compactable[0].Key)
+	l := runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(4), l.Stats.Rebased)
+	assert.NoFileExists(t, filepath.Join(dst, MetaDir, "rebase.csv"))
+	assert.NotEqual(t, firstPack, "d/"+readIndexFile(t, dst, "d")["keep"].Location)
+
+	// Once history from the rebase on is all that is kept, the old pack
+	// goes.
+	r, err = GC(context.Background(), f, GCOptions{KeepFrom: l.RunID, DeleteExpired: true, LockTimeout: time.Hour})
+	require.NoError(t, err)
+	assert.NoFileExists(t, filepath.Join(dst, filepath.FromSlash(firstPack)))
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+}

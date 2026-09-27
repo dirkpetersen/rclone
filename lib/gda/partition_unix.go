@@ -263,6 +263,9 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 		return nil, err
 	}
 	b.checkVersioned(ctx)
+	if b.rebaseDirs, err = readRebase(ctx, b.d); err != nil {
+		return nil, err
+	}
 	fs.Infof(nil, "gda: run %s: worker %d backing up %d partitions", runID, index, len(shallow)+len(trees))
 	var items []childDir
 	for _, p := range shallow {
@@ -523,6 +526,9 @@ func FinishRun(ctx context.Context, dst fs.Fs, runID string, opt Options) (*Ledg
 	}
 	b := &backup{d: d, runID: runID}
 	if err := b.checkRunLock(ctx); err == nil {
+		// Every partition has finished, so every marked directory has
+		// been packed again.
+		clearRebase(ctx, d)
 		if err := compactDedup(ctx, d, runID); err != nil {
 			fs.Errorf(nil, "gda: compact dedup index: %v", err)
 		}
