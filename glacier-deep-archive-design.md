@@ -91,9 +91,9 @@ What this means for the design:
    system](#profiling-a-file-system)).
 3. **The bytes sit in a few huge files.** Files over 4 GiB hold more than
    half the data in about 115,000 objects. For them, the number of multipart
-   parts matters more than packing: GDA uploads standalone files with large
-   parts (at least 512 MiB) instead of rclone's 5 MiB default (analysis,
-   gap 4).
+   parts matters more than packing: GDA uploads standalone files with
+   larger parts (64 MiB, set for S3 unless given) instead of rclone's
+   5 MiB default (analysis, gap 4).
 4. **Tiny directory trees need rolling up.** When a whole subtree holds only
    a few KB, one pack per directory level still costs one request per
    directory. See [Rolling up small subtrees](#rolling-up-small-subtrees).
@@ -116,7 +116,7 @@ small files a directory holds on average:
 | `standalone-min` | 64 MiB | Above it, a file's own PUT and overhead are at most about 2% of its 3-year storage cost, so packing gains little |
 | `pack-size` | 256 MiB | Rarely reached at these file sizes. It bounds temp space and the restore unit for directories with many mid-size files |
 | `rollup-max` | 16 MiB | Twice the 8 MB break-even where one PUT costs as much as 180 days of storage |
-| Standalone part size | at least 512 MiB | Cuts a 100 GiB upload from about 9,300 requests to about 200 |
+| Standalone part size | 64 MiB (set by `rclone gda backup` for S3 unless given) | Cuts a 100 GiB upload from about 20,500 requests to 1,600, with four parts of 256 MiB in memory per worker |
 
 All four are configurable. They should be revisited once a profile of the
 target file system exists.
@@ -810,7 +810,7 @@ run. Nothing shared is written by two processes.
 
 | Resource | Estimate for 15 workers | Control |
 |---|---|---|
-| Memory or local NVMe temp | About 30 GB: two 256 MiB packs in progress per worker, plus standalone uploads in 512 MiB parts, four at a time | Limits per worker and per host |
+| Memory or local NVMe temp | About 30 GB: two 256 MiB packs in progress per worker, plus standalone uploads in 64 MiB parts, four at a time | Limits per worker and per host |
 | CPU | MD5 plus zstd level 3 is roughly one core per 300 to 500 MB/s, so 15 busy workers need 32 or more cores | Number of workers from the CPU count |
 | Source file system | 15 workers scanning and reading at once load NFS servers and the Lustre metadata server | A throttle per source file system |
 | S3 request rates | S3 scales per key prefix; keys that mirror the directory tree spread well | rclone's pacer handles "slow down" responses |
