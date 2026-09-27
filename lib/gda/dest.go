@@ -56,29 +56,36 @@ func (d *dest) info(remote string, size int64, modTime time.Time, md5sum, tier s
 // put uploads the content from open to remote, retrying with a fresh
 // reader on failure.
 func (d *dest) put(ctx context.Context, remote string, size int64, modTime time.Time, md5sum, tier string, open func() (io.ReadCloser, error)) error {
+	_, err := d.putObject(ctx, remote, size, modTime, md5sum, tier, open)
+	return err
+}
+
+// putObject is put returning the uploaded object, which is nil for --dry-run.
+func (d *dest) putObject(ctx context.Context, remote string, size int64, modTime time.Time, md5sum, tier string, open func() (io.ReadCloser, error)) (fs.Object, error) {
 	if d.dryRun {
 		fs.Logf(remote, "Not uploading as --dry-run is set")
-		return nil
+		return nil, nil
 	}
 	var err error
 	for try := 1; try <= d.retries; try++ {
-		err = d.putOnce(ctx, remote, size, modTime, md5sum, tier, open)
+		var o fs.Object
+		o, err = d.putOnce(ctx, remote, size, modTime, md5sum, tier, open)
 		if err == nil || ctx.Err() != nil {
-			return err
+			return o, err
 		}
 		fs.Errorf(remote, "Upload failed (try %d/%d): %v", try, d.retries, err)
 	}
-	return err
+	return nil, err
 }
 
 // putOnce makes one upload attempt.
 //
 // TODO: each attempt is a new transfer in the stats, so retried uploads
 // are counted more than once.
-func (d *dest) putOnce(ctx context.Context, remote string, size int64, modTime time.Time, md5sum, tier string, open func() (io.ReadCloser, error)) (err error) {
+func (d *dest) putOnce(ctx context.Context, remote string, size int64, modTime time.Time, md5sum, tier string, open func() (io.ReadCloser, error)) (o fs.Object, err error) {
 	in, err := open()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tr := accounting.Stats(ctx).NewTransferRemoteSize(remote, size, nil, d.f)
 	defer func() {
@@ -86,8 +93,7 @@ func (d *dest) putOnce(ctx context.Context, remote string, size int64, modTime t
 	}()
 	acc := tr.Account(ctx, in)
 	defer fs.CheckClose(acc, &err)
-	_, err = d.f.Put(ctx, acc, d.info(remote, size, modTime, md5sum, tier))
-	return err
+	return d.f.Put(ctx, acc, d.info(remote, size, modTime, md5sum, tier))
 }
 
 // putBytes uploads data to remote.
@@ -119,9 +125,14 @@ func (r *hashingReader) Read(p []byte) (int, error) {
 
 // putSourceFile uploads a source file to remote in a single read and
 // returns the MD5 of what was read.
+//
+// The MD5 isn't known until the upload is done, so it can't be sent with
+// the upload. Instead it is compared with the MD5 the backend reports for
+// the stored object, where it reports one (for S3, single part uploads
+// without SSE-KMS or SSE-C), and a mismatching object is removed.
 func (d *dest) putSourceFile(ctx context.Context, remote string, e *sourceEntry, tier string) (string, error) {
 	var hr *hashingReader
-	err := d.put(ctx, remote, e.Size, e.ModTime, "", tier, func() (io.ReadCloser, error) {
+	o, err := d.putObject(ctx, remote, e.Size, e.ModTime, "", tier, func() (io.ReadCloser, error) {
 		in, err := os.Open(e.path)
 		if err != nil {
 			return nil, err
@@ -132,7 +143,15 @@ func (d *dest) putSourceFile(ctx context.Context, remote string, e *sourceEntry,
 	if err != nil || d.dryRun {
 		return "", err
 	}
-	return hex.EncodeToString(hr.h.Sum(nil)), nil
+	sum := hex.EncodeToString(hr.h.Sum(nil))
+	stored, err := o.Hash(ctx, hashpkg.MD5)
+	if err == nil && stored != "" && !strings.EqualFold(stored, sum) {
+		if err := o.Remove(ctx); err != nil {
+			fs.Errorf(remote, "gda: failed to remove corrupt upload: %v", err)
+		}
+		return "", fmt.Errorf("stored object has MD5 %s but %s was uploaded", stored, sum)
+	}
+	return sum, nil
 }
 
 // get reads the whole object at remote. It returns fs.ErrorObjectNotFound
