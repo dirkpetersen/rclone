@@ -671,42 +671,77 @@ func makeDirs(target, rel string, overwrite bool) error {
 // Files which are already identical aren't fetched again, but their
 // permissions and times are set from the backup like everything else.
 func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, target string, overwrite bool) *RestoreStatus {
-	st := &RestoreStatus{RestoreID: rec.ID, Tier: rec.Tier, ReadyBy: rec.ReadyBy, Record: rec, Errors: []string{}}
-	st.Files.Total = len(plan)
-	errorf := func(format string, args ...any) {
-		err := fmt.Sprintf(format, args...)
-		fs.Errorf(nil, "gda: %s", err)
-		if len(st.Errors) < maxLedgerErrors {
-			st.Errors = append(st.Errors, err)
-		}
+	f := &fetcher{
+		st:          &RestoreStatus{RestoreID: rec.ID, Tier: rec.Tier, ReadyBy: rec.ReadyBy, Record: rec, Errors: []string{}},
+		plan:        plan,
+		target:      target,
+		overwrite:   overwrite,
+		pattern:     tempPattern(rec.ID),
+		done:        make([]bool, len(plan)),
+		failed:      make([]bool, len(plan)),
+		unsupported: make([]bool, len(plan)),
 	}
-	localPath := func(e *Entry) string {
-		return filepath.Join(target, filepath.FromSlash(e.Target))
-	}
-	pattern := tempPattern(rec.ID)
-	done := make([]bool, len(plan))
-	failed := make([]bool, len(plan))
-	unsupported := make([]bool, len(plan))
+	f.st.Files.Total = len(plan)
 	for i := range plan {
 		if plan[i].Action == actionSkip {
-			st.Files.SkippedIdentical++
+			f.st.Files.SkippedIdentical++
 		}
 	}
+	f.makeDirs()
+	f.fetchFiles(ctx, d)
+	linkFiles(plan, f.done, f.failed, overwrite, f.localPath, f.errorf, f.pattern)
+	f.makeSpecials()
+	f.applyMeta()
+	f.count()
+	return f.st
+}
 
-	// Directories first, so everything else has somewhere to go.
-	for i := range plan {
-		e := &plan[i]
+// fetcher is the state of one pass of fetchPlan.
+type fetcher struct {
+	st          *RestoreStatus
+	plan        []Entry
+	target      string
+	overwrite   bool
+	pattern     string // of temporary file names
+	done        []bool // by plan index: in place
+	failed      []bool // by plan index: couldn't be restored
+	unsupported []bool // by plan index: a kind of file this system can't create
+}
+
+// errorf records a problem with the restore.
+func (f *fetcher) errorf(format string, args ...any) {
+	err := fmt.Sprintf(format, args...)
+	fs.Errorf(nil, "gda: %s", err)
+	if len(f.st.Errors) < maxLedgerErrors {
+		f.st.Errors = append(f.st.Errors, err)
+	}
+}
+
+// localPath returns where e is restored to.
+func (f *fetcher) localPath(e *Entry) string {
+	return filepath.Join(f.target, filepath.FromSlash(e.Target))
+}
+
+// makeDirs creates the directories first, so everything else has
+// somewhere to go.
+func (f *fetcher) makeDirs() {
+	for i := range f.plan {
+		e := &f.plan[i]
 		if e.IsDir() {
-			if err := makeDirs(target, e.Target, overwrite); err != nil {
-				errorf("create directory %q: %v", e.Target, err)
-				failed[i] = true
+			if err := makeDirs(f.target, e.Target, f.overwrite); err != nil {
+				f.errorf("create directory %q: %v", e.Target, err)
+				f.failed[i] = true
 			}
 		}
 	}
+}
 
-	// Files, grouped by the object holding their data. Every object the
-	// plan needs data from counts as requested, and as fetched once all
-	// its files are in place, so the counts only grow from run to run.
+// fetchFiles writes the files, grouped by the object holding their data.
+// Every object the plan needs data from counts as requested, and as
+// fetched once all its files are in place, so the counts only grow from
+// run to run.
+func (f *fetcher) fetchFiles(ctx context.Context, d *dest) {
+	st, plan := f.st, f.plan
 	byObject := map[string][]int{}
 	objectFiles := map[string]int{}
 	objectDone := map[string]int{}
@@ -720,47 +755,47 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, ta
 		if counted {
 			objectFiles[e.Location]++
 		}
-		p := localPath(e)
+		p := f.localPath(e)
 		same, exists, err := inPlace(e, p)
 		switch {
 		case err != nil:
-			errorf("check %q: %v", e.Target, err)
-			failed[i] = true
+			f.errorf("check %q: %v", e.Target, err)
+			f.failed[i] = true
 			continue
 		case same:
-			done[i] = true
+			f.done[i] = true
 			if counted {
 				objectDone[e.Location]++
 			}
 			continue
-		case exists && !overwrite:
+		case exists && !f.overwrite:
 			// Changed locally since the restore started.
-			errorf("%q exists and differs from the backup; use --overwrite to replace it", e.Target)
-			failed[i] = true
+			f.errorf("%q exists and differs from the backup; use --overwrite to replace it", e.Target)
+			f.failed[i] = true
 			continue
 		}
 		parent := path.Dir(e.Target)
-		if err := makeDirs(target, parent, overwrite); err != nil {
-			errorf("create directory for %q: %v", e.Target, err)
-			failed[i] = true
+		if err := makeDirs(f.target, parent, f.overwrite); err != nil {
+			f.errorf("create directory for %q: %v", e.Target, err)
+			f.failed[i] = true
 			continue
 		}
-		if err := clearDir(p, overwrite); err != nil {
-			errorf("%q: %v", e.Target, err)
-			failed[i] = true
+		if err := clearDir(p, f.overwrite); err != nil {
+			f.errorf("%q: %v", e.Target, err)
+			f.failed[i] = true
 			continue
 		}
 		if !swept[parent] {
 			swept[parent] = true
-			sweepTemp(filepath.Dir(p), pattern)
+			sweepTemp(filepath.Dir(p), f.pattern)
 		}
 		if !hasData(e) {
-			if err := writeVerified(io.NopCloser(strings.NewReader("")), e, p, pattern); err != nil {
-				errorf("create %q: %v", e.Target, err)
-				failed[i] = true
+			if err := writeVerified(io.NopCloser(strings.NewReader("")), e, p, f.pattern); err != nil {
+				f.errorf("create %q: %v", e.Target, err)
+				f.failed[i] = true
 				continue
 			}
-			done[i] = true
+			f.done[i] = true
 			continue
 		}
 		byObject[e.Location] = append(byObject[e.Location], i)
@@ -778,94 +813,101 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, ta
 	sort.Strings(keys)
 	for _, key := range keys {
 		todo := byObject[key]
-		fetched, err := fetchObject(ctx, d, key, plan, todo, localPath, errorf, pattern)
+		fetched, err := fetchObject(ctx, d, key, plan, todo, f.localPath, f.errorf, f.pattern)
 		switch {
 		case isRestorePending(err):
 			st.Objects.Restoring++
 			st.Pending = append(st.Pending, key)
 			continue
 		case err != nil:
-			errorf("fetch %q: %v", key, err)
+			f.errorf("fetch %q: %v", key, err)
 		}
 		for _, i := range todo {
 			if fetched[i] {
-				done[i] = true
+				f.done[i] = true
 			} else {
-				failed[i] = true
+				f.failed[i] = true
 			}
 		}
 		if err == nil && len(fetched) == len(todo) && objectDone[key]+len(todo) == objectFiles[key] {
 			st.Objects.Fetched++
 		}
 	}
+}
 
-	linkFiles(plan, done, failed, overwrite, localPath, errorf, pattern)
-
-	// Symlinks and special files need no data.
-	for i := range plan {
-		e := &plan[i]
+// makeSpecials creates symlinks and special files, which need no data.
+func (f *fetcher) makeSpecials() {
+	for i := range f.plan {
+		e := &f.plan[i]
 		if e.Type == TypeFile || e.IsDir() {
 			continue
 		}
-		if err := makeDirs(target, path.Dir(e.Target), overwrite); err != nil {
-			errorf("create directory for %q: %v", e.Target, err)
-			failed[i] = true
+		if err := makeDirs(f.target, path.Dir(e.Target), f.overwrite); err != nil {
+			f.errorf("create directory for %q: %v", e.Target, err)
+			f.failed[i] = true
 			continue
 		}
-		err := createSpecial(e, localPath(e), overwrite)
+		err := createSpecial(e, f.localPath(e), f.overwrite)
 		switch {
 		case errors.Is(err, errUnsupported):
-			unsupported[i] = true
+			f.unsupported[i] = true
 		case err != nil:
-			errorf("create %q: %v", e.Target, err)
-			failed[i] = true
+			f.errorf("create %q: %v", e.Target, err)
+			f.failed[i] = true
 		default:
-			done[i] = true
+			f.done[i] = true
 		}
 	}
+}
 
+// applyMeta sets the metadata of everything in place. Directories come
+// last and deepest first, as creating their contents changes their
+// modification times and a read only directory couldn't be filled. They
+// wait until nothing is left to write, so a later run can still write
+// into them.
+func (f *fetcher) applyMeta() {
 	isRoot := os.Geteuid() == 0
-	for i := range plan {
-		e := &plan[i]
-		if done[i] && e.Type != TypeDir {
-			if err := applyMeta(e, localPath(e), isRoot); err != nil {
-				errorf("set metadata of %q: %v", e.Target, err)
-			}
-		}
-	}
 	anyFailed := false
-	for i := range plan {
-		anyFailed = anyFailed || failed[i]
-	}
-	if st.Objects.Restoring == 0 && !anyFailed {
-		// Directory metadata last and deepest first, as creating their
-		// contents changes their modification times and a read only
-		// directory couldn't be filled. It waits until nothing is left
-		// to write, so a later run can still write into them.
-		var dirs []int
-		for i := range plan {
-			if plan[i].IsDir() {
-				dirs = append(dirs, i)
+	for i := range f.plan {
+		e := &f.plan[i]
+		anyFailed = anyFailed || f.failed[i]
+		if f.done[i] && e.Type != TypeDir {
+			if err := applyMeta(e, f.localPath(e), isRoot); err != nil {
+				f.errorf("set metadata of %q: %v", e.Target, err)
 			}
 		}
-		sort.SliceStable(dirs, func(a, b int) bool {
-			return strings.Count(plan[dirs[a]].Target, "/") > strings.Count(plan[dirs[b]].Target, "/")
-		})
-		for _, i := range dirs {
-			e := &plan[i]
-			if err := applyMeta(e, localPath(e), isRoot); err != nil {
-				errorf("set metadata of %q: %v", e.Target, err)
-			}
-			done[i] = true
+	}
+	if f.st.Objects.Restoring > 0 || anyFailed {
+		return
+	}
+	var dirs []int
+	for i := range f.plan {
+		if f.plan[i].IsDir() {
+			dirs = append(dirs, i)
 		}
 	}
-	for i := range plan {
+	sort.SliceStable(dirs, func(a, b int) bool {
+		return strings.Count(f.plan[dirs[a]].Target, "/") > strings.Count(f.plan[dirs[b]].Target, "/")
+	})
+	for _, i := range dirs {
+		e := &f.plan[i]
+		if err := applyMeta(e, f.localPath(e), isRoot); err != nil {
+			f.errorf("set metadata of %q: %v", e.Target, err)
+		}
+		f.done[i] = true
+	}
+}
+
+// count fills in the file counts and the state of the restore.
+func (f *fetcher) count() {
+	st := f.st
+	for i := range f.plan {
 		switch {
-		case failed[i]:
+		case f.failed[i]:
 			st.Files.Failed++
-		case unsupported[i]:
+		case f.unsupported[i]:
 			st.Files.Unsupported++
-		case done[i]:
+		case f.done[i]:
 			st.Files.Fetched++
 		}
 	}
@@ -877,7 +919,6 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, ta
 	default:
 		st.State = StateDone
 	}
-	return st
 }
 
 // linkFiles makes the restored files which were links to the same file
