@@ -362,6 +362,9 @@ func FinishRun(ctx context.Context, dst fs.Fs, runID string, opt Options) (*Ledg
 	}
 	b := &backup{d: d, runID: runID}
 	if err := b.checkRunLock(ctx); err == nil {
+		if err := compactDedup(ctx, d, runID); err != nil {
+			fs.Errorf(nil, "gda: compact dedup index: %v", err)
+		}
 		b.unlock(ctx)
 	}
 	if merged.Stats.Errors > 0 {

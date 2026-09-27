@@ -115,6 +115,30 @@ func contains(list []string, s string) bool {
 	return false
 }
 
+func TestCompactDedup(t *testing.T) {
+	fakeClock(t)
+	old := dedupCompactAt
+	dedupCompactAt = 2
+	t.Cleanup(func() { dedupCompactAt = old })
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.DedupMin = 1000
+	for i := range 4 {
+		writeFile(t, src, filepath.Join("d", string(rune('a'+i))+".bin"), 1000+i)
+		runBackup(t, src, dst, opt)
+	}
+	files, err := filepath.Glob(filepath.Join(dst, MetaDir, "dedup", "*.csv"))
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(files), 2)
+
+	// Deduplication still finds every copy.
+	for i := range 4 {
+		copyFile(t, src, filepath.Join("d", string(rune('a'+i))+".bin"), filepath.Join("copies", string(rune('a'+i))+".bin"))
+	}
+	l := runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(4), l.Stats.Deduplicated)
+}
+
 func TestRelKey(t *testing.T) {
 	for _, test := range []struct{ from, to, want string }{
 		{"", "a/x.tar", "a/x.tar"},
