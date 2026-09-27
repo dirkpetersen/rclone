@@ -1256,9 +1256,20 @@ func createSpecial(e *Entry, p string, overwrite bool) error {
 	}
 }
 
-// applyMeta sets the permissions and modification time of p from e, and
-// its owner and group when running as root.
+// applyMeta sets the permissions, modification time and extended
+// attributes of p from e, and its owner and group when running as root.
 func applyMeta(e *Entry, p string, isRoot bool) error {
+	err := applyMode(e, p, isRoot)
+	// Last, so a failure to set one, as for a namespace only root can
+	// write, doesn't stop the rest.
+	if e.Xattrs != "" {
+		err = errors.Join(err, writeXattrs(p, e.Xattrs))
+	}
+	return err
+}
+
+// applyMode sets the owner, permissions and modification time of p from e.
+func applyMode(e *Entry, p string, isRoot bool) error {
 	if isRoot {
 		uid, gid := lookupOwner(e)
 		if uid >= 0 || gid >= 0 {

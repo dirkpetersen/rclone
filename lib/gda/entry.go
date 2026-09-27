@@ -96,6 +96,7 @@ type Entry struct {
 	DevMinor     int64     `json:"dev_minor"`        // device files: minor device number
 	StoredStart  int64     `json:"stored_start"`     // offset in the uncompressed pack where the stored range starts
 	HardLink     string    `json:"hard_link"`        // files with more than one link: device and inode, the same for all links
+	Xattrs       string    `json:"xattrs"`           // extended attributes: base64 name:value pairs separated by spaces
 	Target       string    `json:"target,omitempty"` // restore plans only: path below the restore target
 }
 
@@ -139,7 +140,7 @@ var columns = []string{
 	"md5", "link_target", "location", "offset", "codec", "stored_offset",
 	"stored_length", "stored_size", "stored_md5", "dedup_of", "version_id",
 	"run", "tree_size", "tree_files", "listing", "name_encoding", "action",
-	"dev_major", "dev_minor", "stored_start", "hard_link",
+	"dev_major", "dev_minor", "stored_start", "hard_link", "xattrs",
 }
 
 // planColumns are the columns of a restore plan.
@@ -232,6 +233,8 @@ func (e *Entry) value(col string) string {
 		return formatInt(e.StoredStart)
 	case "hard_link":
 		return e.HardLink
+	case "xattrs":
+		return e.Xattrs
 	case "target":
 		return e.Target
 	}
@@ -307,6 +310,8 @@ func (e *Entry) setField(col, v string) (err error) {
 		e.StoredStart, err = parseInt(v)
 	case "hard_link":
 		e.HardLink = v
+	case "xattrs":
+		e.Xattrs = v
 	case "target":
 		e.Target = v
 	}

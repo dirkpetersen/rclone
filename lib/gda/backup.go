@@ -43,6 +43,7 @@ type Options struct {
 	DedupMin      int64         // identical files of at least this size are stored once; -1 disables
 	CompressMax   int64         // standalone files bigger than this are stored uncompressed
 	IndexCache    string        // directory for local copies of indexes; "" to read them all from the destination
+	Xattrs        bool          // keep extended attributes, which include ACLs
 }
 
 // DefaultOptions returns the default options.
@@ -232,6 +233,9 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 	}
 	if last := workerID(opt, opt.Workers-1); len(last) > maxWorkerID {
 		return nil, nil, fmt.Errorf("worker ID %q is longer than %d bytes", last, maxWorkerID)
+	}
+	if opt.Xattrs && !xattrsSupported {
+		return nil, nil, errors.New("extended attributes can only be kept on Linux")
 	}
 	if opt.Compression != CodecZstd && opt.Compression != CodecNone {
 		return nil, nil, fmt.Errorf("unknown compression %q: use %s or %s", opt.Compression, CodecZstd, CodecNone)
@@ -761,6 +765,9 @@ func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, ke
 			continue
 		}
 		e, err := statEntry(sourcePath(b.srcRoot, childRel), encName, b.names)
+		if err == nil && b.opt.Xattrs {
+			e.Xattrs, err = readXattrs(e.path)
+		}
 		if err != nil {
 			b.errorf("stat %q: %v", childRel, err)
 			keep[encName] = true
@@ -818,7 +825,8 @@ func (b *backup) dirKeysTooLong(key string) bool {
 // sameMeta returns true if the metadata other than data and times of a and b match.
 func sameMeta(a *Entry, b *Entry) bool {
 	return a.Mode == b.Mode && a.UID == b.UID && a.GID == b.GID &&
-		a.Owner == b.Owner && a.Group == b.Group && a.HardLink == b.HardLink
+		a.Owner == b.Owner && a.Group == b.Group && a.HardLink == b.HardLink &&
+		a.Xattrs == b.Xattrs
 }
 
 // withMeta returns prev with the metadata of cur.
@@ -828,6 +836,7 @@ func withMeta(prev Entry, cur *Entry) Entry {
 	prev.UID, prev.GID = cur.UID, cur.GID
 	prev.Owner, prev.Group = cur.Owner, cur.Group
 	prev.HardLink = cur.HardLink
+	prev.Xattrs = cur.Xattrs
 	prev.Action = ""
 	return prev
 }

@@ -88,6 +88,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
 	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
 	flags.FVarP(flagSet, &compressMax, "compress-max", "", "Store standalone files bigger than this uncompressed", "")
+	flags.BoolVarP(flagSet, &opt.Xattrs, "xattrs", "", opt.Xattrs, "Keep extended attributes, including ACLs (Linux only)", "")
 	flags.StringVarP(flagSet, &pricesFile, "prices", "", pricesFile, "JSON file with the prices to use for the cost estimate (default built in)", "")
 	flags.StringVarP(flagSet, &opt.IndexCache, "index-cache-dir", "", opt.IndexCache, "Directory for local copies of the destination's indexes (\"\" to disable)", "")
 	flags.IntVarP(flagSet, &opt.Workers, "workers", "", opt.Workers, "Directories to back up in parallel (default one per CPU, up to 15)", "")
@@ -241,7 +242,10 @@ uploading them again.
 
 The source must be a local path, as it is read directly with POSIX
 calls to keep owners, permissions, symlinks, hard links and special
-files. Extended attributes and ACLs aren't kept.
+files. With !--xattrs! it keeps extended attributes too, which on Linux
+include POSIX and NFSv4 ACLs; this costs a request or two per file on
+network file systems. Restores set them where the target file system
+and the user's rights allow.
 `, "!", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",

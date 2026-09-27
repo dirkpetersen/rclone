@@ -1270,7 +1270,8 @@ Milestone 1 limits, each lifted by a later milestone:
 - hard links were stored as separate files (lifted: files with several
   links record their device and inode in `hard_link`, the data is stored
   once per run, and restores link them again), and extended attributes
-  are not stored;
+  were not stored (lifted on Linux: `--xattrs` records them, including
+  POSIX and NFSv4 ACLs, in an `xattrs` column, and restores set them);
 - paths whose S3 key would exceed 1,024 bytes are reported and skipped rather
   than moved into an ancestor's pack;
 - the scan reads file metadata twice (once for subtree totals, once to
