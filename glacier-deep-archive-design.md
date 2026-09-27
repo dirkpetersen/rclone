@@ -802,7 +802,8 @@ Archive, an on-premises Ceph RGW bucket, or both (decided 2026-09-26).
 ## Restore
 
 1. **Find:** browse `gda-index.csv` files, query with DuckDB, or run
-   `gda find`. No Deep Archive access is needed.
+   `rclone gda find`, which walks the indexes applying rclone's filters
+   (implemented). No Deep Archive access is needed.
 2. **Plan:** from the requested paths and optional `--at <run>`, work out the
    exact set of packs and standalone objects needed.
 3. **Request restores:** one Bulk `RestoreObject` per needed object, with a

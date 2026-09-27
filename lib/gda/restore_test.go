@@ -295,3 +295,29 @@ func TestCheckpoints(t *testing.T) {
 		assert.Equal(t, contents[i], string(got), run)
 	}
 }
+
+func TestListAndWalk(t *testing.T) {
+	fakeClock(t)
+	src := makeTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	runBackup(t, src, dst, opt)
+	f := newDst(t, dst)
+
+	var walked []string
+	require.NoError(t, Walk(context.Background(), f, "results", "", func(l *Located) error {
+		walked = append(walked, l.LocalPath)
+		return nil
+	}))
+	assert.Contains(t, walked, "sub/deep/c.dat")
+	assert.Contains(t, walked, "a.dat")
+
+	// Listing a directory reads only its own index.
+	require.NoError(t, os.WriteFile(filepath.Join(dst, "results", "sub", IndexName), []byte("name,type,size\nbad"), 0o644))
+	entries, err := List(context.Background(), f, "", "")
+	require.NoError(t, err)
+	assert.NotEmpty(t, entries)
+	err = Walk(context.Background(), f, "results", "", func(*Located) error { return nil })
+	assert.Error(t, err)
+}

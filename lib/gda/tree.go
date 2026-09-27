@@ -287,14 +287,24 @@ func (t *tree) walk(ctx context.Context, p string, fn func(*Located) error) erro
 	}
 	if row != nil {
 		if !row.IsDir() {
-			return fn(&Located{Entry: *row, IndexKey: rowKey, Path: path.Base(row.Name), LocalPath: localName(row)})
+			err := fn(&Located{Entry: *row, IndexKey: rowKey, Path: path.Base(row.Name), LocalPath: localName(row)})
+			if errors.Is(err, errSkipDir) {
+				return nil
+			}
+			return err
 		}
-		if err := fn(&Located{Entry: *row, IndexKey: rowKey}); err != nil {
+		if err := fn(&Located{Entry: *row, IndexKey: rowKey}); errors.Is(err, errSkipDir) {
+			return nil
+		} else if err != nil {
 			return err
 		}
 	}
 	return t.walkIndex(ctx, key, name, "", "", fn)
 }
+
+// errSkipDir is returned by a walk function to skip the directories
+// below the directory it was called for.
+var errSkipDir = errors.New("skip directory")
 
 // walkIndex calls fn for the entries of the index at key, only those
 // below the rolled up directory prefix if it isn't "", naming them below
@@ -319,7 +329,9 @@ func (t *tree) walkIndex(ctx context.Context, key, prefix, out, localOut string,
 			localRel = localName(&e)
 		}
 		l := &Located{Entry: e, IndexKey: key, Path: joinRemote(out, rel), LocalPath: joinRemote(localOut, localRel)}
-		if err := fn(l); err != nil {
+		if err := fn(l); errors.Is(err, errSkipDir) {
+			continue
+		} else if err != nil {
 			return err
 		}
 		if e.IsDir() && e.Listing == ListingIndex && isDirectChild(e.Name) && prefix == "" {
@@ -339,8 +351,22 @@ func List(ctx context.Context, dst fs.Fs, p, at string) ([]Located, error) {
 	err := t.walk(ctx, p, func(l *Located) error {
 		if l.Path != "" && !strings.Contains(l.Path, "/") {
 			out = append(out, *l)
+			return errSkipDir
 		}
 		return nil
 	})
 	return out, err
+}
+
+// Walk calls fn for every entry below p in the tree at dst, as it is now
+// or, if at is set, as it was at the end of that run, and for p itself
+// if it is a file.
+func Walk(ctx context.Context, dst fs.Fs, p, at string, fn func(*Located) error) error {
+	t := newTree(&dest{f: dst, retries: 1}, at)
+	return t.walk(ctx, p, func(l *Located) error {
+		if l.Path == "" {
+			return nil
+		}
+		return fn(l)
+	})
 }
