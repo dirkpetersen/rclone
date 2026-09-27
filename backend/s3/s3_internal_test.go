@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"path"
 	"strings"
 	"testing"
@@ -330,6 +332,40 @@ func TestMergeDeleteMarkersWithURLEncodedKeys(t *testing.T) {
 		{Key: &encodedKey, LastModified: &t1},
 	}
 	assert.Equal(t, want, got)
+}
+
+func TestSetModTimeKeepsStorageClass(t *testing.T) {
+	var gotClass []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.Header.Get("X-Amz-Copy-Source") == "" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		gotClass = append(gotClass, r.Header.Get("X-Amz-Storage-Class"))
+		_, _ = io.WriteString(w, `<CopyObjectResult><ETag>"d41d8cd98f00b204e9800998ecf8427e"</ETag><LastModified>2026-09-26T12:00:00.000Z</LastModified></CopyObjectResult>`)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	for _, test := range []struct {
+		configured string
+		class      *string
+		want       string
+	}{
+		{configured: "", class: aws.String("STANDARD_IA"), want: "STANDARD_IA"},
+		{configured: "DEEP_ARCHIVE", class: aws.String("STANDARD_IA"), want: "STANDARD_IA"},
+		// Not known, so the object has the class it was uploaded with.
+		{configured: "DEEP_ARCHIVE", class: nil, want: "DEEP_ARCHIVE"},
+		{configured: "DEEP_ARCHIVE", class: aws.String(""), want: "STANDARD"},
+		{configured: "", class: nil, want: ""},
+	} {
+		gotClass = nil
+		f, err := fs.NewFs(ctx, fmt.Sprintf(":s3,provider=Other,endpoint='%s',force_path_style,access_key_id=key,secret_access_key=secret,storage_class='%s':bucket", srv.URL, test.configured))
+		require.NoError(t, err)
+		o := &Object{fs: f.(*Fs), remote: "file.txt", meta: map[string]string{}, storageClass: test.class}
+		require.NoError(t, o.SetModTime(ctx, time.Now()))
+		assert.Equal(t, []string{test.want}, gotClass, "configured %q", test.configured)
+	}
 }
 
 func TestRemoveAWSChunked(t *testing.T) {

@@ -4349,6 +4349,12 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 		Metadata:          mapToS3Metadata(o.meta),
 		MetadataDirective: types.MetadataDirectiveReplace, // replace metadata with that passed in
 	}
+	// Keep the object's storage class, as the copy would otherwise get
+	// the configured storage_class, or STANDARD if none is configured.
+	// HEAD reports no storage class for STANDARD objects.
+	if o.storageClass != nil && (*o.storageClass != "" || o.fs.opt.StorageClass != "") {
+		req.StorageClass = types.StorageClass(o.GetTier())
+	}
 	if o.fs.opt.RequesterPays {
 		req.RequestPayer = types.RequestPayerRequester
 	}
