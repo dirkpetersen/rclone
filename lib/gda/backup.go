@@ -186,6 +186,11 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	if err := b.openCache(ctx); err != nil {
 		fs.Errorf(nil, "gda: not using the index cache: %v", err)
 	}
+	// A ledger without a finish time shows the run started, so even if
+	// it doesn't finish, other hosts' index caches see it wrote here.
+	if err := b.putLedger(ctx, ledger); err != nil {
+		return nil, fmt.Errorf("write run ledger: %w", err)
+	}
 	if len(opt.Changes) > 0 {
 		fs.Infof(nil, "gda: run %s: backing up %d changes in %s", b.runID, len(opt.Changes), b.srcRoot)
 		if err := b.backupChanges(ctx, opt.Changes); err != nil {
