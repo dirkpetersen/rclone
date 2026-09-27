@@ -36,6 +36,7 @@ type Options struct {
 	Compression   string        // CodecZstd to compress data where it helps, or CodecNone
 	Level         int           // zstd compression level, 1 to 22
 	Workers       int           // directories processed in parallel
+	Changes       []string      // if set, back up only the directories these source paths are in
 }
 
 // DefaultOptions returns the default options.
@@ -105,6 +106,7 @@ type dirSummary struct {
 	standalone bool  // holds a file of at least StandaloneMin
 	unreadable bool  // couldn't be read in full
 	badName    bool  // holds a name which needs encoding, so can't be rolled up
+	noRollup   bool  // holds a directory which must keep its own index
 }
 
 // backup is the state of one run.
@@ -124,6 +126,9 @@ type backup struct {
 	stopped         bool // whether the run was stopped by a fatal error
 
 	enc *zstd.Encoder // for compressing packs, nil if not compressing
+
+	dirty   map[string]bool // for change runs, directories to process
+	newDirs map[string]bool // for change runs, directories new since the last run
 }
 
 // stop stops the run after the directory in progress.
@@ -153,6 +158,13 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		return nil, err
 	}
 	defer b.unlock(ctx)
+	if len(opt.Changes) > 0 {
+		fs.Infof(nil, "gda: run %s: backing up %d changes in %s", b.runID, len(opt.Changes), b.srcRoot)
+		if err := b.backupChanges(ctx, opt.Changes); err != nil {
+			b.errorf("%v", err)
+		}
+		return b.finishLedger(ctx, ledger)
+	}
 	fs.Infof(nil, "gda: run %s: scanning %s with %d workers", b.runID, b.srcRoot, b.opt.Workers)
 	b.summarizeAll()
 	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, fs.ConfigString(dst))
@@ -437,7 +449,7 @@ func (b *backup) setSummary(rel string, s *dirSummary) {
 func (b *backup) rollupEligible(rel string) bool {
 	s := b.summaries[rel]
 	return b.opt.RollupMax > 0 && s != nil && s.treeSize < b.opt.RollupMax &&
-		!s.standalone && !s.unreadable && !s.badName
+		!s.standalone && !s.unreadable && !s.badName && !s.noRollup
 }
 
 // isRollupRoot returns true if the directory at rel is the top of a

@@ -405,6 +405,14 @@ use that instead:
 
 - **A full reconciliation scan still runs periodically** (for example
   quarterly) on every source, to catch anything a change feed missed.
+- **How change runs work** (implemented): `--changes-from` takes one path
+  per line or `zfs diff -H` output. The directories holding the listed
+  paths and all their ancestors are read from the source; every other
+  directory's subtree totals come from its row in the previous index, and
+  it isn't read at all. A directory missing from the indexes is new and
+  is scanned in full. A directory which has its own index keeps it during
+  change runs even if it has shrunk enough to be rolled up; the next full
+  run makes that change.
 - **Local index cache:** each worker keeps copies of the indexes it owns,
   checked against their S3 ETags, so a run doesn't download millions of
   indexes just to compare them.
