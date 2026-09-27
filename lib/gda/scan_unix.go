@@ -3,6 +3,7 @@
 package gda
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"os/user"
@@ -112,6 +113,9 @@ func entryFromInfo(p, name string, info fs.FileInfo, names *idNames) (sourceEntr
 		e.GID = int64(st.Gid)
 		e.Owner = names.user(e.UID)
 		e.Group = names.group(e.GID)
+		if e.Type == TypeFile && st.Nlink > 1 {
+			e.HardLink = fmt.Sprintf("%x:%x", uint64(st.Dev), uint64(st.Ino)) //nolint:unconvert // not uint64 on every platform
+		}
 		if e.Type == TypeCharDev || e.Type == TypeBlockDev {
 			rdev := uint64(st.Rdev) //nolint:unconvert // Rdev isn't uint64 on every platform
 			e.DevMajor, e.DevMinor = int64(unix.Major(rdev)), int64(unix.Minor(rdev))
