@@ -262,6 +262,7 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 	if err := b.loadDedup(ctx); err != nil {
 		return nil, err
 	}
+	b.checkVersioned(ctx)
 	fs.Infof(nil, "gda: run %s: worker %d backing up %d partitions", runID, index, len(shallow)+len(trees))
 	var items []childDir
 	for _, p := range shallow {

@@ -103,14 +103,26 @@ func downloadPlan(plan []Entry, todo []int, size int64) (bytes int64, requests i
 // directory once rather than reading each object.
 func listObjects(ctx context.Context, f fs.Fs, byObject map[string][]int) (map[string]fs.Object, error) {
 	dirs := map[string]bool{}
+	objects := map[string]fs.Object{}
 	for key := range byObject {
+		if _, version := splitVersionKey(key); version != "" {
+			// A listing shows only the current version.
+			o, err := newDataObject(ctx, f, key)
+			if errors.Is(err, fs.ErrorObjectNotFound) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			objects[key] = o
+			continue
+		}
 		dir := path.Dir(key)
 		if dir == "." {
 			dir = ""
 		}
 		dirs[dir] = true
 	}
-	objects := map[string]fs.Object{}
 	for dir := range dirs {
 		entries, err := f.List(ctx, dir)
 		if errors.Is(err, fs.ErrorDirNotFound) {

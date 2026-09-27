@@ -48,7 +48,7 @@ type dedupKey struct {
 // dedupCopy is where a copy is stored: the fields of its row which a
 // reference to it copies.
 type dedupCopy struct {
-	location, codec, storedMD5                      string
+	location, codec, storedMD5, versionID           string
 	offset, storedOffset, storedLength, storedStart int64
 	storedSize                                      int64
 }
@@ -89,6 +89,7 @@ func (idx *dedupIndex) put(row *Entry) bool {
 		location:     idx.intern(row.Location),
 		codec:        idx.intern(row.Codec),
 		storedMD5:    strings.Clone(row.StoredMD5),
+		versionID:    strings.Clone(row.VersionID),
 		offset:       row.Offset,
 		storedOffset: row.StoredOffset,
 		storedLength: row.StoredLength,
@@ -175,7 +176,7 @@ func copyRow(k dedupKey, c dedupCopy) Entry {
 	sum := hex.EncodeToString(k.md5[:])
 	row := NewEntry(dedupName(sum, k.size), TypeFile)
 	row.Size, row.MD5 = k.size, sum
-	row.Location, row.Codec, row.StoredMD5 = c.location, c.codec, c.storedMD5
+	row.Location, row.Codec, row.StoredMD5, row.VersionID = c.location, c.codec, c.storedMD5, c.versionID
 	row.Offset, row.StoredOffset, row.StoredLength, row.StoredStart = c.offset, c.storedOffset, c.storedLength, c.storedStart
 	row.StoredSize = c.storedSize
 	return row
@@ -269,6 +270,7 @@ func dedupRow(key string, e *sourceEntry, copyRow Entry, runID string) Entry {
 	row.StoredStart = copyRow.StoredStart
 	row.StoredSize = copyRow.StoredSize
 	row.StoredMD5 = copyRow.StoredMD5
+	row.VersionID = copyRow.VersionID
 	row.Run = runID
 	return row
 }

@@ -64,6 +64,23 @@ func Check(ctx context.Context, dst fs.Fs, p, at string, opt CheckOptions) (*Che
 			continue
 		}
 		key := l.ObjectKey()
+		if l.VersionID != "" {
+			// A listing shows only the current version.
+			o, err := newDataObject(ctx, dst, l.objectRef())
+			switch {
+			case errors.Is(err, fs.ErrorObjectNotFound):
+				r.Missing = append(r.Missing, l.LocalPath)
+			case err != nil:
+				r.Errors = append(r.Errors, fmt.Sprintf("%q: %v", l.LocalPath, err))
+			case l.StoredSize >= 0 && o.Size() >= 0 && o.Size() != l.StoredSize:
+				r.WrongSize = append(r.WrongSize, l.LocalPath)
+			}
+			if !referenced[l.objectRef()] {
+				referenced[l.objectRef()] = true
+				r.Objects++
+			}
+			continue
+		}
 		dir := path.Dir(key)
 		if dir == "." {
 			dir = ""

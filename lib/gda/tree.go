@@ -176,6 +176,12 @@ func (l *Located) ObjectKey() string {
 	return joinRemote(l.IndexKey, l.Location)
 }
 
+// objectRef returns a reference to the object holding l's data, with
+// its version if it has one, for newDataObject.
+func (l *Located) objectRef() string {
+	return versionKey(l.ObjectKey(), l.VersionID)
+}
+
 // outsideRoot returns true if l refers to a stored copy above the root
 // the tree is read from, as a dedup_of reference can when the tree is
 // read from below the directory it was written from.
