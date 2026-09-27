@@ -50,16 +50,17 @@ Reads every changeset and index of the GDA tree and reports:
   the current indexes rather than only in history;
 - orphans: packs and standalone objects no changeset refers to, left by
   runs that stopped before committing them;
+- parts of split indexes which a later index has replaced;
 - packs worth compacting: at least 180 days old, less than half live,
   with at least 1 GiB of dead data;
 - objects without GDA names which no changeset refers to, which may
   not be GDA's.
 
-With !--delete-orphans! it also removes the orphans older than
-!--min-age!, holding the destination lock so that no backup adds data
-meanwhile. Nothing else is ever removed, and nothing is removed if any
-directory couldn't be read. Superseded and deleted files stay in their
-packs, as history is kept.
+With !--delete-orphans! it also removes the orphans and old index parts
+older than !--min-age!, holding the destination lock so that no backup
+adds data meanwhile. Nothing else is ever removed, and nothing is
+removed if any directory couldn't be read. Superseded and deleted files
+stay in their packs, as history is kept.
 `, "!", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",
@@ -100,6 +101,11 @@ func printReport(r *libgda.GCReport) {
 		}
 		fmt.Printf("  %s (%s, %s)\n", o.Key, fs.SizeSuffix(o.Size), o.ModTime.Format(time.RFC3339))
 	}
+	var staleBytes int64
+	for _, o := range r.StaleIndexes {
+		staleBytes += o.Size
+	}
+	fmt.Printf("Old indexes:   %d parts of split indexes replaced since (%s)\n", len(r.StaleIndexes), fs.SizeSuffix(staleBytes))
 	fmt.Printf("Compactable:   %d packs\n", len(r.Compactable))
 	for i, u := range r.Compactable {
 		if i == maxListed {

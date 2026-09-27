@@ -57,6 +57,9 @@ func TestBackupChanges(t *testing.T) {
 	changed.Changes = changes
 	l := runBackup(t, src, dst, changed)
 	assert.Equal(t, int64(0), l.Stats.Errors)
+	// The ledger counts the change list rather than holding it.
+	assert.Equal(t, len(changes), l.Changes)
+	assert.Nil(t, l.Options.Changes)
 	// Only the affected directories were backed up.
 	assert.Less(t, l.Stats.IndexedDirs, int64(15))
 

@@ -88,6 +88,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
 	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
 	flags.FVarP(flagSet, &compressMax, "compress-max", "", "Store standalone files bigger than this uncompressed", "")
+	flags.BoolVarP(flagSet, &opt.AllowEmpty, "allow-empty", "", opt.AllowEmpty, "Back up an empty source over a backup which isn't empty", "")
 	flags.BoolVarP(flagSet, &opt.Xattrs, "xattrs", "", opt.Xattrs, "Keep extended attributes, including ACLs (Linux only)", "")
 	flags.StringVarP(flagSet, &pricesFile, "prices", "", pricesFile, "JSON file with the prices to use for the cost estimate (default built in)", "")
 	flags.StringVarP(flagSet, &indexCache, "index-cache-dir", "", indexCache, "Directory for local copies of the destination's indexes, or off (default gda in rclone's cache directory)", "")
@@ -164,9 +165,11 @@ Packs and standalone files are uploaded with the storage class
 as it would override these; the run stops if it finds objects stored
 with the wrong class.
 
-For S3, set !--s3-upload-cutoff! above !--pack-size! so that each pack
-is uploaded in one request checked against its MD5, and consider
-!--s3-no-check-bucket! when the bucket exists.
+For S3, unless they are set, !--s3-upload-cutoff! is set above
+!--pack-size!, so that each pack is uploaded in one request checked
+against its MD5, and !--s3-chunk-size! to 64 MiB, so that large files
+are uploaded in few parts; each worker may then hold four parts, 256
+MiB, in memory. Consider !--s3-no-check-bucket! when the bucket exists.
 
 Data is compressed with zstd where it helps: a pack is compressed when
 a trial compression of its files' data saves at least 10%, and a
@@ -178,10 +181,9 @@ without the rest of its pack, and a compressed pack is a normal
 
 A compressed standalone file is uploaded as a stream whose size isn't
 known in advance, which S3 limits to 10,000 parts of !--s3-chunk-size!,
-48.8 GiB with the default 5 MiB. Files bigger than !--compress-max!
-(default 32 GiB) are stored uncompressed; to compress bigger ones, raise
-!--s3-chunk-size! with it, for example !--s3-chunk-size 64M! for files up
-to 625 GiB.
+625 GiB with the 64 MiB a backup uses unless it is set. Files bigger
+than !--compress-max! (default 32 GiB) are stored uncompressed; raise it
+to compress bigger ones, keeping it below that limit.
 
 !--workers! directories are scanned and backed up in parallel. Each
 directory is handled by one worker, whose ID is part of the names of
@@ -243,6 +245,16 @@ which they are for packs when !--s3-upload-cutoff! is above
 !--pack-size!; each part of a multipart upload is charged too. Metadata
 storage and the requests of reading indexes are small and not counted.
 
+Only one run writes to a destination at a time: a run holds a lock,
+which it refreshes every hour. A run which is killed leaves its lock
+behind, and the next run takes it over once it is older than
+!--lock-timeout! (default 24 hours); for nightly runs, 2 hours is
+enough, as a running run refreshes its lock.
+
+A run refuses to back up an empty source over a backup which isn't
+empty, as that is usually a file system which isn't mounted; use
+!--allow-empty! if the source really was emptied.
+
 Runs are incremental: only new and changed files are uploaded, and
 nothing already uploaded is overwritten or deleted. Files whose
 modification time changed but whose content didn't are recorded without
@@ -264,8 +276,8 @@ and the user's rights allow.
 		if info, err := os.Stat(src); err != nil || !info.IsDir() {
 			return fmt.Errorf("source %q must be a local directory", src)
 		}
-		dst := cmd.NewFsDir(args[1:2])
 		setSizes()
+		dst := cmd.NewFsDir([]string{tuneS3(args[1], opt.PackSize)})
 		if (runID == "") != (partitionIndex < 0) {
 			return errors.New("--run and --partition go together")
 		}

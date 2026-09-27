@@ -864,3 +864,53 @@ func TestBackupLongKeys(t *testing.T) {
 	l = runBackup(t, src, dst, opt)
 	assert.Zero(t, l.Stats.Added+l.Stats.Modified+l.Stats.MetaOnly+l.Stats.Errors)
 }
+
+func TestBackupLongKeysPlanned(t *testing.T) {
+	fakeClock(t)
+	long := strings.Repeat
+	deep := strings.Join([]string{long("a", 200), long("b", 200), long("c", 200)}, "/")
+	base := t.TempDir()
+	pad := 730 - len(strings.Trim(base, "/")) - len("/x/lab/") - len(deep)
+	src, dst := t.TempDir(), filepath.Join(base, strings.Repeat("x", pad), "lab")
+	for i := range 50 {
+		writeFile(t, src, fmt.Sprintf("%s/f%02d.txt", deep, i), 10)
+	}
+	writeFile(t, src, deep+"/f/inner.txt", 10)
+	writeFile(t, src, deep+"/"+long("d", 240)+"/deep.txt", 10)
+	opt := testOptions()
+	opt.RollupMax = 0
+	f := newDst(t, dst)
+	runID, err := Plan(context.Background(), src, f, opt, 4)
+	require.NoError(t, err)
+	for i := range 4 {
+		wopt := opt
+		wopt.Worker = fmt.Sprintf("p%d", i)
+		_, err := BackupPartition(context.Background(), src, f, wopt, runID, i)
+		require.NoError(t, err)
+	}
+	_, err = FinishRun(context.Background(), f, runID, opt)
+	require.NoError(t, err)
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), f, target, DefaultRestoreOptions())
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	assertSameTree(t, src, target)
+}
+
+func TestBackupEmptySource(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	writeFile(t, src, "a.txt", 10)
+	runBackup(t, src, dst, testOptions())
+	require.NoError(t, os.Remove(filepath.Join(src, "a.txt")))
+
+	// An empty source looks like a file system which isn't mounted.
+	_, err := Backup(context.Background(), src, newDst(t, dst), testOptions())
+	assert.ErrorContains(t, err, "is empty but the backup")
+	assert.Contains(t, readIndexFile(t, dst, ""), "a.txt")
+
+	opt := testOptions()
+	opt.AllowEmpty = true
+	l := runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(1), l.Stats.Deleted)
+}
