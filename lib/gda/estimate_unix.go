@@ -89,14 +89,14 @@ func downloadPlan(plan []Entry, todo []int, size int64) (bytes int64, requests i
 	if plan[todo[0]].Offset < 0 {
 		return size, 1
 	}
-	var want int64
-	for _, i := range todo {
-		want += plan[i].StoredLength
+	spans := packSpans(plan, todo)
+	if !useSpans(spans, size) {
+		return size, 1
 	}
-	if len(todo) <= wholeObjectMembers && want*2 < size {
-		return want, len(todo)
+	for _, s := range spans {
+		bytes += s.end - s.start
 	}
-	return size, 1
+	return bytes, len(spans)
 }
 
 // listObjects returns the objects at the keys of byObject, listing each

@@ -37,6 +37,12 @@ worker N from 0, and !rclone gda finish --run ID! once they are done.
 The options which shape the backup, such as !--pack-size! and
 !--compression!, are fixed by the plan; the workers' own values of
 those are ignored.
+
+The workers refresh the lock while they run, but nothing does between
+the plan and the first worker starting. Other runs take the lock over
+once it is older than the plan's !--lock-timeout! or their own,
+whichever is longer, so raise it if the workers may wait in a queue for
+longer than that.
 `, "!", "`"),
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",
@@ -62,7 +68,9 @@ var FinishCommand = &cobra.Command{
 	Use:   "finish <destination> --run ID",
 	Short: `Finish a GDA backup planned with rclone gda plan.`,
 	Long: `Merges the ledgers of the run's workers into the run's ledger and
-releases the destination lock. It fails if any worker reported errors.
+releases the destination lock. It fails, keeping the lock, while a
+partition of the plan hasn't finished, and after releasing the lock if
+any worker reported errors.
 `,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",

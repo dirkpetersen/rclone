@@ -4,6 +4,7 @@ package gda
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,25 +131,49 @@ func TestBackupPartitioned(t *testing.T) {
 	_, err = Backup(context.Background(), src, f, opt)
 	assert.ErrorContains(t, err, "locked by run "+runID)
 
-	// Four workers, as a job array would run them.
-	errs := make(chan error, 4)
-	for i := range 4 {
+	// Four workers, as a job array would run them; the fourth crashes
+	// after starting.
+	workerOpt := func(i int) Options {
 		wopt := opt
 		wopt.Worker = fmt.Sprintf("p%03d", i)
 		wopt.Workers = 2
+		return wopt
+	}
+	errs := make(chan error, 3)
+	for i := range 3 {
 		go func() {
-			_, err := BackupPartition(context.Background(), src, f, wopt, runID, i)
+			_, err := BackupPartition(context.Background(), src, f, workerOpt(i), runID, i)
 			errs <- err
 		}()
 	}
-	for range 4 {
+	for range 3 {
 		require.NoError(t, <-errs)
 	}
-	// Worker IDs must be unique within a run.
-	dup := opt
-	dup.Worker = "p000"
-	_, err = BackupPartition(context.Background(), src, f, dup, runID, 0)
-	assert.ErrorContains(t, err, "already has a ledger")
+	three := 3
+	crashed, err := json.Marshal(Ledger{RunID: runID, Worker: "p003", Partition: &three})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(split, MetaDir, "runs", runID, "p003.json"), crashed, 0o644))
+
+	// The run can't finish until every partition has.
+	_, err = FinishRun(context.Background(), f, runID, opt)
+	assert.ErrorContains(t, err, "partition 3 of run "+runID+", worker p003, hasn't finished")
+	assert.FileExists(t, filepath.Join(split, MetaDir, "lock"))
+
+	// Each worker ID and partition belongs to one worker.
+	_, err = BackupPartition(context.Background(), src, f, workerOpt(0), runID, 0)
+	assert.ErrorContains(t, err, "has finished already")
+	_, err = BackupPartition(context.Background(), src, f, workerOpt(0), runID, 3)
+	assert.ErrorContains(t, err, "used by another partition")
+	_, err = BackupPartition(context.Background(), src, f, workerOpt(9), runID, 1)
+	assert.ErrorContains(t, err, `was started by worker "p001"`)
+	reserved := opt
+	reserved.Worker = "plan"
+	_, err = BackupPartition(context.Background(), src, f, reserved, runID, 3)
+	assert.ErrorContains(t, err, "reserved")
+
+	// The crashed partition is run again with its worker ID.
+	_, err = BackupPartition(context.Background(), src, f, workerOpt(3), runID, 3)
+	require.NoError(t, err)
 
 	merged, err := FinishRun(context.Background(), f, runID, opt)
 	require.NoError(t, err)

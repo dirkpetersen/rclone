@@ -52,9 +52,9 @@ func isCompressedName(name string) bool {
 }
 
 // newEncoder returns a zstd encoder for level, 1 to 22 as for the zstd
-// command.
-func newEncoder(level int) (*zstd.Encoder, error) {
-	return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)), zstd.WithEncoderConcurrency(1))
+// command, for use by up to concurrency goroutines at once.
+func newEncoder(level, concurrency int) (*zstd.Encoder, error) {
+	return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)), zstd.WithEncoderConcurrency(concurrency))
 }
 
 // worthCompressing returns true if compressing sample saves at least
@@ -204,6 +204,15 @@ func newFrameWriter(out io.Writer, level int) (*frameWriter, error) {
 
 func (w *frameWriter) Write(p []byte) (n int, err error) {
 	for len(p) > 0 {
+		// A full frame is ended only when more data comes, so Close
+		// doesn't add an empty one.
+		if w.inFrm >= frameMax {
+			if err := w.enc.Close(); err != nil {
+				return n, err
+			}
+			w.enc.Reset(w.out)
+			w.inFrm = 0
+		}
 		chunk := min(int64(len(p)), frameMax-w.inFrm)
 		written, err := w.enc.Write(p[:chunk])
 		n += written
@@ -212,14 +221,6 @@ func (w *frameWriter) Write(p []byte) (n int, err error) {
 			return n, err
 		}
 		p = p[chunk:]
-		if w.inFrm >= frameMax {
-			// End the frame and start a new one.
-			if err := w.enc.Close(); err != nil {
-				return n, err
-			}
-			w.enc.Reset(w.out)
-			w.inFrm = 0
-		}
 	}
 	return n, nil
 }

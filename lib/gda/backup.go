@@ -39,6 +39,7 @@ type Options struct {
 	Workers       int           // directories processed in parallel
 	Changes       []string      // if set, back up only the directories these source paths are in
 	DedupMin      int64         // identical files of at least this size are stored once; -1 disables
+	CompressMax   int64         // standalone files bigger than this are stored uncompressed
 }
 
 // DefaultOptions returns the default options.
@@ -56,6 +57,9 @@ func DefaultOptions() Options {
 		Level:         3,
 		Workers:       1,
 		DedupMin:      1024 * 1024,
+		// Compressed files are uploaded as streams of unknown size, which
+		// S3 limits to 10,000 parts of --s3-chunk-size, 48.8 GiB by default.
+		CompressMax: 32 * 1024 * 1024 * 1024,
 	}
 }
 
@@ -93,6 +97,7 @@ type Ledger struct {
 	Started       time.Time
 	Finished      time.Time
 	Options       Options
+	Partition     *int `json:",omitempty"` // index of the partition of a planned run
 	Stats         Stats
 	Errors        []string
 }
@@ -138,6 +143,8 @@ type backup struct {
 	dedup *dedupIndex // stored copies, nil if not deduplicating
 
 	catalog *catalogWriter // this run's catalog, nil for --dry-run
+
+	claim *partitionClaim // this worker's claim on its partition of a planned run
 }
 
 // stop stops the run after the directory in progress.
@@ -167,6 +174,7 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		return nil, err
 	}
 	defer b.unlock(ctx)
+	defer b.keepLock(ctx)()
 	if err := b.loadDedup(ctx); err != nil {
 		return nil, err
 	}
@@ -204,6 +212,9 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 	if opt.Workers < 1 {
 		opt.Workers = 1
 	}
+	if last := workerID(opt, opt.Workers-1); len(last) > maxWorkerID {
+		return nil, nil, fmt.Errorf("worker ID %q is longer than %d bytes", last, maxWorkerID)
+	}
 	if opt.Compression != CodecZstd && opt.Compression != CodecNone {
 		return nil, nil, fmt.Errorf("unknown compression %q: use %s or %s", opt.Compression, CodecZstd, CodecNone)
 	}
@@ -233,7 +244,7 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 		summaries: map[string]*dirSummary{},
 	}
 	if opt.Compression == CodecZstd {
-		if b.enc, err = newEncoder(opt.Level); err != nil {
+		if b.enc, err = newEncoder(opt.Level, opt.Workers); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -309,27 +320,21 @@ func (b *backup) finishLedger(ctx context.Context, ledger *Ledger) (*Ledger, err
 	if b.isStopped() {
 		fs.Errorf(nil, "gda: run %s stopped early", b.runID)
 	}
-	ledger.Finished = time.Now().UTC()
-	ledger.Stats = b.stats
-	ledger.Errors = b.errors
-	data, err := json.MarshalIndent(ledger, "", "  ")
-	if err != nil {
-		return ledger, err
-	}
 	if b.dedup != nil && !b.d.dryRun {
 		if err := b.dedup.save(ctx, b.d, b.runID, b.opt.Worker); err != nil {
 			b.errorf("write dedup index: %v", err)
 		}
 	}
 	if b.catalog != nil {
-		key := joinRemote(MetaDir, "catalog", "runs", b.runID, b.opt.Worker+".csv.zst")
-		if err := b.catalog.finish(ctx, b.d, key); err != nil {
+		if err := b.saveCatalog(ctx); err != nil {
 			b.errorf("write catalog: %v", err)
 		}
 		b.catalog = nil
 	}
-	ledgerKey := joinRemote(MetaDir, "runs", b.runID, b.opt.Worker+".json")
-	if err := b.d.putBytes(ctx, ledgerKey, data, b.opt.MetaTier); err != nil {
+	ledger.Finished = time.Now().UTC()
+	ledger.Stats = b.stats
+	ledger.Errors = b.errors
+	if err := b.putLedger(ctx, ledger); err != nil {
 		b.errorf("write run ledger: %v", err)
 		ledger.Stats = b.stats
 	}
@@ -337,6 +342,34 @@ func (b *backup) finishLedger(ctx context.Context, ledger *Ledger) (*Ledger, err
 		return ledger, fmt.Errorf("gda: run %s finished with %d errors", b.runID, b.stats.Errors)
 	}
 	return ledger, nil
+}
+
+// putLedger writes the ledger of this worker's part of the run.
+func (b *backup) putLedger(ctx context.Context, ledger *Ledger) error {
+	data, err := json.MarshalIndent(ledger, "", "  ")
+	if err != nil {
+		return err
+	}
+	return b.d.putBytes(ctx, joinRemote(MetaDir, "runs", b.runID, b.opt.Worker+".json"), data, b.opt.MetaTier)
+}
+
+// saveCatalog uploads the run's catalog. A partition run again gets a
+// catalog of its own, as the one from its earlier attempt holds the
+// changes of the directories that attempt committed.
+func (b *backup) saveCatalog(ctx context.Context) error {
+	dir := joinRemote(MetaDir, "catalog", "runs", b.runID)
+	key := joinRemote(dir, b.opt.Worker+".csv.zst")
+	for attempt := 2; ; attempt++ {
+		exists, err := b.d.exists(ctx, key)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			break
+		}
+		key = joinRemote(dir, fmt.Sprintf("%s.%d.csv.zst", b.opt.Worker, attempt))
+	}
+	return b.catalog.finish(ctx, b.d, key)
 }
 
 // errorf records an error.
@@ -360,23 +393,39 @@ func (b *backup) count(f func(*Stats) *int64, n int64) {
 
 // lockInfo is the content of the destination lock.
 type lockInfo struct {
-	RunID   string
-	Host    string
-	PID     int
-	Started time.Time
+	RunID     string
+	Host      string
+	PID       int
+	Started   time.Time
+	Refreshed time.Time     // when the run last showed it is still going
+	Timeout   time.Duration // the holder's LockTimeout
+}
+
+// age returns how long ago the run holding the lock last refreshed it.
+func (l *lockInfo) age() time.Duration {
+	latest := l.Started
+	if l.Refreshed.After(latest) {
+		latest = l.Refreshed
+	}
+	return time.Since(latest)
 }
 
 var lockKey = joinRemote(MetaDir, "lock")
 
+// lockRefreshEvery is how often a run refreshes the destination lock, so
+// that a run lasting longer than LockTimeout keeps it. Tests lower it.
+var lockRefreshEvery = time.Hour
+
 // lock takes the destination lock, unless another run holds a lock
-// younger than LockTimeout.
+// younger than LockTimeout or that run's own timeout, whichever is
+// longer.
 func (b *backup) lock(ctx context.Context, host string) error {
 	data, err := b.d.get(ctx, lockKey)
 	if err == nil {
 		var held lockInfo
 		if jsonErr := json.Unmarshal(data, &held); jsonErr == nil {
-			age := time.Since(held.Started)
-			if age < b.opt.LockTimeout {
+			age := held.age()
+			if age < max(b.opt.LockTimeout, held.Timeout) {
 				return fmt.Errorf("destination is locked by run %s on %s (pid %d) since %s", held.RunID, held.Host, held.PID, held.Started.Format(time.RFC3339))
 			}
 			fs.Logf(nil, "gda: taking over lock of run %s on %s, which is %v old", held.RunID, held.Host, age.Round(time.Second))
@@ -384,7 +433,7 @@ func (b *backup) lock(ctx context.Context, host string) error {
 	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
 		return fmt.Errorf("read lock: %w", err)
 	}
-	data, err = json.Marshal(lockInfo{RunID: b.runID, Host: host, PID: os.Getpid(), Started: time.Now().UTC()})
+	data, err = json.Marshal(lockInfo{RunID: b.runID, Host: host, PID: os.Getpid(), Started: time.Now().UTC(), Timeout: b.opt.LockTimeout})
 	if err != nil {
 		return err
 	}
@@ -405,6 +454,66 @@ func (b *backup) lock(ctx context.Context, host string) error {
 		return fmt.Errorf("destination lock was taken by run %s on %s", held.RunID, held.Host)
 	}
 	return b.d.checkTier(ctx, lockKey, b.opt.MetaTier)
+}
+
+// keepLock refreshes the destination lock every lockRefreshEvery until
+// the function it returns is called. If the lock is lost, the run stops.
+func (b *backup) keepLock(ctx context.Context) (done func()) {
+	if b.d.dryRun {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(lockRefreshEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			if err := b.refreshLock(ctx); err != nil {
+				b.errorf("%v", err)
+				b.stop()
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		wg.Wait()
+	}
+}
+
+// refreshLock rewrites the destination lock with the current time if
+// the run still holds it. Failing to read it is left for the next try,
+// as the workers of a planned run refresh the same lock.
+func (b *backup) refreshLock(ctx context.Context) error {
+	data, err := b.d.get(ctx, lockKey)
+	var held lockInfo
+	if err == nil {
+		err = json.Unmarshal(data, &held)
+	}
+	if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+		fs.Errorf(nil, "gda: refresh lock: %v", err)
+		return nil
+	}
+	if held.RunID != b.runID {
+		return fmt.Errorf("run %s lost the destination lock, now held by run %q on %q", b.runID, held.RunID, held.Host)
+	}
+	held.Refreshed = time.Now().UTC()
+	if data, err = json.Marshal(held); err != nil {
+		return err
+	}
+	if err := b.d.putBytes(ctx, lockKey, data, b.opt.MetaTier); err != nil {
+		fs.Errorf(nil, "gda: refresh lock: %v", err)
+	}
+	return nil
 }
 
 // unlock removes the destination lock.
@@ -606,9 +715,7 @@ func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, ke
 			b.count(func(s *Stats) *int64 { return &s.RollupDirs }, 1)
 			continue
 		}
-		childKey := joinRemote(key, encName)
-		// The longest key this directory produces is a pack's manifest name.
-		if keyTooLong(b.rootKey, joinRemote(childKey, packName(dirLabel(childKey, b.opt.RootLabel), b.runID, w, 99999)+".csv")) {
+		if b.dirKeysTooLong(joinRemote(key, encName)) {
 			b.errorf("skipping directory %q: its keys would be longer than %d bytes", childRel, maxKeyLength)
 			keep[encName] = true
 			continue
@@ -617,6 +724,14 @@ func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, ke
 		cur = append(cur, e)
 	}
 	return cur, keep, nil
+}
+
+// dirKeysTooLong returns true if keys of objects in the directory at key
+// could be longer than S3 allows. The longest is a pack's manifest name,
+// checked with the longest worker ID so the answer doesn't depend on
+// which worker handles the directory.
+func (b *backup) dirKeysTooLong(key string) bool {
+	return keyTooLong(b.rootKey, joinRemote(key, packName(dirLabel(key, b.opt.RootLabel), b.runID, longestWorkerID, 99999)+".csv"))
 }
 
 // sameMeta returns true if the metadata other than data and times of a and b match.
@@ -1127,12 +1242,21 @@ func (b *backup) uploadPack(ctx context.Context, key string, pw *packWriter, sto
 }
 
 // storeStandalone uploads a large file as its own object, never
-// overwriting an existing object.
+// overwriting an existing object. A file which can't be stored is left
+// out of stored, so the directory keeps its previous row. It returns
+// false only if the run must stop.
 func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEntry, stored map[string]Entry) bool {
+	// Checked with the longest name the file could be stored under, so
+	// whether it is stored doesn't depend on the worker or on whether a
+	// copy exists already.
+	if keyTooLong(b.rootKey, joinRemote(key, versionedName(e.Name, b.runID, longestWorkerID)+".zst")) {
+		b.errorf("skipping %q: its key would be longer than %d bytes", e.path, maxKeyLength)
+		return true
+	}
 	compress, err := b.compressStandalone(e)
 	if err != nil {
 		b.errorf("read %q: %v", e.path, err)
-		return false
+		return true
 	}
 	suffix := ""
 	if compress {
@@ -1146,15 +1270,11 @@ func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEn
 	exists, err := b.d.exists(ctx, remote)
 	if err != nil {
 		b.errorf("check %q: %v", remote, err)
-		return false
+		return true
 	}
 	if exists {
 		name = versionedName(e.Name, b.runID, w) + suffix
 		remote = joinRemote(key, name)
-	}
-	if keyTooLong(b.rootKey, remote) {
-		b.errorf("skipping %q: its key would be longer than %d bytes", e.path, maxKeyLength)
-		return true
 	}
 	var sum, storedSum string
 	storedSize := e.Size
@@ -1166,7 +1286,7 @@ func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEn
 	}
 	if err != nil {
 		b.errorf("upload %q: %v", remote, err)
-		return false
+		return true
 	}
 	if !b.checkDataTier(ctx, remote) {
 		return false
@@ -1203,10 +1323,11 @@ func (b *backup) storeStandalone(ctx context.Context, w, key string, e *sourceEn
 
 // compressStandalone returns true if the standalone file e should be
 // compressed: compression is on, the destination can take uploads of
-// unknown size, the file isn't in a compressed format by its name, and a
-// trial compression of its start saves enough.
+// unknown size, the file is no bigger than CompressMax and isn't in a
+// compressed format by its name, and a trial compression of its start
+// saves enough.
 func (b *backup) compressStandalone(e *sourceEntry) (bool, error) {
-	if b.enc == nil || b.d.f.Features().PutStream == nil || isCompressedName(e.Name) {
+	if b.enc == nil || b.d.f.Features().PutStream == nil || e.Size > b.opt.CompressMax || isCompressedName(e.Name) {
 		return false, nil
 	}
 	sample, err := readStart(e.path, trialBytes)

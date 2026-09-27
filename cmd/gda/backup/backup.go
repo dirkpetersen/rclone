@@ -26,6 +26,7 @@ var (
 	standaloneMin = fs.SizeSuffix(opt.StandaloneMin)
 	rollupMax     = fs.SizeSuffix(opt.RollupMax)
 	dedupMin      = fs.SizeSuffix(opt.DedupMin)
+	compressMax   = fs.SizeSuffix(opt.CompressMax)
 )
 
 func init() {
@@ -82,6 +83,7 @@ func addFlags(flagSet *pflag.FlagSet) {
 	flags.IntVarP(flagSet, &opt.Retries, "upload-retries", "", opt.Retries, "Upload attempts per object", "")
 	flags.StringVarP(flagSet, &opt.Compression, "compression", "", opt.Compression, "Compress data where it helps with zstd, or none", "")
 	flags.IntVarP(flagSet, &opt.Level, "compression-level", "", opt.Level, "zstd compression level, 1 to 22", "")
+	flags.FVarP(flagSet, &compressMax, "compress-max", "", "Store standalone files bigger than this uncompressed", "")
 	flags.IntVarP(flagSet, &opt.Workers, "workers", "", opt.Workers, "Directories to back up in parallel (default one per CPU, up to 15)", "")
 }
 
@@ -91,6 +93,7 @@ func setSizes() {
 	opt.StandaloneMin = int64(standaloneMin)
 	opt.RollupMax = int64(rollupMax)
 	opt.DedupMin = int64(dedupMin)
+	opt.CompressMax = int64(compressMax)
 }
 
 // logLedger logs what a run did.
@@ -139,15 +142,25 @@ is written as independent frames, so a single file can still be read
 without the rest of its pack, and a compressed pack is a normal
 !.tar.zst! file. !--compression none! turns this off.
 
+A compressed standalone file is uploaded as a stream whose size isn't
+known in advance, which S3 limits to 10,000 parts of !--s3-chunk-size!,
+48.8 GiB with the default 5 MiB. Files bigger than !--compress-max!
+(default 32 GiB) are stored uncompressed; to compress bigger ones, raise
+!--s3-chunk-size! with it, for example !--s3-chunk-size 64M! for files up
+to 625 GiB.
+
 !--workers! directories are scanned and backed up in parallel. Each
 directory is handled by one worker, whose ID is part of the names of
 the packs it writes, so workers never write the same object. Each
-worker may have a pack of up to !--pack-size! in !--temp-dir! at once.
+worker may have a pack of up to !--pack-size! in !--temp-dir! at once,
+and a compressed copy of it, so allow twice !--pack-size! per worker.
 
 To split a run over several hosts, plan it with !rclone gda plan!,
 which prints its run ID, run one !rclone gda backup --run ID --partition
-N! per worker, each with its own !--worker! ID, and end it with !rclone
-gda finish!. For example with a Slurm job array:
+N! per worker, each with its own !--worker! ID of at most 16 bytes, and
+end it with !rclone gda finish!, which fails until every partition has
+finished. A partition which failed or didn't finish can be run again
+with the same !--worker! ID. For example with a Slurm job array:
 
     RUN=$(rclone gda plan /data s3:bucket/lab --partitions 20)
     sbatch --array=0-19 --wrap "rclone gda backup /data s3:bucket/lab \

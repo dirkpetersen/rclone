@@ -935,44 +935,15 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 		}
 		fetched[todo[0]] = true
 		// Duplicates of the same file refer to the same object.
-		for _, i := range todo[1:] {
-			e := &plan[i]
-			copyIn, err := os.Open(localPath(first))
-			if err == nil {
-				err = writeVerified(copyIn, e, localPath(e), pattern)
-			}
-			if err != nil {
-				errorf("%v", err)
-				continue
-			}
-			fetched[i] = true
-		}
+		copyDuplicates(plan, todo, localPath, fetched, errorf, pattern)
 		return fetched, nil
 	}
-	var want int64
-	for _, i := range todo {
-		want += plan[i].StoredLength
-	}
-	if len(todo) <= wholeObjectMembers && want*2 < o.Size() {
-		for _, i := range todo {
-			e := &plan[i]
-			in, err := o.Open(ctx, &fs.RangeOption{Start: e.StoredOffset, End: e.StoredOffset + e.StoredLength - 1})
-			if err != nil {
+	spans := packSpans(plan, todo)
+	if useSpans(spans, o.Size()) {
+		for _, s := range spans {
+			if err := fetchSpan(ctx, o, plan, s, localPath, fetched, errorf, pattern); err != nil {
 				return fetched, err
 			}
-			if e.Codec == CodecZstd {
-				// The stored range starts at a frame, which holds the
-				// end of earlier members before this one's data.
-				if in, err = decompressRange(in, e.Offset-e.StoredStart, e.Size); err != nil {
-					errorf("%q: %v", e.Target, err)
-					continue
-				}
-			}
-			if err := writeVerified(in, e, localPath(e), pattern); err != nil {
-				errorf("%v", err)
-				continue
-			}
-			fetched[i] = true
 		}
 		return fetched, nil
 	}
@@ -1022,23 +993,117 @@ func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, loc
 			continue
 		}
 		fetched[indexes[0]] = true
-		for _, i := range indexes[1:] {
-			e := &plan[i]
-			copyIn, err := os.Open(localPath(first))
-			if err == nil {
-				err = writeVerified(copyIn, e, localPath(e), pattern)
-			}
-			if err != nil {
-				errorf("%v", err)
-				continue
-			}
-			fetched[i] = true
-		}
+		copyDuplicates(plan, indexes, localPath, fetched, errorf, pattern)
 	}
 	for _, indexes := range wanted {
 		for _, i := range indexes {
 			errorf("%q not found in pack %q", plan[i].Target, o.Remote())
 		}
+	}
+	return nil
+}
+
+// copyDuplicates writes the plan entries at indexes[1:], which share the
+// data of the entry at indexes[0], from that entry's restored file.
+func copyDuplicates(plan []Entry, indexes []int, localPath func(*Entry) string, fetched map[int]bool, errorf func(string, ...any), pattern string) {
+	first := &plan[indexes[0]]
+	for _, i := range indexes[1:] {
+		e := &plan[i]
+		copyIn, err := os.Open(localPath(first))
+		if err == nil {
+			err = writeVerified(copyIn, e, localPath(e), pattern)
+		}
+		if err != nil {
+			errorf("%v", err)
+			continue
+		}
+		fetched[i] = true
+	}
+}
+
+// span is a range of a pack's stored bytes read with one request.
+type span struct {
+	start, end int64   // stored bytes, end exclusive
+	uStart     int64   // offset in the uncompressed pack where a compressed span starts
+	members    [][]int // plan indexes of the entries in the span, grouped by the data they share, in data order
+}
+
+// packSpans groups the pack members at todo into spans, so that frames
+// holding several wanted members, and members wanted under several
+// names, are read once.
+func packSpans(plan []Entry, todo []int) []span {
+	sorted := append([]int(nil), todo...)
+	sort.SliceStable(sorted, func(a, b int) bool { return plan[sorted[a]].Offset < plan[sorted[b]].Offset })
+	var spans []span
+	for _, i := range sorted {
+		e := &plan[i]
+		start, end := e.StoredOffset, e.StoredOffset+e.StoredLength
+		if n := len(spans); n > 0 && start <= spans[n-1].end {
+			s := &spans[n-1]
+			s.end = max(s.end, end)
+			if last := len(s.members) - 1; plan[s.members[last][0]].Offset == e.Offset {
+				s.members[last] = append(s.members[last], i)
+			} else {
+				s.members = append(s.members, []int{i})
+			}
+			continue
+		}
+		spans = append(spans, span{start: start, end: end, uStart: e.StoredStart, members: [][]int{{i}}})
+	}
+	return spans
+}
+
+// useSpans returns true if reading spans is better than downloading the
+// whole object of size bytes.
+func useSpans(spans []span, size int64) bool {
+	var want int64
+	for _, s := range spans {
+		want += s.end - s.start
+	}
+	return len(spans) <= wholeObjectMembers && want*2 < size
+}
+
+// fetchSpan reads the span s of the pack o and writes its members. The
+// error is a problem reading the object at all.
+func fetchSpan(ctx context.Context, o fs.Object, plan []Entry, s span, localPath func(*Entry) string, fetched map[int]bool, errorf func(string, ...any), pattern string) (err error) {
+	in, err := o.Open(ctx, &fs.RangeOption{Start: s.start, End: s.end - 1})
+	if err != nil {
+		return err
+	}
+	pos := s.start
+	if plan[s.members[0][0]].Codec == CodecZstd {
+		// A compressed span starts at a frame, which may hold the end of
+		// an earlier member before the first wanted one.
+		if in, err = decompressRange(in, 0, -1); err != nil {
+			for _, indexes := range s.members {
+				errorf("%q: %v", plan[indexes[0]].Target, err)
+			}
+			return nil
+		}
+		pos = s.uStart
+	}
+	defer fs.CheckClose(in, &err)
+	counter := &readCounter{r: in}
+	for n, indexes := range s.members {
+		first := &plan[indexes[0]]
+		skip := first.Offset - pos - counter.n
+		if skip >= 0 {
+			_, err = io.CopyN(io.Discard, counter, skip)
+		} else {
+			err = errors.New("data overlaps the previous file")
+		}
+		if err != nil {
+			for _, rest := range s.members[n:] {
+				errorf("%q: %v", plan[rest[0]].Target, err)
+			}
+			return nil
+		}
+		if err := writeVerified(io.NopCloser(io.LimitReader(counter, first.Size)), first, localPath(first), pattern); err != nil {
+			errorf("%v", err)
+			continue
+		}
+		fetched[indexes[0]] = true
+		copyDuplicates(plan, indexes, localPath, fetched, errorf, pattern)
 	}
 	return nil
 }
