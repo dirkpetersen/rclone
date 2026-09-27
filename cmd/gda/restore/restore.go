@@ -74,9 +74,15 @@ Local files which are already identical to the backup are skipped. If
 any local files differ, the restore stops before requesting anything
 unless !--overwrite! is given.
 
-Permissions and modification times are always restored. Owner, group,
-setuid and setgid are restored only when running as root, by name where
-the name exists and by numeric ID otherwise.
+Permissions and modification times are always restored, also on files
+which were already identical. Owner, group, setuid, setgid and device
+files are restored only when running as root, by name where the name
+exists and by numeric ID otherwise. Nothing is written through symlinks
+in the target directory: a symlink or file where the backup has a
+directory is a conflict like any other.
+
+If restored copies expire before they are fetched, !--resume! requests
+them again.
 
 With !--estimate! nothing is restored: it prints what each retrieval
 tier would cost and how long it would take, broken down into retrieval,
@@ -100,7 +106,7 @@ other programs, such as Motuz.
 				target = args[1]
 			}
 		} else {
-			cmd.CheckArgs(2, 1<<30, command, args)
+			cmd.CheckArgs(2, max(len(args), 2), command, args)
 			target = args[1]
 			opt.Paths = args[2:]
 		}

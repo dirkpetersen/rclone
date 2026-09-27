@@ -50,7 +50,7 @@ func EstimateRestore(ctx context.Context, dst fs.Fs, target string, ropt Restore
 		}
 		sel.Files++
 		sel.Bytes += e.Size
-		if e.Action == actionSkip {
+		if !needsData(e) {
 			sel.NoRetrievalFiles++
 			continue
 		}

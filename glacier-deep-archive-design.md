@@ -945,8 +945,10 @@ requests the restores and returns at once with the restore ID and the
 estimate for the chosen tier, which Motuz stores with the job:
 
 ```json
-{"restore_id": "20260926T190512Z-7f3a", "tier": "Bulk", "estimate": { "total": 116.49, "total_egress_waived": 5.90 }}
+{"restore_id": "20260926T190512Z-7f3a", "tier": "Bulk", "state": "restoring", "estimate": {"tier": "Bulk", "total": 116.49, "total_egress_waived": 5.90}}
 ```
+
+(abbreviated: the full response has the progress fields below).
 
 #### 3. Progress: polled by a Celery job
 
@@ -960,14 +962,20 @@ calls it every few minutes until `state` is `done`:
 ```json
 {
   "restore_id": "20260926T190512Z-7f3a",
+  "tier": "Bulk",
   "state": "restoring",
-  "objects": {"requested": 6, "restoring": 4, "ready": 2, "fetched": 2},
-  "files": {"total": 2340, "fetched": 781, "skipped_identical": 0, "failed": 0},
-  "ready_by": "2026-09-28T19:05:12Z"
+  "objects": {"requested": 6, "restoring": 4, "fetched": 2},
+  "files": {"total": 2340, "fetched": 781, "skipped_identical": 0, "failed": 0, "unsupported": 0},
+  "ready_by": "2026-09-28T19:05:12Z",
+  "errors": []
 }
 ```
 
-`state` is one of `restoring`, `fetching`, `done` or `failed`. The job
+`state` is one of `restoring`, `done` or `failed`. `errors` lists what
+went wrong with individual files. `unsupported` counts entries that
+can't be recreated on this system, such as device files when not
+running as root. The start call returns the same, plus `estimate` with
+the chosen tier's costs. The job
 list shows the estimate next to the job, so users can compare it with what
 happened.
 

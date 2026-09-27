@@ -63,35 +63,35 @@ const NameEncodingPercent = "percent"
 // Integer fields which don't apply to an entry are -1 and are written as
 // empty CSV fields.
 type Entry struct {
-	Name         string    // path relative to the index's directory, "/" separated
-	Type         string    // one of the Type constants
-	Size         int64     // bytes
-	ModTime      time.Time // modification time, UTC
-	Mode         uint32    // permission bits including setuid, setgid and sticky
-	Owner        string    // user name, if known
-	Group        string    // group name, if known
-	UID          int64     // numeric user ID
-	GID          int64     // numeric group ID
-	MD5          string    // hex MD5 of the original content
-	LinkTarget   string    // symlink target
-	Location     string    // pack name or object key holding the data
-	Offset       int64     // data offset inside the uncompressed tar
-	Codec        string    // codec of the stored bytes
-	StoredOffset int64     // start of the stored bytes holding this entry
-	StoredLength int64     // length of the stored bytes holding this entry
-	StoredSize   int64     // size of a standalone object as stored
-	StoredMD5    string    // MD5 of a standalone object as stored
-	DedupOf      string    // location of the copy this entry is a duplicate of
-	VersionID    string    // S3 version ID of a standalone object
-	Run          string    // run that wrote this version
-	TreeSize     int64     // directories: bytes in the whole subtree
-	TreeFiles    int64     // directories: non-directory entries in the whole subtree
-	Listing      string    // directories: ListingIndex or ListingRollup
-	NameEncoding string    // "" or NameEncodingPercent
-	Action       string    // changesets only: one of the Action constants
-	DevMajor     int64     // device files: major device number
-	DevMinor     int64     // device files: minor device number
-	Target       string    // restore plans only: path below the restore target
+	Name         string    `json:"name"`             // path relative to the index's directory, "/" separated
+	Type         string    `json:"type"`             // one of the Type constants
+	Size         int64     `json:"size"`             // bytes
+	ModTime      time.Time `json:"mtime"`            // modification time, UTC
+	Mode         uint32    `json:"mode"`             // permission bits including setuid, setgid and sticky
+	Owner        string    `json:"owner"`            // user name, if known
+	Group        string    `json:"group"`            // group name, if known
+	UID          int64     `json:"uid"`              // numeric user ID
+	GID          int64     `json:"gid"`              // numeric group ID
+	MD5          string    `json:"md5"`              // hex MD5 of the original content
+	LinkTarget   string    `json:"link_target"`      // symlink target
+	Location     string    `json:"location"`         // pack name or object key holding the data
+	Offset       int64     `json:"offset"`           // data offset inside the uncompressed tar
+	Codec        string    `json:"codec"`            // codec of the stored bytes
+	StoredOffset int64     `json:"stored_offset"`    // start of the stored bytes holding this entry
+	StoredLength int64     `json:"stored_length"`    // length of the stored bytes holding this entry
+	StoredSize   int64     `json:"stored_size"`      // size of a standalone object as stored
+	StoredMD5    string    `json:"stored_md5"`       // MD5 of a standalone object as stored
+	DedupOf      string    `json:"dedup_of"`         // location of the copy this entry is a duplicate of
+	VersionID    string    `json:"version_id"`       // S3 version ID of a standalone object
+	Run          string    `json:"run"`              // run that wrote this version
+	TreeSize     int64     `json:"tree_size"`        // directories: bytes in the whole subtree
+	TreeFiles    int64     `json:"tree_files"`       // directories: non-directory entries in the whole subtree
+	Listing      string    `json:"listing"`          // directories: ListingIndex or ListingRollup
+	NameEncoding string    `json:"name_encoding"`    // "" or NameEncodingPercent
+	Action       string    `json:"action,omitempty"` // changesets only: one of the Action constants
+	DevMajor     int64     `json:"dev_major"`        // device files: major device number
+	DevMinor     int64     `json:"dev_minor"`        // device files: minor device number
+	Target       string    `json:"target,omitempty"` // restore plans only: path below the restore target
 }
 
 // NewEntry returns an Entry with the integer fields that don't apply set to -1.
