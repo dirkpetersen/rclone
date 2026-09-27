@@ -5,6 +5,7 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -41,6 +42,7 @@ func init() {
 	flags.IntVarP(flagSet, &partitionIndex, "partition", "", partitionIndex, "Index of the worker whose partitions to back up with --run", "")
 	flags.StringVarP(flagSet, &changesFrom, "changes-from", "", changesFrom, "Back up only the directories of the paths in this file (- for stdin)", "")
 	flags.StringVarP(flagSet, &changesFormat, "changes-format", "", changesFormat, "Format of --changes-from: lines, or zfs for zfs diff -H output", "")
+	flags.StringVarP(flagSet, &ledgerFile, "ledger-file", "", ledgerFile, "Write the outcome and ledger of the run to this local file as JSON", "")
 	gda.Command.AddCommand(Command)
 }
 
@@ -49,9 +51,45 @@ var (
 	partitionIndex = -1
 	changesFrom    = ""
 	changesFormat  = libgda.ChangesLines
+	ledgerFile     = ""
 )
 
-// readChanges reads the change list given with --changes-from.
+// Outcomes of a run written with --ledger-file.
+const (
+	outcomeOK        = "ok"
+	outcomeFailed    = "failed"
+	outcomeNoChanges = "no changes"
+)
+
+// report is what --ledger-file holds.
+type report struct {
+	Outcome string // outcomeOK, outcomeFailed or outcomeNoChanges
+	Error   string `json:",omitempty"` // why the run failed
+	*libgda.Ledger
+}
+
+// writeReport writes the outcome of a run to --ledger-file, if given.
+// ledger is nil if the run failed before it started.
+func writeReport(outcome string, ledger *libgda.Ledger, runErr error) error {
+	if ledgerFile == "" {
+		return nil
+	}
+	r := report{Outcome: outcome, Ledger: ledger}
+	if runErr != nil {
+		r.Outcome, r.Error = outcomeFailed, runErr.Error()
+	}
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(ledgerFile, append(data, '\n'), 0o666); err != nil {
+		return fmt.Errorf("write ledger file: %w", err)
+	}
+	return nil
+}
+
+// readChanges reads the change list given with --changes-from, returning
+// only the paths below src.
 func readChanges(src string) ([]string, error) {
 	in := os.Stdin
 	if changesFrom != "-" {
@@ -62,14 +100,7 @@ func readChanges(src string) ([]string, error) {
 		defer func() { _ = f.Close() }()
 		in = f
 	}
-	changes, err := libgda.ParseChanges(in, changesFormat, src)
-	if err != nil {
-		return nil, err
-	}
-	if len(changes) == 0 {
-		return nil, errors.New("the change list has no paths below the source")
-	}
-	return changes, nil
+	return libgda.ParseChanges(in, changesFormat, src)
 }
 
 // addFlags adds the options which shape a backup to flagSet.
@@ -225,9 +256,20 @@ Backing up the snapshot rather than the live file system means the
 files don't change while they are read. zfs diff names paths where the
 file system is mounted, which a source in a snapshot is taken to be.
 
+Paths outside the source are ignored, so one change list can serve
+several sources on the same file system. A source with no changed paths
+is left alone: no run is made and the command succeeds.
+
 GPFS policy lists and Lustre changelogs can be turned into a list of
 paths. A change run needs a full run first, and full runs should still
 be made now and then to catch anything a change feed missed.
+
+!--ledger-file! writes the outcome of the run to a local file as JSON
+for scripts which report on backups: !Outcome! is !ok!, !failed! or
+!no changes!, !Error! says why a run failed, and the rest is the run's
+ledger as stored in the destination under !_gda/runs!, with its counts
+and the first errors, if the run got as far as starting. !rclone gda
+finish! takes it too.
 
 Identical files of at least !--dedup-min! (default 1 MiB) are stored
 once per destination: a copy of content already stored, for example in
@@ -309,6 +351,12 @@ and the user's rights allow.
 			if err != nil {
 				return err
 			}
+			if len(changes) == 0 {
+				// A change list may cover a whole file system with
+				// several sources on it, not all of them changed.
+				fs.Logf(nil, "gda: the change list has no paths below %s, so there is nothing to back up", src)
+				return writeReport(outcomeNoChanges, nil, nil)
+			}
 			opt.Changes = changes
 		}
 		cmd.Run(false, true, command, func() error {
@@ -320,7 +368,7 @@ and the user's rights allow.
 				ledger, err = libgda.Backup(context.Background(), src, dst, opt)
 			}
 			logLedger(ledger)
-			return err
+			return errors.Join(err, writeReport(outcomeOK, ledger, err))
 		})
 		return nil
 	},
