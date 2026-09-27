@@ -54,7 +54,7 @@ func (b *Browser) resetExpired() {
 // entries returns the rows of the index at key, or nil if there is none.
 // Concurrent reads of the same index are done once.
 func (b *Browser) entries(ctx context.Context, key string) ([]Entry, error) {
-	if key == "" && b.f.Features().BucketBased {
+	if key == "" && b.f.Features().BucketBased && b.f.Root() == "" {
 		// Above the buckets there are no objects, so no index.
 		return nil, nil
 	}
@@ -117,8 +117,11 @@ func (b *Browser) List(ctx context.Context, dir string) (entries []Located, ok b
 			// It has its own index, which is empty.
 			return nil, true, nil
 		default:
+			// Replaying history finds no index for a directory which
+			// was empty, and a run which stopped may not have written
+			// it yet; either way nothing is known to be in it.
 			fs.Debugf(nil, "gda: %q should have an index but has none", dir)
-			return nil, false, nil
+			return nil, true, nil
 		}
 	}
 	if own != nil {

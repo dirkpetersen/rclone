@@ -217,6 +217,23 @@ func (m *mutator) mutate(n int) {
 	}
 }
 
+// browseTree lists the files below dir as the Browser shows them, by
+// local path.
+func browseTree(t *testing.T, b *Browser, dir, local string, out map[string]int64) {
+	t.Helper()
+	entries, ok, err := b.List(context.Background(), dir)
+	require.NoError(t, err, dir)
+	require.True(t, ok, dir)
+	for _, e := range entries {
+		switch {
+		case e.IsDir():
+			browseTree(t, b, joinRemote(dir, e.Name[strings.LastIndex(e.Name, "/")+1:]), joinRemote(local, e.LocalPath), out)
+		case e.Type == TypeFile:
+			out[joinRemote(local, e.LocalPath)] = e.Size
+		}
+	}
+}
+
 func TestRandomHistory(t *testing.T) {
 	for seed := int64(1); seed <= 6; seed++ {
 		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
@@ -295,6 +312,21 @@ func TestRandomHistory(t *testing.T) {
 				require.NoError(t, err, "restore at run %d", i)
 				assert.Equal(t, StateDone, st.State, "restore at run %d", i)
 				assert.Equal(t, states[i], treeState(t, target), "restore at run %d", i)
+
+				// Browsing shows the same files.
+				b, err := NewBrowser(f, runID)
+				require.NoError(t, err)
+				browsed := map[string]int64{}
+				browseTree(t, b, "", "", browsed)
+				want := map[string]int64{}
+				for p, desc := range states[i] {
+					if strings.HasPrefix(desc, "-") {
+						info, err := os.Lstat(filepath.Join(target, filepath.FromSlash(p)))
+						require.NoError(t, err)
+						want[p] = info.Size()
+					}
+				}
+				assert.Equal(t, want, browsed, "browse at run %d", i)
 			}
 			// The indexes list the files the source held at the last run.
 			var walked, want []string
