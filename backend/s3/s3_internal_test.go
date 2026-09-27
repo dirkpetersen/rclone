@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"path"
 	"strings"
 	"testing"
@@ -371,6 +373,48 @@ func TestRemoveAWSChunked(t *testing.T) {
 			check(got, got2)
 		})
 	}
+}
+
+func TestSetTierMultipartKeepsHeaders(t *testing.T) {
+	var created http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		switch {
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Type", "text/csv")
+			w.Header().Set("Cache-Control", "max-age=60")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Disposition", "attachment")
+			w.Header().Set("Content-Language", "en")
+			w.Header().Set("X-Amz-Meta-Mtime", "1600000000")
+			w.Header().Set("Content-Length", "10")
+		case r.Method == http.MethodPost && q.Has("uploads"):
+			created = r.Header.Clone()
+			_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>file.csv</Key><UploadId>id</UploadId></InitiateMultipartUploadResult>`)
+		case r.Method == http.MethodPut && q.Has("partNumber"):
+			_, _ = io.WriteString(w, `<CopyPartResult><ETag>"d41d8cd98f00b204e9800998ecf8427e"</ETag></CopyPartResult>`)
+		case r.Method == http.MethodPost && q.Has("uploadId"):
+			_, _ = io.WriteString(w, `<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>file.csv</Key><ETag>"x-2"</ETag></CompleteMultipartUploadResult>`)
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	f, err := fs.NewFs(ctx, fmt.Sprintf(":s3,provider=Other,endpoint='%s',force_path_style,access_key_id=key,secret_access_key=secret:bucket", srv.URL))
+	require.NoError(t, err)
+	// Big enough to be copied in parts.
+	o := &Object{fs: f.(*Fs), remote: "file.csv", bytes: int64(f.(*Fs).opt.CopyCutoff) + 1}
+	require.NoError(t, o.SetTier("STANDARD_IA"))
+	require.NotNil(t, created)
+	assert.Equal(t, "text/csv", created.Get("Content-Type"))
+	assert.Equal(t, "max-age=60", created.Get("Cache-Control"))
+	assert.Equal(t, "gzip", created.Get("Content-Encoding"))
+	assert.Equal(t, "attachment", created.Get("Content-Disposition"))
+	assert.Equal(t, "en", created.Get("Content-Language"))
+	assert.Equal(t, "1600000000", created.Get("X-Amz-Meta-Mtime"))
+	assert.Equal(t, "STANDARD_IA", created.Get("X-Amz-Storage-Class"))
 }
 
 func (f *Fs) InternalTestVersions(t *testing.T) {

@@ -3127,10 +3127,26 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 	//structs.SetFrom(req, info)
 	setFrom_s3CreateMultipartUploadInput_s3HeadObjectOutput(req, info)
 
-	// If copy metadata was set then set the Metadata to that read
-	// from the head request
+	// If copy metadata was set then set the Metadata, and the headers
+	// not given in copyReq, to those read from the head request, as a
+	// single part copy would keep them
 	if copyReq.MetadataDirective == types.MetadataDirectiveCopy {
 		copyReq.Metadata = info.Metadata
+		if copyReq.CacheControl == nil {
+			copyReq.CacheControl = info.CacheControl
+		}
+		if copyReq.ContentDisposition == nil {
+			copyReq.ContentDisposition = info.ContentDisposition
+		}
+		if copyReq.ContentEncoding == nil {
+			copyReq.ContentEncoding = removeAWSChunked(info.ContentEncoding)
+		}
+		if copyReq.ContentLanguage == nil {
+			copyReq.ContentLanguage = info.ContentLanguage
+		}
+		if copyReq.ContentType == nil {
+			copyReq.ContentType = info.ContentType
+		}
 	}
 
 	// Overwrite any from the copyReq
