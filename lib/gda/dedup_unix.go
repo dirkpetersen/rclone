@@ -177,3 +177,68 @@ func (b *backup) recordCopies(key string, rows map[string]Entry) {
 		}
 	}
 }
+
+// dedupCompactAt is the number of dedup index files above which a run
+// merges them into one. Tests lower it.
+var dedupCompactAt = 50
+
+// compactDedup merges the dedup index files into one when there are more
+// than dedupCompactAt, then removes the merged ones. It must be called
+// while holding the destination lock. Readers take the union of the
+// files, so a copy listed twice while this runs does no harm.
+func compactDedup(ctx context.Context, d *dest, runID string) error {
+	if d.dryRun {
+		return nil
+	}
+	entries, err := d.f.List(ctx, dedupDir)
+	if errors.Is(err, fs.ErrorDirNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var files []fs.Object
+	for _, entry := range entries {
+		if o, ok := entry.(fs.Object); ok && path.Ext(o.Remote()) == ".csv" {
+			files = append(files, o)
+		}
+	}
+	if len(files) <= dedupCompactAt {
+		return nil
+	}
+	merged := map[string]Entry{}
+	for _, o := range files {
+		data, err := d.get(ctx, o.Remote())
+		if err != nil {
+			return err
+		}
+		rows, err := ReadEntries(bytes.NewReader(data))
+		if err != nil {
+			return fmt.Errorf("parse dedup index %q: %w", o.Remote(), err)
+		}
+		for _, row := range rows {
+			if _, ok := merged[row.Name]; !ok {
+				merged[row.Name] = row
+			}
+		}
+	}
+	rows := make([]Entry, 0, len(merged))
+	for _, row := range merged {
+		rows = append(rows, row)
+	}
+	sortEntries(rows)
+	target := joinRemote(dedupDir, "compact-"+runID+".csv")
+	if err := d.writeEntries(ctx, target, rows, columns); err != nil {
+		return err
+	}
+	for _, o := range files {
+		if o.Remote() == target {
+			continue
+		}
+		if err := o.Remove(ctx); err != nil {
+			return fmt.Errorf("remove merged dedup index %q: %w", o.Remote(), err)
+		}
+	}
+	fs.Infof(nil, "gda: merged %d dedup index files into %q", len(files), target)
+	return nil
+}

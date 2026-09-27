@@ -178,7 +178,13 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 	b.summarizeAll()
 	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, fs.ConfigString(dst))
 	b.processAll(ctx)
-	return b.finishLedger(ctx, ledger)
+	ledger, err = b.finishLedger(ctx, ledger)
+	if b.dedup != nil {
+		if cErr := compactDedup(ctx, b.d, b.runID); cErr != nil {
+			fs.Errorf(nil, "gda: compact dedup index: %v", cErr)
+		}
+	}
+	return ledger, err
 }
 
 // newBackup checks the options and sets up a run.
