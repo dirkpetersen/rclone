@@ -1306,6 +1306,32 @@ Pieces that could go upstream independently, all from the analysis:
 - the `StorageClass` fix for `--s3-versions` listings;
 - the Intelligent-Tiering case in the `SetModTime` guard.
 
+### Releases
+
+The fork is released as rclone-gda, versioned after the rclone release
+it is built on plus a fourth number: `v1.75.1.1` is the first GDA
+release on rclone v1.75.1, `v1.75.1.2` the next. Each release holds two
+binaries built from the same source: `rclone`, which is rclone plus
+`rclone gda` and the `gda` backend, and `rclone-gda`, which runs
+`rclone gda`, so `rclone-gda backup /src remote:dst` is
+`rclone gda backup /src remote:dst`. `rclone-gda config` and
+`rclone-gda version` run rclone's own commands.
+
+- The `gda` branch follows rclone's master. The `gda-vX.Y` branch holds
+  the gda commits on top of rclone's `vX.Y.Z` tag, cherry-picked from
+  `gda`, and is where releases are tagged.
+- The `gda` workflow in `.github/workflows/gda.yml` tests and builds
+  every push to those branches, and pushing a tag such as `v1.75.1.1`
+  publishes a GitHub release with zips for Linux, macOS, Windows and
+  FreeBSD. The tag must extend the `VERSION` of the commit it is on.
+- The builds leave out `rclone selfupdate`, which would replace them
+  with upstream rclone, and the version check reads the fourth number
+  as build metadata, `1.75.1+gda.1`.
+- A new rclone point release, such as v1.75.2, is merged into
+  `gda-v1.75`; a new minor release, such as v1.76.0, starts `gda-v1.76`
+  from its tag with the gda commits cherry-picked onto it. Either way the
+  first GDA release on it ends in `.1`.
+
 ## Implementation plan
 
 Code lives in the fork: the format and engine in `lib/gda`, the commands in

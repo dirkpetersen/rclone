@@ -1,0 +1,162 @@
+---
+# Builds rclone and rclone-gda for the GDA fork, and publishes them as a
+# GitHub release when a fork version tag such as v1.75.1.1 is pushed.
+#
+# A fork version is the rclone release it is built on, as in the VERSION
+# file, plus a fourth number counting GDA releases on that base. Releases
+# are tagged on the gda-vX.Y branch, which holds the gda commits on top of
+# rclone's vX.Y.Z tag.
+
+name: gda
+
+on:
+  push:
+    branches:
+      - gda
+      - 'gda-v*'
+    tags:
+      - 'v*.*.*.*'
+  pull_request:
+    branches:
+      - gda
+      - 'gda-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '~1.26.6'
+
+jobs:
+  test:
+    if: github.repository != 'rclone/rclone'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Vet
+        run: go vet ./fs/ ./lib/gda/... ./cmd/gda/... ./backend/gda/... ./backend/s3/...
+
+      - name: Test
+        run: go test ./fs/ ./fs/rc/ ./cmd/version/ ./lib/gda/... ./cmd/gda/... ./backend/gda/...
+        env:
+          RCLONE_CONFIG: /notfound
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: linux, goarch: arm, goarm: '7'}
+          - {goos: darwin, goarch: amd64}
+          - {goos: darwin, goarch: arm64}
+          - {goos: windows, goarch: amd64}
+          - {goos: windows, goarch: arm64}
+          - {goos: freebsd, goarch: amd64}
+    env:
+      CGO_ENABLED: '0'
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      GOARM: ${{ matrix.goarm }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Version
+        id: version
+        run: |
+          base=$(cat VERSION)
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="$GITHUB_REF_NAME"
+            if [[ "${version%.*}" != "$base" ]]; then
+              echo "::error::tag $version isn't a fork release of $base, the VERSION it was tagged on"
+              exit 1
+            fi
+          elif ! version=$(git describe --tags --match 'v*.*.*.*' 2>/dev/null); then
+            version="$base-beta.$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          fi
+          arch="$GOARCH${GOARM:+-v$GOARM}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=rclone-gda-$version-$GOOS-$arch" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NAME: ${{ steps.version.outputs.name }}
+        run: |
+          ext=""
+          if [[ "$GOOS" == windows ]]; then ext=.exe; fi
+          flags=(-trimpath -tags noselfupdate -ldflags "-s -X github.com/rclone/rclone/fs.Version=$VERSION")
+          mkdir -p "dist/$NAME"
+          go build "${flags[@]}" -o "dist/$NAME/rclone$ext" .
+          go build "${flags[@]}" -o "dist/$NAME/rclone-gda$ext" ./cmd/gda/rclone-gda
+          cp COPYING README.md "dist/$NAME/"
+          if [[ "$GOOS/$GOARCH" == linux/amd64 ]]; then
+            "dist/$NAME/rclone-gda" version
+            "dist/$NAME/rclone-gda" backup --help > /dev/null
+          fi
+          cd dist && zip -qr "$NAME.zip" "$NAME"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.name }}
+          path: dist/${{ steps.version.outputs.name }}.zip
+          retention-days: 14
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum -- *.zip > SHA256SUMS
+          base="${TAG%.*}"
+          cat > notes.md <<EOF
+          rclone $base with the \`rclone gda\` commands added: GDA fork release ${TAG##*.} on rclone $base.
+
+          Each zip holds two binaries built from the same source:
+
+          - \`rclone\`, which is rclone $base plus \`rclone gda\` and the \`gda\` backend
+          - \`rclone-gda\`, which runs \`rclone gda\`, so \`rclone-gda backup /data s3:bucket/path\` is \`rclone gda backup /data s3:bucket/path\`. \`rclone-gda config\` and \`rclone-gda version\` run rclone's own commands.
+
+          \`rclone selfupdate\` is left out of these builds, as it would replace them with upstream rclone, which has no \`rclone gda\`.
+
+          Changes on top of rclone $base: https://github.com/$GITHUB_REPOSITORY/compare/$base...$TAG
+          EOF
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "rclone-gda $TAG" --notes-file notes.md -- *.zip SHA256SUMS

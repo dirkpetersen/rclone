@@ -231,7 +231,7 @@ This shows the current versions of rclone, Go and the OS:
 
 // Return version info
 func rcVersion(ctx context.Context, in Params) (out Params, err error) {
-	version, err := semver.NewVersion(fs.Version[1:])
+	version, err := semver.NewVersion(fs.SemVersion())
 	if err != nil {
 		return nil, err
 	}

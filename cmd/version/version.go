@@ -134,7 +134,7 @@ func GetVersion(ctx context.Context, url string) (v *semver.Version, vs string, 
 
 // CheckVersion checks the installed version against available downloads
 func CheckVersion(ctx context.Context) {
-	vCurrent, err := semver.NewVersion(stripV(fs.Version))
+	vCurrent, err := semver.NewVersion(fs.SemVersion())
 	if err != nil {
 		fs.Errorf(nil, "Failed to parse version: %v", err)
 	}
