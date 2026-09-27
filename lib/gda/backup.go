@@ -206,10 +206,8 @@ func Backup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*Ledge
 		b.finishCache(ctx)
 		return ledger, err
 	}
-	fs.Infof(nil, "gda: run %s: scanning %s with %d workers", b.runID, b.srcRoot, b.opt.Workers)
-	b.summarizeAll()
-	fs.Infof(nil, "gda: run %s: backing up to %s", b.runID, destName(dst))
-	b.processAll(ctx)
+	fs.Infof(nil, "gda: run %s: backing up %s to %s with %d workers", b.runID, b.srcRoot, destName(dst), b.opt.Workers)
+	b.scanAll(ctx)
 	ledger, err = b.finishLedger(ctx, ledger)
 	b.finishCache(ctx)
 	if b.dedup != nil {
@@ -725,7 +723,12 @@ func (b *backup) summary(rel string) *dirSummary {
 // rollupEligible returns true if the subtree at rel could be packed as
 // one unit.
 func (b *backup) rollupEligible(rel string) bool {
-	s := b.summary(rel)
+	return b.eligible(b.summary(rel))
+}
+
+// eligible returns true if a subtree with summary s could be packed as
+// one unit.
+func (b *backup) eligible(s *dirSummary) bool {
 	return b.opt.RollupMax > 0 && s != nil && s.treeSize < b.opt.RollupMax &&
 		!s.standalone && !s.unreadable && !s.badName && !s.noRollup
 }
@@ -762,6 +765,22 @@ func (b *backup) processDir(ctx context.Context, w, rel, key string, rollup bool
 	if ctx.Err() != nil || b.isStopped() {
 		return nil
 	}
+	cur, keep, err := b.collect(w, rel, key, rollup)
+	if err != nil {
+		b.errorf("%v", err)
+		return nil
+	}
+	return b.commitEntries(ctx, w, rel, key, cur, keep)
+}
+
+// commitEntries backs up the directory at rel, whose destination key is
+// key and whose current entries are cur, as worker w. keep holds the
+// names of entries that couldn't be read, whose previous rows are kept.
+// It returns the subdirectories with their own index.
+func (b *backup) commitEntries(ctx context.Context, w, rel, key string, cur []sourceEntry, keep map[string]bool) []childDir {
+	if ctx.Err() != nil || b.isStopped() {
+		return nil
+	}
 	prevEntries, err := b.d.readIndex(ctx, key)
 	if err != nil {
 		b.errorf("%v", err)
@@ -771,11 +790,6 @@ func (b *backup) processDir(ctx context.Context, w, rel, key string, rollup bool
 	prev := make(map[string]*Entry, len(prevEntries))
 	for i := range prevEntries {
 		prev[prevEntries[i].Name] = &prevEntries[i]
-	}
-	cur, keep, err := b.collect(w, rel, key, rollup)
-	if err != nil {
-		b.errorf("%v", err)
-		return nil
 	}
 	change := b.compare(key, prev, cur, keep)
 	b.commitDir(ctx, w, rel, key, prevEntries, change)

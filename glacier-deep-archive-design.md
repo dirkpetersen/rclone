@@ -1292,8 +1292,13 @@ Milestone 1 limits, each lifted by a later milestone:
   packed with the deepest directory that has an index, and such a large
   file is packed rather than stored on its own; only names which need
   encoding are still skipped);
-- the scan reads file metadata twice (once for subtree totals, once to
-  process each directory).
+- the scan read file metadata twice (once for subtree totals, once to
+  process each directory). Lifted for full runs on one host: they read
+  the tree once, depth first, committing each directory after its
+  subdirectories, which also means only the directories being read and
+  subtrees which may still be rolled up are held in memory, rather than
+  totals for every directory. Planned runs still scan once to plan and
+  again in the workers.
 
 ## Alternatives considered
 
