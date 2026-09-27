@@ -449,6 +449,9 @@ func buildPlan(ctx context.Context, t *tree, paths []string) ([]Entry, error) {
 			}
 			e := l.Entry
 			e.Target = name
+			if l.outsideRoot() {
+				return l.errOutsideRoot()
+			}
 			if e.Location != "" || e.DedupOf != "" {
 				e.Location = l.ObjectKey()
 			}

@@ -208,6 +208,9 @@ func (b *Browser) Open(ctx context.Context, l *Located, options ...fs.OpenOption
 	if l.Size == 0 || start >= l.Size || start > end {
 		return io.NopCloser(strings.NewReader("")), nil
 	}
+	if l.outsideRoot() {
+		return nil, l.errOutsideRoot()
+	}
 	o, err := b.f.NewObject(ctx, l.ObjectKey())
 	if err != nil {
 		return nil, err

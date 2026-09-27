@@ -156,3 +156,28 @@ func TestRelKey(t *testing.T) {
 		assert.Equal(t, "bucket/lab/"+test.to, l.ObjectKey())
 	}
 }
+
+func TestDedupOutsideRoot(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	opt.DedupMin = 1000
+	writeFile(t, src, "a/data.bin", 3000)
+	runBackup(t, src, dst, opt)
+	copyFile(t, src, "a/data.bin", "b/copy.bin")
+	runBackup(t, src, dst, opt)
+
+	// From a root below the directory the copy was written from, the
+	// stored copy is out of reach, which is reported as such.
+	br, err := NewBrowser(newDst(t, filepath.Join(dst, "b")), "")
+	require.NoError(t, err)
+	entries, ok, err := br.List(context.Background(), "")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, entries, 1)
+	_, err = br.Open(context.Background(), &entries[0])
+	assert.ErrorContains(t, err, "outside this GDA root")
+	_, err = StartRestore(context.Background(), newDst(t, filepath.Join(dst, "b")), t.TempDir(), DefaultRestoreOptions())
+	assert.ErrorContains(t, err, "outside this GDA root")
+}

@@ -3,6 +3,7 @@ package gda
 import (
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -21,8 +22,17 @@ const (
 	maxWorkerID = 16
 )
 
-// longestWorkerID stands for any worker ID when checking key lengths.
-var longestWorkerID = strings.Repeat("w", maxWorkerID)
+// workerIDRe matches the worker IDs users can choose. Generated suffixes
+// use "-", so they never make one user's ID into another's.
+var workerIDRe = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+// maxAttempts is the number of times a partition of a planned run can
+// be run.
+const maxAttempts = 99
+
+// longestWorkerID stands for any worker ID, including the suffix of a
+// partition's attempt, when checking key lengths.
+var longestWorkerID = strings.Repeat("w", maxWorkerID+len("-r99"))
 
 // NewRunID returns the run ID for a run starting at t.
 func NewRunID(t time.Time) string {

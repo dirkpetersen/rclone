@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -154,6 +155,12 @@ func (b *backup) dedupEntries(key string, entries []*sourceEntry, stored map[str
 			continue
 		}
 		copyRow, ok := b.dedup.find(sum, e.Size)
+		if ok {
+			// As for packing, a file which changed while being read
+			// isn't recorded with what was read.
+			info, err := os.Lstat(e.path)
+			ok = err == nil && info.Size() == e.Size && info.ModTime().Equal(e.ModTime)
+		}
 		if !ok {
 			rest = append(rest, e)
 			continue

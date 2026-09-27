@@ -285,3 +285,32 @@ func TestRestoreSharedFrames(t *testing.T) {
 		assert.Equal(t, want, got, rel)
 	}
 }
+
+func TestCatalogRetired(t *testing.T) {
+	fakeClock(t)
+	src := makeTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	runBackup(t, src, dst, opt)
+	require.NoError(t, os.RemoveAll(filepath.Join(src, "results/sub")))
+	l := runBackup(t, src, dst, opt)
+
+	// The files of a deleted directory with its own index are deleted in
+	// the catalog too.
+	in, err := os.Open(filepath.Join(dst, MetaDir, "catalog", "runs", l.RunID, "w01.csv.zst"))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, in.Close()) }()
+	dec, err := zstd.NewReader(in)
+	require.NoError(t, err)
+	defer dec.Close()
+	records, err := csv.NewReader(dec).ReadAll()
+	require.NoError(t, err)
+	actions := map[string]string{}
+	for _, r := range records[1:] {
+		actions[r[0]] = r[2]
+	}
+	assert.Equal(t, ActionDelete, actions["results/sub/deep/c.dat"])
+	assert.Equal(t, ActionDelete, actions["results/sub/deep"])
+	assert.Equal(t, ActionDelete, actions["results/sub"])
+}
