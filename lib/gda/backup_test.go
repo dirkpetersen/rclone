@@ -23,6 +23,7 @@ import (
 	_ "github.com/rclone/rclone/backend/local"
 	_ "github.com/rclone/rclone/backend/memory"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -935,4 +936,34 @@ func TestBackupChecksum(t *testing.T) {
 	assert.Equal(t, int64(1), l.Stats.Modified)
 	l = runBackup(t, src, dst, opt)
 	assert.Zero(t, l.Stats.Modified+l.Stats.MetaOnly)
+}
+
+func TestBackupFilters(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	writeFile(t, src, "keep.txt", 10)
+	writeFile(t, src, "dump.tmp", 10)
+	writeFile(t, src, "scratch/a.txt", 10)
+	writeFile(t, src, "data/b.txt", 10)
+	writeFile(t, src, "data/private/c.txt", 10)
+	writeFile(t, src, "data/private/.nobackup", 0)
+	opt := testOptions()
+	opt.RollupMax = 0
+	fopt := filter.Opt
+	fopt.ExcludeFile = []string{".nobackup"}
+	fopt.ExcludeRule = []string{"*.tmp", "/scratch/**"}
+	fi, err := filter.NewFilter(&fopt)
+	require.NoError(t, err)
+	ctx := filter.ReplaceConfig(context.Background(), fi)
+	_, err = Backup(ctx, src, newDst(t, dst), opt)
+	require.NoError(t, err)
+	root := readIndexFile(t, dst, "")
+	assert.Contains(t, root, "keep.txt")
+	assert.NotContains(t, root, "dump.tmp")
+	assert.NotContains(t, root, "scratch")
+	assert.NotContains(t, readIndexFile(t, dst, "data"), "private")
+
+	// Without the filters, the files left out are added.
+	l := runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(6), l.Stats.Added)
 }

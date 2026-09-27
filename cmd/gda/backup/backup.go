@@ -263,6 +263,12 @@ behind, and the next run takes it over once it is older than
 !--lock-timeout! (default 24 hours); for nightly runs, 2 hours is
 enough, as a running run refreshes its lock.
 
+rclone's filter flags, such as !--exclude!, !--exclude-from!,
+!--include! and !--exclude-if-present!, leave files and directories out.
+Their patterns are matched against paths relative to the source, so a
+leading !/! anchors a pattern at the source. A file backed up before and
+left out now is recorded as deleted, as if it had been removed.
+
 A run refuses to back up an empty source over a backup which isn't
 empty, as that is usually a file system which isn't mounted; use
 !--allow-empty! if the source really was emptied (with !rclone gda

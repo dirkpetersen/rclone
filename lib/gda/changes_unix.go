@@ -146,6 +146,9 @@ func (b *backup) summarizeChanged(ctx context.Context, rel string, t *tree) (*di
 			s.unreadable = true
 			continue
 		}
+		if b.excluded(childRel, info.IsDir(), info.Size(), info.ModTime()) {
+			continue
+		}
 		if !info.IsDir() {
 			s.treeFiles++
 			if info.Mode().IsRegular() {

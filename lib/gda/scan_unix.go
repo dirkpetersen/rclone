@@ -3,6 +3,7 @@
 package gda
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -175,6 +177,23 @@ func readDirDirs(p string) (map[string]bool, error) {
 			return nil, err
 		}
 	}
+}
+
+// excluded returns true if rclone's filters leave out the entry at rel,
+// relative to the source root, which is a directory if isDir.
+func (b *backup) excluded(rel string, isDir bool, size int64, modTime time.Time) bool {
+	if b.filter == nil {
+		return false
+	}
+	if isDir {
+		include, err := b.filter.IncludeDirectory(context.Background(), b.filterFs)(rel)
+		if err != nil {
+			b.errorf("filter %q: %v", rel, err)
+			return true
+		}
+		return !include
+	}
+	return !b.filter.Include(rel, size, modTime, nil)
 }
 
 // sourcePath returns the source path of rel below root.

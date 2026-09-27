@@ -68,6 +68,9 @@ func (b *backup) streamTree(ctx context.Context, d *scanned, rel string, names [
 		}
 		if isDir[name] {
 			e, err := statEntry(sourcePath(b.srcRoot, childRel), encName, b.names)
+			if err == nil && b.excluded(childRel, e.IsDir(), e.Size, e.ModTime) {
+				continue
+			}
 			if err == nil && b.opt.Xattrs {
 				e.Xattrs, err = readXattrs(e.path)
 			}
@@ -188,6 +191,9 @@ func (b *backup) commitStream(ctx context.Context, w, rel string, d *scanned, it
 			default:
 				childRel := joinRemote(rel, item.raw)
 				e, err := statEntry(sourcePath(b.srcRoot, childRel), item.name, b.names)
+				if err == nil && b.excluded(childRel, e.IsDir(), e.Size, e.ModTime) {
+					continue
+				}
 				if err == nil && b.opt.Xattrs {
 					e.Xattrs, err = readXattrs(e.path)
 				}

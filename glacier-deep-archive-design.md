@@ -1342,6 +1342,9 @@ Milestone 1 limits, each lifted by a later milestone:
   packed with the deepest directory that has an index, and such a large
   file is packed rather than stored on its own; only names which need
   encoding are still skipped);
+- `rclone gda backup` took no filters (lifted: rclone's filter flags,
+  matched against paths relative to the source, leave entries out, and an
+  entry left out that was backed up before is recorded as deleted);
 - the scan read file metadata twice (once for subtree totals, once to
   process each directory). Lifted for full runs on one host: they read
   the tree once, depth first, committing each directory after its

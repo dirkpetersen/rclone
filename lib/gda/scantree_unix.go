@@ -123,6 +123,9 @@ func (b *backup) scanTree(ctx context.Context, d *scanned, rel string, sem chan 
 			continue
 		}
 		e, err := statEntry(sourcePath(b.srcRoot, childRel), encName, b.names)
+		if err == nil && b.excluded(childRel, e.IsDir(), e.Size, e.ModTime) {
+			continue
+		}
 		if err == nil && b.opt.Xattrs {
 			e.Xattrs, err = readXattrs(e.path)
 		}

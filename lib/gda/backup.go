@@ -22,6 +22,7 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/filter"
 )
 
 // Options configure a backup run.
@@ -155,6 +156,9 @@ type backup struct {
 
 	claim *partitionClaim // this worker's claim on its partition of a planned run
 
+	filter   *filter.Filter // rclone's filters, nil if none are set
+	filterFs fs.Fs          // the source, for --exclude-if-present
+
 	versioned bool // the destination keeps each version of an object under its key
 
 	rebaseDirs map[string]bool // directory keys gc marked to be packed again
@@ -277,6 +281,14 @@ func newBackup(ctx context.Context, srcRoot string, dst fs.Fs, opt Options) (*ba
 		runID:     NewRunID(started),
 		names:     newIDNames(),
 		summaries: map[string]*dirSummary{},
+	}
+	if fi := filter.GetConfig(ctx); !fi.InActive() {
+		b.filter = fi
+		if len(fi.Opt.ExcludeFile) > 0 {
+			if b.filterFs, err = fs.NewFs(ctx, srcRoot); err != nil {
+				return nil, nil, fmt.Errorf("source for filters: %w", err)
+			}
+		}
 	}
 	if opt.Compression == CodecZstd {
 		if b.enc, err = newEncoder(opt.Level, opt.Workers); err != nil {
@@ -700,6 +712,9 @@ func (b *backup) summarize(rel string, sem chan struct{}) *dirSummary {
 			s.unreadable = true
 			continue
 		}
+		if b.excluded(childRel, info.IsDir(), info.Size(), info.ModTime()) {
+			continue
+		}
 		if info.IsDir() {
 			select {
 			case sem <- struct{}{}:
@@ -843,6 +858,9 @@ func (b *backup) collect(w, rel, key string, rollup bool) (cur []sourceEntry, ke
 			continue
 		}
 		e, err := statEntry(sourcePath(b.srcRoot, childRel), encName, b.names)
+		if err == nil && b.excluded(childRel, e.IsDir(), e.Size, e.ModTime) {
+			continue
+		}
 		if err == nil && b.opt.Xattrs {
 			e.Xattrs, err = readXattrs(e.path)
 		}
