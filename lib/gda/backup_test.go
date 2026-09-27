@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -377,11 +378,64 @@ func TestBackupLock(t *testing.T) {
 	_, err = Backup(context.Background(), src, f, testOptions())
 	assert.ErrorContains(t, err, "locked by run 20260926T000000Z on other")
 
+	// The holder's own timeout counts when it is longer.
 	opt := testOptions()
 	opt.LockTimeout = time.Nanosecond
+	long := `{"RunID":"20260926T000000Z","Host":"other","PID":1,"Started":"` + time.Now().UTC().Format(time.RFC3339) + `","Timeout":3600000000000}`
+	require.NoError(t, os.WriteFile(filepath.Join(dst, MetaDir, "lock"), []byte(long), 0o644))
+	_, err = Backup(context.Background(), src, f, opt)
+	assert.ErrorContains(t, err, "locked by run 20260926T000000Z on other")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dst, MetaDir, "lock"), []byte(lock), 0o644))
 	_, err = Backup(context.Background(), src, f, opt)
 	require.NoError(t, err)
 	assert.NoFileExists(t, filepath.Join(dst, MetaDir, "lock"))
+}
+
+func TestBackupLockRefresh(t *testing.T) {
+	fakeClock(t)
+	old := lockRefreshEvery
+	lockRefreshEvery = time.Millisecond
+	t.Cleanup(func() { lockRefreshEvery = old })
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	writeFile(t, src, "file.txt", 5)
+	b, _, err := newBackup(context.Background(), src, newDst(t, dst), testOptions())
+	require.NoError(t, err)
+	defer b.close()
+	require.NoError(t, b.lock(context.Background(), "here"))
+	// The lock may be read while it is being written.
+	tryReadLock := func() (held lockInfo, ok bool) {
+		data, err := os.ReadFile(filepath.Join(dst, MetaDir, "lock"))
+		return held, err == nil && json.Unmarshal(data, &held) == nil
+	}
+	readLock := func() lockInfo {
+		held, ok := tryReadLock()
+		require.True(t, ok)
+		return held
+	}
+
+	// A long run keeps showing it is still going.
+	done := b.keepLock(context.Background())
+	require.Eventually(t, func() bool {
+		held, ok := tryReadLock()
+		return ok && !held.Refreshed.IsZero()
+	}, 5*time.Second, time.Millisecond)
+	done()
+	held := readLock()
+	assert.Equal(t, b.runID, held.RunID)
+	assert.Less(t, held.age(), time.Minute)
+	assert.False(t, b.isStopped())
+
+	// A run whose lock was taken over stops.
+	held.RunID = "20260926T000000Z"
+	data, err := json.Marshal(held)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dst, MetaDir, "lock"), data, 0o644))
+	done = b.keepLock(context.Background())
+	require.Eventually(t, b.isStopped, 5*time.Second, time.Millisecond)
+	done()
+	assert.Equal(t, "20260926T000000Z", readLock().RunID)
+	assert.Equal(t, int64(1), b.stats.Errors)
 }
 
 func TestBackupSplitIndex(t *testing.T) {
@@ -592,5 +646,51 @@ func TestBackupStandaloneMD5Mismatch(t *testing.T) {
 	assert.ErrorContains(t, err, "errors")
 	// The corrupt object is removed and nothing refers to it.
 	assert.NoFileExists(t, filepath.Join(dst, "big.bin"))
-	assert.NoFileExists(t, filepath.Join(dst, IndexName))
+	assert.NotContains(t, readIndexFile(t, dst, ""), "big.bin")
+}
+
+func TestBackupStandaloneUploadFailure(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 0
+	writeFile(t, src, "a.bin", 9000)
+	writeFile(t, src, "b.bin", 9000)
+	writeFile(t, src, "small.txt", 100)
+	h := &hookFs{Fs: newDst(t, dst), put: func(remote, tier string) error {
+		if remote == "a.bin" {
+			return errors.New("injected failure")
+		}
+		return nil
+	}}
+	_, err := Backup(context.Background(), src, h, opt)
+	assert.ErrorContains(t, err, "1 errors")
+	// The rest of the directory is committed without the failed file.
+	index := readIndexFile(t, dst, "")
+	assert.NotContains(t, index, "a.bin")
+	assert.Contains(t, index, "b.bin")
+	assert.Contains(t, index, "small.txt")
+
+	l := runBackup(t, src, dst, opt)
+	assert.Equal(t, int64(1), l.Stats.Added)
+	index = readIndexFile(t, dst, "")
+	assert.Contains(t, index, "a.bin")
+	checkStored(t, dst, "", index)
+}
+
+func TestBackupWorkerIDLength(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	opt := testOptions()
+	opt.Worker = strings.Repeat("w", maxWorkerID+1)
+	_, _, err := newBackup(context.Background(), src, newDst(t, dst), opt)
+	assert.ErrorContains(t, err, "longer than 16 bytes")
+	// With several workers the suffix counts too.
+	opt.Worker = strings.Repeat("w", maxWorkerID-2)
+	opt.Workers = 2
+	_, _, err = newBackup(context.Background(), src, newDst(t, dst), opt)
+	assert.ErrorContains(t, err, "-02")
+	opt.Workers = 1
+	b, _, err := newBackup(context.Background(), src, newDst(t, dst), opt)
+	require.NoError(t, err)
+	b.close()
 }

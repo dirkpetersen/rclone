@@ -371,7 +371,7 @@ UTF-8 are percent-encoded, with a `name_encoding` column to mark them.
 - **Tree-wide questions use the Parquet catalog, not the CSVs.** Globbing a
   few thousand CSVs with DuckDB works for one lab:
 
-  ```sql
+  ```text
   SELECT * FROM read_csv('s3://bucket/lab/**/gda-index.csv', filename=true)
   WHERE name LIKE '%.bam' AND size > 1e9;
   ```
@@ -383,7 +383,7 @@ UTF-8 are percent-encoded, with a `name_encoding` column to mark them.
   the union of those files; the current state is the latest row per path
   which isn't a deletion:
 
-  ```sql
+  ```text
   SELECT path, size, object FROM (
     SELECT *, row_number() OVER (PARTITION BY path ORDER BY run DESC) AS n
     FROM read_csv('s3://bucket/lab/_gda/catalog/runs/*/*.csv.zst')
@@ -695,6 +695,9 @@ At the end of the run, write the run ledger.
   [Scale and parallel workers](#scale-and-parallel-workers)). A lock object
   `_gda/lock` with the run ID and coordinator host, with a takeover timeout,
   prevents two coordinators from running against the same destination.
+  Running workers refresh it every hour, so a run lasting days keeps it, and
+  the holder's timeout is stored in it, so a planned run's longer timeout
+  covers workers waiting in a queue.
 
 ## Scale and parallel workers
 
@@ -713,9 +716,13 @@ coordinator with workers for large ones (decided 2026-09-26).
 - **How work is handed out:** on one host the coordinator starts the worker
   processes and gives each its partitions. Across hosts it writes a plan,
   `_gda/runs/<run>/plan.csv`, and each Slurm array task takes its share of
-  it. Partitions not finished by a crashed worker are handed out again in the
-  next run. The worker ID in pack names means the new worker never collides
-  with the old one's leftovers.
+  it. Each worker claims its partition in
+  `_gda/runs/<run>/partition-<n>.json` and writes its ledger when it starts,
+  so a second worker for the same partition, or a worker ID used twice, is
+  refused, and `rclone gda finish` refuses to release the lock until every
+  planned partition has a finished ledger. A partition whose worker crashed
+  or reported errors is run again with the same worker ID; it writes under
+  the same names, replacing the earlier attempt's objects.
 - **No locks in S3 per directory.** They would need conditional writes
   (`If-None-Match`), which AWS supports but which I haven't confirmed for
   Ceph RGW.
@@ -1126,7 +1133,7 @@ per directory. Column names are as produced by that workflow's
 `csv2parquet.sh`, where files have `pw_fcount = -1`; check them against your
 Parquet file.
 
-```sql
+```text
 WITH per_dir AS (
   SELECT st_dev, "parent-inode" AS dir,
          count(*) FILTER (WHERE st_size <  67108864) AS small_files,

@@ -10,10 +10,15 @@ import (
 
 // workerID returns the ID of worker i of a run.
 func (b *backup) workerID(i int) string {
-	if b.opt.Workers == 1 {
-		return b.opt.Worker
+	return workerID(b.opt, i)
+}
+
+// workerID returns the ID of worker i of a run with options opt.
+func workerID(opt Options, i int) string {
+	if opt.Workers == 1 {
+		return opt.Worker
 	}
-	return fmt.Sprintf("%s-%02d", b.opt.Worker, i+1)
+	return fmt.Sprintf("%s-%02d", opt.Worker, i+1)
 }
 
 // summarizeAll computes the summaries of the whole source, scanning

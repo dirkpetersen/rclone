@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/csv"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -139,6 +140,20 @@ func TestBackupCompression(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
+func TestBackupCompressMax(t *testing.T) {
+	fakeClock(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	writeText(t, src, "reads.fastq", 50000)
+	writeText(t, src, "small.fastq", 42000)
+	opt := compressOptions()
+	opt.CompressMax = 45000
+	runBackup(t, src, dst, opt)
+	index := readIndexFile(t, dst, "")
+	assert.Equal(t, "reads.fastq", index["reads.fastq"].Location)
+	assert.Equal(t, CodecNone, index["reads.fastq"].Codec)
+	assert.Equal(t, "small.fastq.gda.zst", index["small.fastq"].Location)
+}
+
 func TestBrowseCompressed(t *testing.T) {
 	fakeClock(t)
 	smallFrames(t)
@@ -206,4 +221,67 @@ func TestCatalog(t *testing.T) {
 	assert.FileExists(t, filepath.Join(dst, filepath.FromSlash(a[10])))
 	assert.Equal(t, "results/big.bin", rows["results/big.bin"][10])
 	assert.Equal(t, int64(len(records)-1), l.Stats.Added+l.Stats.Modified+l.Stats.MetaOnly+l.Stats.Deleted)
+}
+
+// writeMixed writes a file of size bytes which is half random, so it
+// compresses by about half.
+func writeMixed(t *testing.T, root, rel string, size int) {
+	t.Helper()
+	p := filepath.Join(root, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+	data := make([]byte, size)
+	_, err := rand.Read(data[:size/2])
+	require.NoError(t, err)
+	copy(data[size/2:], strings.Repeat("ACGT", size))
+	require.NoError(t, os.WriteFile(p, data, 0o644))
+}
+
+func TestRestoreSharedFrames(t *testing.T) {
+	fakeClock(t)
+	smallFrames(t)
+	src, dst := t.TempDir(), filepath.Join(t.TempDir(), "lab")
+	for i := range 12 {
+		writeMixed(t, src, fmt.Sprintf("text/f%02d.txt", i), 1500)
+	}
+	opt := compressOptions()
+	opt.DedupMin = 1000
+	runBackup(t, src, dst, opt)
+	// A copy made later refers to the data already stored.
+	data, err := os.ReadFile(filepath.Join(src, "text/f00.txt"))
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "copy"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "copy/f00.txt"), data, 0o644))
+	l := runBackup(t, src, dst, opt)
+	require.Equal(t, int64(1), l.Stats.Deduplicated)
+
+	// Two files in the first frame and the copy of one of them are read
+	// with a single ranged read.
+	ropt := restoreOptions("text/f00.txt", "text/f01.txt", "copy/f00.txt")
+	p, err := PlanRestore(context.Background(), newDst(t, dst), t.TempDir(), ropt)
+	require.NoError(t, err)
+	var todo []int
+	for i := range p.entries {
+		if needsData(&p.entries[i]) {
+			todo = append(todo, i)
+		}
+	}
+	require.Len(t, todo, 3)
+	spans := packSpans(p.entries, todo)
+	require.Len(t, spans, 1)
+	assert.Len(t, spans[0].members, 2)
+	info, err := os.Stat(filepath.Join(dst, filepath.FromSlash(p.entries[todo[0]].Location)))
+	require.NoError(t, err)
+	_, requests := downloadPlan(p.entries, todo, info.Size())
+	assert.Equal(t, 1, requests)
+
+	target := t.TempDir()
+	st, err := StartRestore(context.Background(), newDst(t, dst), target, ropt)
+	require.NoError(t, err)
+	assert.Equal(t, StateDone, st.State)
+	for _, rel := range ropt.Paths {
+		want, _ := os.ReadFile(filepath.Join(src, rel))
+		got, err := os.ReadFile(filepath.Join(target, rel))
+		require.NoError(t, err)
+		assert.Equal(t, want, got, rel)
+	}
 }

@@ -17,7 +17,12 @@ const (
 	runIDFormat = "20060102T150405Z"
 	// maxKeyLength is the maximum length of an S3 key in bytes.
 	maxKeyLength = 1024
+	// maxWorkerID is the maximum length of a worker ID in bytes.
+	maxWorkerID = 16
 )
+
+// longestWorkerID stands for any worker ID when checking key lengths.
+var longestWorkerID = strings.Repeat("w", maxWorkerID)
 
 // NewRunID returns the run ID for a run starting at t.
 func NewRunID(t time.Time) string {

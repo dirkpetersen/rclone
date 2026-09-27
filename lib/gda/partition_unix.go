@@ -14,6 +14,7 @@ import (
 	"path"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -135,8 +136,13 @@ func (b *backup) partition(workers int) []partition {
 			parts = append(parts, p)
 			continue
 		}
+		// A shallow partition covers only the files directly in it.
 		p.shallow = true
-		p.files = 1
+		p.files = s.treeFiles
+		for _, c := range children {
+			p.files -= b.summaries[c.rel].treeFiles
+		}
+		p.files = max(p.files, 1)
 		parts = append(parts, p)
 		queue = append(queue, children...)
 	}
@@ -173,7 +179,11 @@ func (b *backup) childDirs(rel, key string) []partition {
 			continue
 		}
 		encName, _ := encodeName(name)
-		out = append(out, partition{rel: childRel, key: joinRemote(key, encName)})
+		childKey := joinRemote(key, encName)
+		if b.dirKeysTooLong(childKey) {
+			continue
+		}
+		out = append(out, partition{rel: childRel, key: childKey})
 	}
 	return out
 }
@@ -183,6 +193,10 @@ func (b *backup) childDirs(rel, key string) []partition {
 // workers. The options which shape the backup come from the plan; only
 // the worker ID, worker count, temporary directory and retries come
 // from opt.
+//
+// A partition which didn't finish, or finished with errors, can be run
+// again with the same worker ID. Its objects are written under the same
+// names, replacing those of the earlier attempt.
 func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options, runID string, index int) (*Ledger, error) {
 	d := &dest{f: dst, retries: 1}
 	data, err := d.get(ctx, runKey(runID, "plan.json"))
@@ -199,7 +213,10 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 		return nil, err
 	}
 	defer b.close()
-	b.runID, ledger.RunID = runID, runID
+	b.runID, ledger.RunID, ledger.Partition = runID, runID, &index
+	if isRunFile(b.opt.Worker + ".json") {
+		return nil, fmt.Errorf("worker ID %q is reserved", b.opt.Worker)
+	}
 	if err := b.checkRunLock(ctx); err != nil {
 		return nil, err
 	}
@@ -207,8 +224,16 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 	if err != nil {
 		return nil, err
 	}
-	if used, _ := b.d.exists(ctx, runKey(runID, b.opt.Worker+".json")); used {
-		return nil, fmt.Errorf("worker ID %q already has a ledger in run %s; give each worker its own ID", b.opt.Worker, runID)
+	if err := b.checkLedger(ctx, index); err != nil {
+		return nil, err
+	}
+	if err := b.claimPartition(ctx, index, ledger.Host); err != nil {
+		return nil, err
+	}
+	defer b.keepLock(ctx)()
+	// A ledger without a finish time shows the partition is under way.
+	if err := b.putLedger(ctx, ledger); err != nil {
+		return nil, fmt.Errorf("write run ledger: %w", err)
 	}
 	var items []childDir
 	sem := make(chan struct{}, max(b.opt.Workers-1, 0))
@@ -226,7 +251,98 @@ func BackupPartition(ctx context.Context, srcRoot string, dst fs.Fs, opt Options
 	}
 	fs.Infof(nil, "gda: run %s: worker %d backing up %d partitions", runID, index, len(items))
 	b.processItems(ctx, items)
+	if err := b.checkClaim(ctx, index); err != nil {
+		b.errorf("%v", err)
+	}
 	return b.finishLedger(ctx, ledger)
+}
+
+// partitionClaim records which worker backs up a partition of a run.
+type partitionClaim struct {
+	Worker  string
+	Host    string
+	PID     int
+	Started time.Time
+}
+
+func partitionKey(runID string, index int) string {
+	return runKey(runID, fmt.Sprintf("partition-%d.json", index))
+}
+
+// isRunFile returns true if name is one of the files of a planned run
+// other than a worker ledger.
+func isRunFile(name string) bool {
+	return name == "plan.json" || name == "run.json" || strings.HasPrefix(name, "partition-")
+}
+
+// checkLedger checks that the worker ID isn't used by another partition
+// of the run and that this partition hasn't finished already.
+func (b *backup) checkLedger(ctx context.Context, index int) error {
+	data, err := b.d.get(ctx, runKey(b.runID, b.opt.Worker+".json"))
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read run ledger: %w", err)
+	}
+	var prev Ledger
+	if err := json.Unmarshal(data, &prev); err != nil || prev.Partition == nil || *prev.Partition != index {
+		return fmt.Errorf("worker ID %q is used by another partition of run %s; give each worker its own ID", b.opt.Worker, b.runID)
+	}
+	if !prev.Finished.IsZero() && prev.Stats.Errors == 0 {
+		return fmt.Errorf("partition %d of run %s has finished already", index, b.runID)
+	}
+	fs.Logf(nil, "gda: run %s: running partition %d again, started at %s", b.runID, index, prev.Started.Format(time.RFC3339))
+	return nil
+}
+
+// claimPartition records that this worker backs up partition index,
+// unless another worker has started it.
+func (b *backup) claimPartition(ctx context.Context, index int, host string) error {
+	key := partitionKey(b.runID, index)
+	data, err := b.d.get(ctx, key)
+	if err == nil {
+		var held partitionClaim
+		if err := json.Unmarshal(data, &held); err != nil {
+			return fmt.Errorf("parse %q: %w", key, err)
+		}
+		if held.Worker != b.opt.Worker {
+			return fmt.Errorf("partition %d of run %s was started by worker %q on %s; run it again with --worker %s", index, b.runID, held.Worker, held.Host, held.Worker)
+		}
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return fmt.Errorf("read %q: %w", key, err)
+	}
+	claim := partitionClaim{Worker: b.opt.Worker, Host: host, PID: os.Getpid(), Started: time.Now().UTC()}
+	if data, err = json.Marshal(claim); err != nil {
+		return err
+	}
+	if err := b.d.putBytes(ctx, key, data, b.opt.MetaTier); err != nil {
+		return err
+	}
+	if b.d.dryRun {
+		return nil
+	}
+	// Writing the claim isn't atomic, so check that another worker which
+	// started at the same moment didn't overwrite it.
+	b.claim = &claim
+	return b.checkClaim(ctx, index)
+}
+
+// checkClaim checks that this worker's claim on partition index stands.
+func (b *backup) checkClaim(ctx context.Context, index int) error {
+	if b.d.dryRun {
+		return nil
+	}
+	data, err := b.d.get(ctx, partitionKey(b.runID, index))
+	if err != nil {
+		return fmt.Errorf("read claim of partition %d: %w", index, err)
+	}
+	var held partitionClaim
+	if err := json.Unmarshal(data, &held); err != nil || held.Worker != b.opt.Worker ||
+		(b.claim != nil && (held.Host != b.claim.Host || held.PID != b.claim.PID || !held.Started.Equal(b.claim.Started))) {
+		return fmt.Errorf("partition %d of run %s was taken by worker %q on %s", index, b.runID, held.Worker, held.Host)
+	}
+	return nil
 }
 
 // checkRunLock checks that the destination lock is held by the run.
@@ -310,18 +426,24 @@ func readCSVRows(data []byte, fields int, fn func([]string) error) error {
 
 // FinishRun merges the ledgers of the workers of run runID into
 // _gda/runs/<run>/run.json and releases the destination lock. It returns
-// an error if any worker reported errors.
+// an error, keeping the lock, if a partition of the plan hasn't
+// finished, and an error after releasing it if any worker reported
+// errors.
 func FinishRun(ctx context.Context, dst fs.Fs, runID string, opt Options) (*Ledger, error) {
 	d := &dest{f: dst, metaTier: opt.MetaTier, retries: max(opt.Retries, 1), dryRun: fs.GetConfig(ctx).DryRun}
+	planned, err := plannedPartitions(ctx, d, runID)
+	if err != nil {
+		return nil, err
+	}
 	entries, err := dst.List(ctx, joinRemote(MetaDir, "runs", runID))
 	if err != nil {
 		return nil, fmt.Errorf("list run %s: %w", runID, err)
 	}
 	merged := &Ledger{FormatVersion: FormatVersion, RunID: runID, Worker: "all", Destination: fs.ConfigString(dst)}
-	workers := 0
+	done := map[int]string{} // worker by partition
 	for _, e := range entries {
 		name := path.Base(e.Remote())
-		if path.Ext(name) != ".json" || name == "run.json" {
+		if path.Ext(name) != ".json" || isRunFile(name) {
 			continue
 		}
 		data, err := d.get(ctx, e.Remote())
@@ -332,7 +454,16 @@ func FinishRun(ctx context.Context, dst fs.Fs, runID string, opt Options) (*Ledg
 		if err := json.Unmarshal(data, &l); err != nil {
 			return nil, fmt.Errorf("parse %q: %w", e.Remote(), err)
 		}
-		workers++
+		if l.RunID != runID || l.Partition == nil {
+			return nil, fmt.Errorf("%q isn't the ledger of a partition of run %s", e.Remote(), runID)
+		}
+		if l.Finished.IsZero() {
+			return nil, fmt.Errorf("partition %d of run %s, worker %s, hasn't finished", *l.Partition, runID, l.Worker)
+		}
+		if other, ok := done[*l.Partition]; ok {
+			return nil, fmt.Errorf("partition %d of run %s was run by both worker %s and worker %s", *l.Partition, runID, other, l.Worker)
+		}
+		done[*l.Partition] = l.Worker
 		merged.Source, merged.Options, merged.DryRun = l.Source, l.Options, l.DryRun
 		if merged.Started.IsZero() || l.Started.Before(merged.Started) {
 			merged.Started = l.Started
@@ -347,11 +478,15 @@ func FinishRun(ctx context.Context, dst fs.Fs, runID string, opt Options) (*Ledg
 			}
 		}
 	}
-	if workers == 0 {
-		return nil, fmt.Errorf("run %s has no worker ledgers", runID)
+	var missing []int
+	for index := range planned {
+		if _, ok := done[index]; !ok {
+			missing = append(missing, index)
+		}
 	}
-	if merged.Finished.IsZero() {
-		merged.Finished = time.Now().UTC()
+	if len(missing) > 0 {
+		sort.Ints(missing)
+		return nil, fmt.Errorf("partitions %v of run %s have no ledger yet", missing, runID)
 	}
 	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
@@ -371,6 +506,25 @@ func FinishRun(ctx context.Context, dst fs.Fs, runID string, opt Options) (*Ledg
 		return merged, fmt.Errorf("gda: run %s finished with %d errors", runID, merged.Stats.Errors)
 	}
 	return merged, nil
+}
+
+// plannedPartitions returns the indexes of the partitions of the planned
+// run runID which have directories assigned.
+func plannedPartitions(ctx context.Context, d *dest, runID string) (map[int]bool, error) {
+	data, err := d.get(ctx, runKey(runID, "plan.csv"))
+	if err != nil {
+		return nil, fmt.Errorf("read plan of run %s: %w", runID, err)
+	}
+	planned := map[int]bool{}
+	err = readCSVRows(data, 5, func(r []string) error {
+		index, err := strconv.Atoi(r[0])
+		planned[index] = true
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("parse plan of run %s: %w", runID, err)
+	}
+	return planned, nil
 }
 
 // add adds o to s.
