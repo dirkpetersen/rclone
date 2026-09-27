@@ -121,4 +121,21 @@ func TestLoadPrices(t *testing.T) {
 	cost, err := prices.egressCost(EgressInternet, 100*bytesPerGB)
 	require.NoError(t, err)
 	assert.InDelta(t, 1.0, cost, 1e-9)
+
+	// Overriding one tier keeps the class's other tiers.
+	require.NoError(t, os.WriteFile(p, []byte(`{"retrieval":{"DEEP_ARCHIVE":{"Bulk":{"per_gb":0.001}}},"get_per_1000":0}`), 0o600))
+	prices, err = LoadPrices(p)
+	require.NoError(t, err)
+	assert.Equal(t, 0.001, prices.Retrieval["DEEP_ARCHIVE"]["Bulk"].PerGB)
+	assert.Contains(t, prices.Retrieval["DEEP_ARCHIVE"], "Standard")
+	assert.Equal(t, 0.0, prices.GetPer1000)
+	assert.Equal(t, DefaultPrices().TemporaryCopyPerGBMonth, prices.TemporaryCopyPerGBMonth)
+}
+
+func TestCanonicalTier(t *testing.T) {
+	tier, err := canonicalTier("bulk")
+	require.NoError(t, err)
+	assert.Equal(t, "Bulk", tier)
+	_, err = canonicalTier("slow")
+	assert.Error(t, err)
 }

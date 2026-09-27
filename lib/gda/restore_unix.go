@@ -26,6 +26,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/filter"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -58,15 +59,15 @@ type RestoreStatus struct {
 	Objects   ObjectCounts  `json:"objects"`
 	Files     FileCounts    `json:"files"`
 	ReadyBy   time.Time     `json:"ready_by"`
-	Errors    []string      `json:"errors,omitempty"`
+	Errors    []string      `json:"errors"`
 	Estimate  *Option       `json:"estimate,omitempty"` // estimate for the chosen tier, when starting
 	Pending   []string      `json:"-"`                  // objects still being restored
 	Record    RestoreRecord `json:"-"`
 }
 
-// ObjectCounts counts the objects a restore needs.
+// ObjectCounts counts the objects a restore needs data from.
 type ObjectCounts struct {
-	Requested int `json:"requested"` // objects holding data to fetch
+	Requested int `json:"requested"` // objects holding data the restore needs
 	Restoring int `json:"restoring"` // objects not readable yet
 	Fetched   int `json:"fetched"`   // objects whose files are all in place
 }
@@ -82,20 +83,22 @@ type FileCounts struct {
 
 // RestoreRecord describes a restore. It is saved as
 // _gda/restores/<id>.json next to the plan in _gda/restores/<id>.csv.
+//
+// Target and Overwrite are kept for information only: a resumed restore
+// takes them from its caller, as anyone who can write the destination
+// could change the record.
 type RestoreRecord struct {
-	ID        string
-	Tier      string
-	Lifetime  int
-	At        string
-	Target    string
-	Paths     []string
-	Overwrite bool
-	Requested time.Time
-	ReadyBy   time.Time
+	ID            string
+	Tier          string
+	Lifetime      int
+	At            string
+	Target        string
+	Paths         []string
+	Overwrite     bool
+	Requested     time.Time
+	ReadyBy       time.Time
+	RequestedKeys []string // objects whose restore was requested
 }
-
-// tierHours is how long each retrieval tier takes at most for Deep Archive.
-var tierHours = map[string]int{"Expedited": 5, "Standard": 12, "Bulk": 48}
 
 // actionSkip marks plan rows already in place when the restore started.
 const actionSkip = "skip"
@@ -112,72 +115,188 @@ func restoreKey(id, ext string) string {
 	return joinRemote(MetaDir, "restores", id+ext)
 }
 
-// StartRestore plans the restore of the GDA tree at dst into the local
-// directory target, requests the restore of the objects it needs, saves
-// the plan and fetches whatever is already readable.
-//
-// If local files differ from the ones to restore and Overwrite isn't
-// set, it returns an error before requesting anything.
-func StartRestore(ctx context.Context, dst fs.Fs, target string, opt RestoreOptions) (*RestoreStatus, error) {
-	if _, ok := tierHours[opt.Tier]; !ok {
-		return nil, fmt.Errorf("unknown restore tier %q: use Bulk, Standard or Expedited", opt.Tier)
+// archivedClasses are the storage classes whose objects may need
+// restoring before they can be read.
+var archivedClasses = map[string]bool{"GLACIER": true, "DEEP_ARCHIVE": true, "INTELLIGENT_TIERING": true}
+
+// planObject is an object a restore needs data from.
+type planObject struct {
+	o        fs.Object
+	class    string // storage class, if the backend reports one
+	readable bool   // whether it can be read now
+}
+
+// RestorePlan is a restore which has been planned but not started.
+type RestorePlan struct {
+	f         fs.Fs
+	d         *dest
+	opt       RestoreOptions
+	at        string
+	target    string
+	entries   []Entry
+	conflicts []string
+	objects   map[string]*planObject // by key; nil until found
+}
+
+// PlanRestore plans restoring the GDA tree at dst, or the paths of it in
+// opt, into the local directory target. It reads only indexes and local
+// files.
+func PlanRestore(ctx context.Context, dst fs.Fs, target string, opt RestoreOptions) (*RestorePlan, error) {
+	tier, err := canonicalTier(opt.Tier)
+	if err != nil {
+		return nil, err
 	}
+	opt.Tier = tier
 	at, err := ParseAt(opt.At)
 	if err != nil {
 		return nil, err
 	}
 	d := &dest{f: dst, metaTier: "STANDARD", retries: 3, dryRun: fs.GetConfig(ctx).DryRun}
-	t := newTree(d, at)
-	plan, err := buildPlan(ctx, t, opt.Paths)
+	entries, err := buildPlan(ctx, newTree(d, at), opt.Paths)
 	if err != nil {
 		return nil, err
 	}
-	if len(plan) == 0 {
+	if len(entries) == 0 {
 		return nil, errors.New("nothing to restore")
 	}
-	conflicts, err := markIdentical(plan, target)
+	conflicts, err := markIdentical(entries, target)
 	if err != nil {
 		return nil, err
 	}
-	if len(conflicts) > 0 && !opt.Overwrite {
+	return &RestorePlan{f: dst, d: d, opt: opt, at: at, target: target, entries: entries, conflicts: conflicts}, nil
+}
+
+// findObjects finds the objects the plan needs data from, with one
+// listing per directory, and which of them can be read now. Archived
+// objects are probed by reading their first byte, which fails until
+// they are restored and succeeds while a restored copy exists.
+func (p *RestorePlan) findObjects(ctx context.Context) (map[string]*planObject, error) {
+	if p.objects != nil {
+		return p.objects, nil
+	}
+	byObject := map[string][]int{}
+	for i := range p.entries {
+		if needsData(&p.entries[i]) {
+			byObject[p.entries[i].Location] = append(byObject[p.entries[i].Location], i)
+		}
+	}
+	listed, err := listObjects(ctx, p.f, byObject)
+	if err != nil {
+		return nil, err
+	}
+	objects := make(map[string]*planObject, len(listed))
+	var toProbe []*planObject
+	for key, o := range listed {
+		po := &planObject{o: o, readable: true}
+		if t, ok := o.(fs.GetTierer); ok && p.f.Features().GetTier {
+			po.class = strings.ToUpper(t.GetTier())
+		}
+		if archivedClasses[po.class] {
+			toProbe = append(toProbe, po)
+		}
+		objects[key] = po
+	}
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(max(fs.GetConfig(ctx).Checkers, 1))
+	for _, po := range toProbe {
+		g.Go(func() error {
+			in, err := po.o.Open(gCtx, &fs.RangeOption{Start: 0, End: 0})
+			if isRestorePending(err) {
+				po.readable = false
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("check %q: %w", po.o.Remote(), err)
+			}
+			return in.Close()
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	p.objects = objects
+	return objects, nil
+}
+
+// Start requests restores of the objects the plan needs which can't be
+// read yet, saves the plan and fetches whatever is readable.
+//
+// If local files differ from the ones to restore and Overwrite isn't
+// set, it returns an error before requesting anything.
+func (p *RestorePlan) Start(ctx context.Context) (*RestoreStatus, error) {
+	if len(p.conflicts) > 0 && !p.opt.Overwrite {
+		conflicts := append([]string(nil), p.conflicts...)
 		sort.Strings(conflicts)
 		if len(conflicts) > 20 {
 			conflicts = append(conflicts[:20], fmt.Sprintf("and %d more", len(conflicts)-20))
 		}
 		return nil, fmt.Errorf("these local files differ from the backup, use --overwrite to replace them:\n  %s", strings.Join(conflicts, "\n  "))
 	}
-	now := timeNow().UTC()
-	rec := RestoreRecord{
-		ID:        newRestoreID(),
-		Tier:      opt.Tier,
-		Lifetime:  opt.Lifetime,
-		At:        at,
-		Target:    target,
-		Paths:     opt.Paths,
-		Overwrite: opt.Overwrite,
-		Requested: now,
-		ReadyBy:   now.Add(time.Duration(tierHours[opt.Tier]) * time.Hour),
-	}
-	if err := requestRestore(ctx, dst, planObjects(plan), rec.Tier, rec.Lifetime); err != nil {
-		return nil, err
-	}
-	data, err := json.MarshalIndent(rec, "", "  ")
+	objects, err := p.findObjects(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := d.writeEntries(ctx, restoreKey(rec.ID, ".csv"), plan, planColumns); err != nil {
+	var keys []string
+	for key, po := range objects {
+		if !po.readable {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	now := timeNow().UTC()
+	rec := RestoreRecord{
+		ID:            newRestoreID(),
+		Tier:          p.opt.Tier,
+		Lifetime:      p.opt.Lifetime,
+		At:            p.at,
+		Target:        p.target,
+		Paths:         p.opt.Paths,
+		Overwrite:     p.opt.Overwrite,
+		Requested:     now.Truncate(time.Second),
+		ReadyBy:       readyBy(now, p.opt.Tier),
+		RequestedKeys: keys,
+	}
+	if err := requestRestore(ctx, p.f, keys, rec.Tier, rec.Lifetime); err != nil {
+		return nil, err
+	}
+	if err := p.d.writeEntries(ctx, restoreKey(rec.ID, ".csv"), p.entries, planColumns); err != nil {
 		return nil, fmt.Errorf("save restore plan: %w", err)
 	}
-	if err := d.putBytes(ctx, restoreKey(rec.ID, ".json"), data, d.metaTier); err != nil {
-		return nil, fmt.Errorf("save restore record: %w", err)
+	if err := saveRecord(ctx, p.d, &rec); err != nil {
+		return nil, err
 	}
-	return fetchPlan(ctx, d, rec, plan), nil
+	return runFetch(ctx, p.d, rec, p.entries, p.target, p.opt.Overwrite)
+}
+
+// saveRecord writes a restore's record.
+func saveRecord(ctx context.Context, d *dest, rec *RestoreRecord) error {
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := d.putBytes(ctx, restoreKey(rec.ID, ".json"), data, d.metaTier); err != nil {
+		return fmt.Errorf("save restore record: %w", err)
+	}
+	return nil
+}
+
+// StartRestore plans a restore and starts it; see PlanRestore and
+// RestorePlan.Start.
+func StartRestore(ctx context.Context, dst fs.Fs, target string, opt RestoreOptions) (*RestoreStatus, error) {
+	p, err := PlanRestore(ctx, dst, target, opt)
+	if err != nil {
+		return nil, err
+	}
+	return p.Start(ctx)
 }
 
 // ResumeRestore fetches whatever is readable of the restore with the
-// given ID and reports its progress. If target isn't "" it replaces the
-// target directory saved with the restore.
-func ResumeRestore(ctx context.Context, dst fs.Fs, id, target string) (*RestoreStatus, error) {
+// given ID into target and reports its progress. overwrite says whether
+// local files which differ may be replaced.
+func ResumeRestore(ctx context.Context, dst fs.Fs, id, target string, overwrite bool) (*RestoreStatus, error) {
+	if target == "" {
+		return nil, errors.New("resuming a restore needs the target directory")
+	}
 	d := &dest{f: dst, metaTier: "STANDARD", retries: 3, dryRun: fs.GetConfig(ctx).DryRun}
 	data, err := d.get(ctx, restoreKey(id, ".json"))
 	if err != nil {
@@ -187,8 +306,11 @@ func ResumeRestore(ctx context.Context, dst fs.Fs, id, target string) (*RestoreS
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return nil, fmt.Errorf("parse restore %q: %w", id, err)
 	}
-	if target != "" {
-		rec.Target = target
+	if rec.ID != id {
+		return nil, fmt.Errorf("restore record %q has ID %q", id, rec.ID)
+	}
+	if _, ok := tierHours[rec.Tier]; !ok {
+		return nil, fmt.Errorf("restore %q: unknown tier %q", id, rec.Tier)
 	}
 	data, err = d.get(ctx, restoreKey(id, ".csv"))
 	if err != nil {
@@ -205,26 +327,76 @@ func ResumeRestore(ctx context.Context, dst fs.Fs, id, target string) (*RestoreS
 			return nil, fmt.Errorf("restore plan %q: %w", id, err)
 		}
 	}
-	st := fetchPlan(ctx, d, rec, plan)
+	st, err := runFetch(ctx, d, rec, plan, target, overwrite)
+	if err != nil || d.dryRun || len(st.Pending) == 0 {
+		return st, err
+	}
+	// Ask for objects which were never requested, such as those of files
+	// which were in place when the restore started but have gone since,
+	// and, once the restore is overdue, for everything still unreadable:
+	// restored copies expire, and a request can be lost. Objects still
+	// being restored just report that.
 	now := timeNow().UTC()
-	if len(st.Pending) > 0 && now.After(rec.ReadyBy) && !d.dryRun {
-		// Restored copies expire after their lifetime, and a request
-		// can be lost, so ask again for whatever still isn't readable.
-		// Objects still being restored just report that.
-		fs.Logf(nil, "gda: restore %s: %d objects still aren't readable after %s, requesting them again", rec.ID, len(st.Pending), rec.ReadyBy.Format(time.RFC3339))
-		if err := requestRestore(ctx, dst, st.Pending, rec.Tier, rec.Lifetime); err != nil {
-			st.Errors = append(st.Errors, err.Error())
-			return st, nil
+	requested := make(map[string]bool, len(rec.RequestedKeys))
+	for _, k := range rec.RequestedKeys {
+		requested[k] = true
+	}
+	var again []string
+	for _, k := range st.Pending {
+		if !requested[k] || now.After(rec.ReadyBy) {
+			again = append(again, k)
 		}
-		rec.ReadyBy = now.Add(time.Duration(tierHours[rec.Tier]) * time.Hour)
-		st.ReadyBy, st.Record = rec.ReadyBy, rec
-		data, err := json.MarshalIndent(rec, "", "  ")
-		if err == nil {
-			err = d.putBytes(ctx, restoreKey(rec.ID, ".json"), data, d.metaTier)
+	}
+	if len(again) == 0 {
+		return st, nil
+	}
+	fs.Logf(nil, "gda: restore %s: requesting %d objects which aren't readable", rec.ID, len(again))
+	if err := requestRestore(ctx, dst, again, rec.Tier, rec.Lifetime); err != nil {
+		st.Errors = append(st.Errors, err.Error())
+		return st, nil
+	}
+	for _, k := range again {
+		if !requested[k] {
+			rec.RequestedKeys = append(rec.RequestedKeys, k)
 		}
-		if err != nil {
-			st.Errors = append(st.Errors, fmt.Sprintf("save restore record: %v", err))
+	}
+	rec.ReadyBy = readyBy(now, rec.Tier)
+	st.ReadyBy, st.Record = rec.ReadyBy, rec
+	if err := saveRecord(ctx, d, &rec); err != nil {
+		st.Errors = append(st.Errors, err.Error())
+	}
+	return st, nil
+}
+
+// runFetch fetches a restore's plan into target while holding a lock in
+// target, so that overlapping runs of the same restore don't fetch the
+// same data twice. If another run holds the lock, it reports that
+// instead.
+func runFetch(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, target string, overwrite bool) (*RestoreStatus, error) {
+	if d.dryRun {
+		return &RestoreStatus{RestoreID: rec.ID, Tier: rec.Tier, State: StateRestoring, ReadyBy: rec.ReadyBy, Errors: []string{}, Record: rec}, nil
+	}
+	if err := os.MkdirAll(target, 0o777); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(target, ".gda-restore-"+rec.ID+".lock")
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lock.Close() }()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return &RestoreStatus{
+				RestoreID: rec.ID, Tier: rec.Tier, State: StateRestoring, ReadyBy: rec.ReadyBy, Record: rec,
+				Errors: []string{"another run of this restore is fetching; try again later"},
+			}, nil
 		}
+		return nil, fmt.Errorf("lock %q: %w", lockPath, err)
+	}
+	st := fetchPlan(ctx, d, rec, plan, target, overwrite)
+	if st.State == StateDone {
+		_ = os.Remove(lockPath)
 	}
 	return st, nil
 }
@@ -291,10 +463,16 @@ func buildPlan(ctx context.Context, t *tree, paths []string) ([]Entry, error) {
 	return plan, nil
 }
 
-// needsData returns true if restoring e needs data from an object.
-// Empty files don't, so they never wait for a restore.
+// hasData returns true if e's content is stored in an object. Empty
+// files have none, so they never wait for a restore.
+func hasData(e *Entry) bool {
+	return e.Type == TypeFile && e.Size > 0
+}
+
+// needsData returns true if restoring e needs data from an object when
+// the restore starts: it has data and isn't in place already.
 func needsData(e *Entry) bool {
-	return e.Type == TypeFile && e.Size > 0 && e.Action != actionSkip
+	return hasData(e) && e.Action != actionSkip
 }
 
 // planObjects returns the keys of the objects holding data of plan
@@ -473,20 +651,24 @@ func makeDirs(target, rel string, overwrite bool) error {
 		// The umask applies, as with mkdir; the recorded mode is set
 		// once the directory's contents are in place.
 		if err := os.Mkdir(p, 0o777); err != nil {
-			return err
+			// Something appeared since the Lstat: accept only a directory.
+			info, lerr := os.Lstat(p)
+			if !errors.Is(err, os.ErrExist) || lerr != nil || !info.IsDir() {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 // fetchPlan fetches the data of every plan entry that isn't in place and
-// whose object is readable, then creates the other entries and applies
-// metadata.
+// whose object is readable into target, then creates the other entries
+// and applies metadata.
 //
 // Files which are already identical aren't fetched again, but their
 // permissions and times are set from the backup like everything else.
-func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *RestoreStatus {
-	st := &RestoreStatus{RestoreID: rec.ID, Tier: rec.Tier, ReadyBy: rec.ReadyBy, Record: rec}
+func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry, target string, overwrite bool) *RestoreStatus {
+	st := &RestoreStatus{RestoreID: rec.ID, Tier: rec.Tier, ReadyBy: rec.ReadyBy, Record: rec, Errors: []string{}}
 	st.Files.Total = len(plan)
 	errorf := func(format string, args ...any) {
 		err := fmt.Sprintf(format, args...)
@@ -496,12 +678,9 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 		}
 	}
 	localPath := func(e *Entry) string {
-		return filepath.Join(rec.Target, filepath.FromSlash(e.Target))
+		return filepath.Join(target, filepath.FromSlash(e.Target))
 	}
-	if d.dryRun {
-		st.State = StateRestoring
-		return st
-	}
+	pattern := tempPattern(rec.ID)
 	done := make([]bool, len(plan))
 	failed := make([]bool, len(plan))
 	unsupported := make([]bool, len(plan))
@@ -515,20 +694,28 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 	for i := range plan {
 		e := &plan[i]
 		if e.IsDir() {
-			if err := makeDirs(rec.Target, e.Target, rec.Overwrite); err != nil {
+			if err := makeDirs(target, e.Target, overwrite); err != nil {
 				errorf("create directory %q: %v", e.Target, err)
 				failed[i] = true
 			}
 		}
 	}
 
-	// Files, grouped by the object holding their data.
+	// Files, grouped by the object holding their data. Every object the
+	// plan needs data from counts as requested, and as fetched once all
+	// its files are in place, so the counts only grow from run to run.
 	byObject := map[string][]int{}
+	objectFiles := map[string]int{}
+	objectDone := map[string]int{}
 	swept := map[string]bool{}
 	for i := range plan {
 		e := &plan[i]
 		if e.Type != TypeFile {
 			continue
+		}
+		counted := e.Size > 0 && e.Action != actionSkip
+		if counted {
+			objectFiles[e.Location]++
 		}
 		p := localPath(e)
 		same, exists, err := inPlace(e, p)
@@ -539,25 +726,33 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 			continue
 		case same:
 			done[i] = true
+			if counted {
+				objectDone[e.Location]++
+			}
 			continue
-		case exists && !rec.Overwrite:
+		case exists && !overwrite:
 			// Changed locally since the restore started.
 			errorf("%q exists and differs from the backup; use --overwrite to replace it", e.Target)
 			failed[i] = true
 			continue
 		}
 		parent := path.Dir(e.Target)
-		if err := makeDirs(rec.Target, parent, rec.Overwrite); err != nil {
+		if err := makeDirs(target, parent, overwrite); err != nil {
 			errorf("create directory for %q: %v", e.Target, err)
+			failed[i] = true
+			continue
+		}
+		if err := clearDir(p, overwrite); err != nil {
+			errorf("%q: %v", e.Target, err)
 			failed[i] = true
 			continue
 		}
 		if !swept[parent] {
 			swept[parent] = true
-			sweepTemp(filepath.Dir(p))
+			sweepTemp(filepath.Dir(p), pattern)
 		}
-		if !needsData(e) {
-			if err := writeVerified(io.NopCloser(strings.NewReader("")), e, p); err != nil {
+		if !hasData(e) {
+			if err := writeVerified(io.NopCloser(strings.NewReader("")), e, p, pattern); err != nil {
 				errorf("create %q: %v", e.Target, err)
 				failed[i] = true
 				continue
@@ -567,15 +762,20 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 		}
 		byObject[e.Location] = append(byObject[e.Location], i)
 	}
+	st.Objects.Requested = len(objectFiles)
+	for key, n := range objectFiles {
+		if objectDone[key] == n {
+			st.Objects.Fetched++
+		}
+	}
 	keys := make([]string, 0, len(byObject))
 	for k := range byObject {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	st.Objects.Requested = len(keys)
 	for _, key := range keys {
 		todo := byObject[key]
-		fetched, err := fetchObject(ctx, d, key, plan, todo, localPath, errorf)
+		fetched, err := fetchObject(ctx, d, key, plan, todo, localPath, errorf, pattern)
 		switch {
 		case isRestorePending(err):
 			st.Objects.Restoring++
@@ -591,7 +791,7 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 				failed[i] = true
 			}
 		}
-		if err == nil && len(fetched) == len(todo) {
+		if err == nil && len(fetched) == len(todo) && objectDone[key]+len(todo) == objectFiles[key] {
 			st.Objects.Fetched++
 		}
 	}
@@ -602,12 +802,12 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 		if e.Type == TypeFile || e.IsDir() {
 			continue
 		}
-		if err := makeDirs(rec.Target, path.Dir(e.Target), rec.Overwrite); err != nil {
+		if err := makeDirs(target, path.Dir(e.Target), overwrite); err != nil {
 			errorf("create directory for %q: %v", e.Target, err)
 			failed[i] = true
 			continue
 		}
-		err := createSpecial(e, localPath(e), rec.Overwrite)
+		err := createSpecial(e, localPath(e), overwrite)
 		switch {
 		case errors.Is(err, errUnsupported):
 			unsupported[i] = true
@@ -628,13 +828,18 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 			}
 		}
 	}
-	if st.Objects.Restoring == 0 {
+	anyFailed := false
+	for i := range plan {
+		anyFailed = anyFailed || failed[i]
+	}
+	if st.Objects.Restoring == 0 && !anyFailed {
 		// Directory metadata last and deepest first, as creating their
 		// contents changes their modification times and a read only
-		// directory couldn't be filled.
+		// directory couldn't be filled. It waits until nothing is left
+		// to write, so a later run can still write into them.
 		var dirs []int
 		for i := range plan {
-			if plan[i].IsDir() && !failed[i] {
+			if plan[i].IsDir() {
 				dirs = append(dirs, i)
 			}
 		}
@@ -670,15 +875,34 @@ func fetchPlan(ctx context.Context, d *dest, rec RestoreRecord, plan []Entry) *R
 	return st
 }
 
-// tempPattern names the temporary files restores write into.
-const tempPattern = ".gda-restore-*"
+// tempPattern names the temporary files restore id writes into.
+func tempPattern(id string) string {
+	return ".gda-restore-" + id + "-*"
+}
 
-// sweepTemp removes temporary files left in dir by an interrupted restore.
-func sweepTemp(dir string) {
-	matches, _ := filepath.Glob(filepath.Join(dir, tempPattern))
+// sweepTemp removes temporary files matching pattern left in dir by an
+// interrupted run of the same restore.
+func sweepTemp(dir, pattern string) {
+	matches, _ := filepath.Glob(filepath.Join(dir, pattern))
 	for _, m := range matches {
 		_ = os.Remove(m)
 	}
+}
+
+// clearDir makes way for a file at p if a directory is there: an empty
+// one is removed with overwrite, anything else is an error.
+func clearDir(p string, overwrite bool) error {
+	info, err := os.Lstat(p)
+	if err != nil || !info.IsDir() {
+		return nil
+	}
+	if !overwrite {
+		return errors.New("a directory is in the way; use --overwrite to replace it if it is empty")
+	}
+	if err := os.Remove(p); err != nil {
+		return fmt.Errorf("a directory which isn't empty is in the way: %w", err)
+	}
+	return nil
 }
 
 // wholeObjectMembers is the number of members above which a pack is
@@ -688,7 +912,7 @@ const wholeObjectMembers = 16
 // fetchObject fetches the plan entries at todo from the object at key.
 // It returns which of them were written; the error is the first problem
 // with the object as a whole.
-func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []int, localPath func(*Entry) string, errorf func(string, ...any)) (map[int]bool, error) {
+func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []int, localPath func(*Entry) string, errorf func(string, ...any), pattern string) (map[int]bool, error) {
 	fetched := map[int]bool{}
 	o, err := d.f.NewObject(ctx, key)
 	if err != nil {
@@ -701,7 +925,7 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 		if err != nil {
 			return fetched, err
 		}
-		err = writeVerified(in, first, localPath(first))
+		err = writeVerified(in, first, localPath(first), pattern)
 		if err == nil {
 			fetched[todo[0]] = true
 		}
@@ -718,7 +942,7 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 			if err != nil {
 				return fetched, err
 			}
-			if err := writeVerified(in, e, localPath(e)); err != nil {
+			if err := writeVerified(in, e, localPath(e), pattern); err != nil {
 				errorf("%v", err)
 				continue
 			}
@@ -726,13 +950,13 @@ func fetchObject(ctx context.Context, d *dest, key string, plan []Entry, todo []
 		}
 		return fetched, nil
 	}
-	return fetched, extractPack(ctx, o, plan, todo, localPath, fetched, errorf)
+	return fetched, extractPack(ctx, o, plan, todo, localPath, fetched, errorf, pattern)
 }
 
 // extractPack reads the whole pack o and writes the members at todo.
 // Members are matched by their index name, so tar member names are never
 // used as paths.
-func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, localPath func(*Entry) string, fetched map[int]bool, errorf func(string, ...any)) (err error) {
+func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, localPath func(*Entry) string, fetched map[int]bool, errorf func(string, ...any), pattern string) (err error) {
 	wanted := make(map[string]int, len(todo))
 	for _, i := range todo {
 		wanted[plan[i].Name] = i
@@ -757,7 +981,7 @@ func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, loc
 		}
 		delete(wanted, hdr.Name)
 		e := &plan[i]
-		if err := writeVerified(io.NopCloser(tr), e, localPath(e)); err != nil {
+		if err := writeVerified(io.NopCloser(tr), e, localPath(e), pattern); err != nil {
 			errorf("%v", err)
 			continue
 		}
@@ -769,12 +993,13 @@ func extractPack(ctx context.Context, o fs.Object, plan []Entry, todo []int, loc
 	return nil
 }
 
-// writeVerified writes in to p through a temporary file in the same
-// directory, checking the size and MD5 against e before renaming it into
-// place. The rename replaces a symlink at p rather than following it.
-func writeVerified(in io.ReadCloser, e *Entry, p string) (err error) {
+// writeVerified writes in to p through a temporary file named by pattern
+// in the same directory, checking the size and MD5 against e before
+// renaming it into place. The rename replaces a symlink at p rather than
+// following it.
+func writeVerified(in io.ReadCloser, e *Entry, p, pattern string) (err error) {
 	defer fs.CheckClose(in, &err)
-	tmp, err := os.CreateTemp(filepath.Dir(p), tempPattern)
+	tmp, err := os.CreateTemp(filepath.Dir(p), pattern)
 	if err != nil {
 		return err
 	}
@@ -821,7 +1046,10 @@ func createSpecial(e *Entry, p string, overwrite bool) error {
 		if !overwrite {
 			return errors.New("exists and differs; use --overwrite to replace it")
 		}
-		if err := os.Remove(p); err != nil {
+		if err := clearDir(p, overwrite); err != nil {
+			return err
+		}
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}

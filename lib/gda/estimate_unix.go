@@ -7,44 +7,34 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"strings"
 
 	"github.com/rclone/rclone/fs"
 )
 
-// EstimateRestore works out what restoring into target with ropt would
-// cost with each retrieval tier. It reads only indexes and directory
-// listings, so it costs nothing to run and requests no restores.
-func EstimateRestore(ctx context.Context, dst fs.Fs, target string, ropt RestoreOptions, eopt EstimateOptions) (*Estimate, error) {
-	at, err := ParseAt(ropt.At)
-	if err != nil {
-		return nil, err
-	}
-	d := &dest{f: dst, retries: 1}
-	plan, err := buildPlan(ctx, newTree(d, at), ropt.Paths)
-	if err != nil {
-		return nil, err
-	}
-	conflicts, err := markIdentical(plan, target)
-	if err != nil {
-		return nil, err
-	}
+// Estimate works out what the planned restore would cost with each
+// retrieval tier. It reads only directory listings and the first byte of
+// each archived object, to tell which are restored already, so it costs
+// next to nothing and requests no restores.
+func (p *RestorePlan) Estimate(ctx context.Context, eopt EstimateOptions) (*Estimate, error) {
 	est := &Estimate{
 		Prices:   EstimatePrices{Region: eopt.Prices.Region, Date: eopt.Prices.Date, Currency: eopt.Prices.Currency},
 		Egress:   EstimateEgress{Path: eopt.EgressPath, Waiver: eopt.Waiver},
 		Warnings: []string{},
 	}
-	if len(conflicts) > 0 && !ropt.Overwrite {
-		est.Warnings = append(est.Warnings, fmt.Sprintf("%d local files differ from the backup; restoring them needs --overwrite", len(conflicts)))
+	if len(p.conflicts) > 0 && !p.opt.Overwrite {
+		est.Warnings = append(est.Warnings, fmt.Sprintf("%d local files differ from the backup; restoring them needs --overwrite", len(p.conflicts)))
+	}
+	objects, err := p.findObjects(ctx)
+	if err != nil {
+		return nil, err
 	}
 	sel := &est.Selection
-	sel.TemporaryCopyDays = ropt.Lifetime
+	sel.TemporaryCopyDays = p.opt.Lifetime
 	sel.storageClassBytes = map[string]int64{}
 	sel.storageClassCounts = map[string]int{}
-
 	byObject := map[string][]int{}
-	for i := range plan {
-		e := &plan[i]
+	for i := range p.entries {
+		e := &p.entries[i]
 		if e.Type != TypeFile {
 			continue
 		}
@@ -56,29 +46,23 @@ func EstimateRestore(ctx context.Context, dst fs.Fs, target string, ropt Restore
 		}
 		byObject[e.Location] = append(byObject[e.Location], i)
 	}
-	objects, err := listObjects(ctx, dst, byObject)
-	if err != nil {
-		return nil, err
-	}
 	for key, todo := range byObject {
-		o, ok := objects[key]
+		po, ok := objects[key]
 		if !ok {
 			est.Warnings = append(est.Warnings, fmt.Sprintf("%q is missing from the destination", key))
 			continue
 		}
-		class := ""
-		if t, ok := o.(fs.GetTierer); ok && dst.Features().GetTier {
-			class = strings.ToUpper(t.GetTier())
-		}
-		if _, archival := eopt.Prices.Retrieval[class]; archival {
+		_, priced := eopt.Prices.Retrieval[po.class]
+		if priced && !po.readable {
 			sel.ObjectsToRestore++
-			sel.BytesToRestore += o.Size()
-			sel.storageClassBytes[class] += o.Size()
-			sel.storageClassCounts[class]++
+			sel.BytesToRestore += po.o.Size()
+			sel.storageClassBytes[po.class] += po.o.Size()
+			sel.storageClassCounts[po.class]++
 		} else {
+			// Not archived, or restored already.
 			sel.NoRetrievalFiles += len(todo)
 		}
-		bytes, requests := downloadPlan(plan, todo, o.Size())
+		bytes, requests := downloadPlan(p.entries, todo, po.o.Size())
 		sel.BytesToDownload += bytes
 		sel.DownloadRequests += requests
 	}
@@ -86,6 +70,16 @@ func EstimateRestore(ctx context.Context, dst fs.Fs, target string, ropt Restore
 		return nil, err
 	}
 	return est, nil
+}
+
+// EstimateRestore plans a restore and estimates its cost; see
+// PlanRestore and RestorePlan.Estimate.
+func EstimateRestore(ctx context.Context, dst fs.Fs, target string, ropt RestoreOptions, eopt EstimateOptions) (*Estimate, error) {
+	p, err := PlanRestore(ctx, dst, target, ropt)
+	if err != nil {
+		return nil, err
+	}
+	return p.Estimate(ctx, eopt)
 }
 
 // downloadPlan returns the bytes and requests needed to fetch the plan
