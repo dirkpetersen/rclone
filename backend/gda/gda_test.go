@@ -237,3 +237,42 @@ func TestBrowseCopy(t *testing.T) {
 		assert.Equal(t, want, got, rel)
 	}
 }
+
+func TestBrowseRoots(t *testing.T) {
+	ctx := context.Background()
+	src := makeSource(t)
+	root := t.TempDir()
+	dst := filepath.Join(root, "lab")
+	backup(t, src, dst)
+	writeFile(t, root, "plain/notes.txt", 7)
+
+	// A root inside a rolled up subtree, as front ends pass the directory
+	// being browsed as the root.
+	f, err := fs.NewFs(ctx, ":gda:"+dst+"/tiny/a")
+	require.NoError(t, err)
+	entries, err := f.List(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b.txt"}, names(t, entries))
+	o, err := f.NewObject(ctx, "b.txt")
+	require.NoError(t, err)
+	want, _ := os.ReadFile(filepath.Join(src, "tiny/a/b.txt"))
+	assert.Equal(t, want, readAll(t, o))
+
+	// A root naming a file, as rclone cat uses it.
+	f, err = fs.NewFs(ctx, ":gda:"+dst+"/results/a.dat")
+	assert.ErrorIs(t, err, fs.ErrorIsFile)
+	require.NotNil(t, f)
+	o, err = f.NewObject(ctx, "a.dat")
+	require.NoError(t, err)
+	want, _ = os.ReadFile(filepath.Join(src, "results/a.dat"))
+	assert.Equal(t, want, readAll(t, o))
+
+	// And one outside any GDA tree.
+	f, err = fs.NewFs(ctx, ":gda:"+root+"/plain/notes.txt")
+	assert.ErrorIs(t, err, fs.ErrorIsFile)
+	o, err = f.NewObject(ctx, "notes.txt")
+	require.NoError(t, err)
+	assert.Equal(t, "notes.txt", o.Remote())
+	assert.Equal(t, int64(7), o.Size())
+	assert.ErrorIs(t, o.Remove(ctx), errReadOnly)
+}

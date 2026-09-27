@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -70,13 +71,25 @@ type Options struct {
 }
 
 // Fs shows GDA trees on a remote as the files they hold
+//
+// It wraps the top of the remote and keeps the path it shows as a
+// prefix, so that the indexes of directories above that path, which a
+// rolled up directory is listed in, can always be read.
 type Fs struct {
 	name     string
 	root     string
 	opt      Options
-	base     fs.Fs // the remote being shown
+	outer    fs.Fs  // the top of the remote being shown
+	prefix   string // path of this Fs's root in outer
 	browser  *libgda.Browser
 	features *fs.Features
+}
+
+// passObject is an object shown as it is, outside any GDA tree.
+type passObject struct {
+	fs.Object
+	fs     *Fs
+	remote string
 }
 
 // Object is a file in a GDA tree
@@ -103,25 +116,81 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if strings.HasPrefix(remote, name+":") {
 		return nil, errors.New("can't point gda remote at itself - check the value of the remote setting")
 	}
-	base, err := cache.Get(ctx, fspath.JoinRootPath(remote, root))
-	if errors.Is(err, fs.ErrorIsFile) {
-		return nil, errors.New("gda remote must point at a directory")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to make remote %q to wrap: %w", remote, err)
-	}
-	browser, err := libgda.NewBrowser(base, opt.At)
+	outerName, prefix, err := fspath.SplitFs(fspath.JoinRootPath(remote, root))
 	if err != nil {
 		return nil, err
 	}
-	f := &Fs{name: name, root: root, opt: *opt, base: base, browser: browser}
+	if outerName == "" {
+		// A local path: wrap the file system root.
+		abs, err := filepath.Abs(prefix)
+		if err != nil {
+			return nil, err
+		}
+		outerName, prefix = "/", filepath.ToSlash(abs)
+	}
+	outer, err := cache.Get(ctx, outerName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make remote %q to wrap: %w", outerName, err)
+	}
+	browser, err := libgda.NewBrowser(outer, opt.At)
+	if err != nil {
+		return nil, err
+	}
+	f := &Fs{name: name, root: root, opt: *opt, outer: outer, prefix: strings.Trim(prefix, "/"), browser: browser}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 		ReadMetadata:            true,
 		ReadMimeType:            true,
-		GetTier:                 base.Features().GetTier,
+		GetTier:                 outer.Features().GetTier,
 	}).Fill(ctx, f)
+	// A root naming a file makes the parent the root, as with other
+	// backends.
+	if f.prefix != "" {
+		if _, err := f.NewObject(ctx, ""); err == nil {
+			f.prefix = parentOf(f.prefix)
+			f.root = parentOf(strings.Trim(f.root, "/"))
+			return f, fs.ErrorIsFile
+		}
+	}
 	return f, nil
+}
+
+// parentOf returns the parent of the "/" separated path p, or "".
+func parentOf(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[:i]
+	}
+	return ""
+}
+
+// full returns the path in outer of remote.
+func (f *Fs) full(remote string) string {
+	return strings.Trim(path.Join(f.prefix, remote), "/")
+}
+
+// relative returns the path relative to this Fs of full, a path in outer.
+func (f *Fs) relative(full string) string {
+	if f.prefix == "" {
+		return full
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(full, f.prefix), "/")
+}
+
+// listOuter lists dir as it is in the wrapped remote.
+func (f *Fs) listOuter(ctx context.Context, dir string) (fs.DirEntries, error) {
+	entries, err := f.outer.List(ctx, f.full(dir))
+	if err != nil {
+		return nil, err
+	}
+	for i, e := range entries {
+		switch x := e.(type) {
+		case fs.Directory:
+			entries[i] = fs.NewDirWrapper(f.relative(x.Remote()), x)
+		case fs.Object:
+			entries[i] = &passObject{Object: x, fs: f, remote: f.relative(x.Remote())}
+		}
+	}
+	return entries, nil
 }
 
 // Name of the remote (as passed into NewFs)
@@ -131,7 +200,7 @@ func (f *Fs) Name() string { return f.name }
 func (f *Fs) Root() string { return f.root }
 
 // String converts this Fs to a string
-func (f *Fs) String() string { return fmt.Sprintf("GDA view of %v", f.base) }
+func (f *Fs) String() string { return fmt.Sprintf("GDA view of %v%s", f.outer, f.prefix) }
 
 // Precision of the modification times
 func (f *Fs) Precision() time.Duration { return time.Nanosecond }
@@ -145,14 +214,14 @@ func (f *Fs) Features() *fs.Features { return f.features }
 // List the objects and directories in dir into entries
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	if f.opt.ShowInternals {
-		return f.base.List(ctx, dir)
+		return f.listOuter(ctx, dir)
 	}
-	located, ok, err := f.browser.List(ctx, dir)
+	located, ok, err := f.browser.List(ctx, f.full(dir))
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return f.base.List(ctx, dir)
+		return f.listOuter(ctx, dir)
 	}
 	var entries fs.DirEntries
 	for _, l := range located {
@@ -198,12 +267,19 @@ func (f *Fs) tier(ctx context.Context, l *libgda.Located) (string, error) {
 
 // NewObject finds the Object at remote.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	if f.opt.ShowInternals {
-		return f.base.NewObject(ctx, remote)
+	passThrough := func() (fs.Object, error) {
+		o, err := f.outer.NewObject(ctx, f.full(remote))
+		if err != nil {
+			return nil, err
+		}
+		return &passObject{Object: o, fs: f, remote: remote}, nil
 	}
-	l, ok, err := f.browser.Find(ctx, remote)
+	if f.opt.ShowInternals {
+		return passThrough()
+	}
+	l, ok, err := f.browser.Find(ctx, f.full(remote))
 	if !ok && err == nil {
-		return f.base.NewObject(ctx, remote)
+		return passThrough()
 	}
 	if err != nil {
 		return nil, err
@@ -311,6 +387,30 @@ func (o *Object) Metadata(ctx context.Context) (fs.Metadata, error) {
 	return m, nil
 }
 
+// Fs returns the parent Fs
+func (o *passObject) Fs() fs.Info { return o.fs }
+
+// Remote returns the remote path
+func (o *passObject) Remote() string { return o.remote }
+
+// String returns a description of the Object
+func (o *passObject) String() string { return o.remote }
+
+// SetModTime is not supported
+func (o *passObject) SetModTime(ctx context.Context, t time.Time) error {
+	return errReadOnly
+}
+
+// Update is not supported
+func (o *passObject) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	return errReadOnly
+}
+
+// Remove is not supported
+func (o *passObject) Remove(ctx context.Context) error {
+	return errReadOnly
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs         = (*Fs)(nil)
@@ -318,4 +418,5 @@ var (
 	_ fs.MimeTyper  = (*Object)(nil)
 	_ fs.GetTierer  = (*Object)(nil)
 	_ fs.Metadataer = (*Object)(nil)
+	_ fs.Object     = (*passObject)(nil)
 )
