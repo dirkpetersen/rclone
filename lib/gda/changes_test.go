@@ -4,6 +4,7 @@ package gda
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -102,4 +103,27 @@ func TestBackupChangesUnrollsSubtree(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StateDone, st.State)
 	assertSameTree(t, src, target)
+}
+
+func TestBackupChangesUnrollParallel(t *testing.T) {
+	fakeClock(t)
+	src := parallelTree(t)
+	dst := filepath.Join(t.TempDir(), "lab")
+	opt := testOptions()
+	opt.RollupMax = 16
+	opt.Workers = 4
+	runBackup(t, src, dst, opt)
+	var changes []string
+	for i := range 10 {
+		rel := fmt.Sprintf("d%02d/sub/new.dat", i)
+		writeFile(t, src, rel, 100)
+		changes = append(changes, rel)
+	}
+	changed := opt
+	changed.Changes = changes
+	l := runBackup(t, src, dst, changed)
+	assert.Equal(t, int64(0), l.Stats.Errors)
+	full := filepath.Join(t.TempDir(), "lab")
+	runBackup(t, src, full, opt)
+	assert.Equal(t, indexRows(t, full), indexRows(t, dst))
 }

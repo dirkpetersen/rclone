@@ -70,7 +70,8 @@ var FinishCommand = &cobra.Command{
 	Long: `Merges the ledgers of the run's workers into the run's ledger and
 releases the destination lock. It fails, keeping the lock, while a
 partition of the plan hasn't finished, and after releasing the lock if
-any worker reported errors.
+any worker reported errors. Run partitions which reported errors again
+before finishing, as they can't be run once the run is finished.
 `,
 	Annotations: map[string]string{
 		"versionIntroduced": "v1.76",

@@ -93,13 +93,19 @@ type PackUsage struct {
 // data meanwhile. Objects which don't have GDA names are only reported.
 func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 	d := &dest{f: dst, metaTier: "STANDARD", retries: 3, dryRun: fs.GetConfig(ctx).DryRun}
+	// Below the root, the lock and the dedup index aren't there to see.
+	if _, err := dst.List(ctx, joinRemote(MetaDir, "runs")); err != nil {
+		return nil, fmt.Errorf("%s isn't the root of a GDA tree: %w", fs.ConfigString(dst), err)
+	}
+	var b *backup
 	if opt.DeleteOrphans {
-		b := &backup{d: d, runID: NewRunID(timeNow().UTC()), opt: Options{LockTimeout: opt.LockTimeout, MetaTier: "STANDARD"}}
+		b = &backup{d: d, runID: NewRunID(timeNow().UTC()), opt: Options{LockTimeout: opt.LockTimeout, MetaTier: "STANDARD"}}
 		host, _ := os.Hostname()
 		if err := b.lock(ctx, host); err != nil {
 			return nil, err
 		}
 		defer b.unlock(ctx)
+		defer b.keepLock(ctx)()
 	}
 	r := &GCReport{Orphans: []GCObject{}, Unknown: []GCObject{}, Compactable: []PackUsage{}, Errors: []string{},
 		referenced: map[string]bool{}, sharedPacks: map[string]bool{}}
@@ -160,7 +166,18 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 		return r, errors.New("not removing orphans as the tree couldn't be read in full")
 	}
 	for _, o := range r.Orphans {
-		if time.Since(o.ModTime) < opt.MinAge {
+		if b.isStopped() {
+			// Another run may be writing objects which look like orphans.
+			return r, errors.New("stopped removing orphans as the destination lock was lost")
+		}
+		// Objects keep their source file's modification time, so the
+		// age comes from the run which wrote them.
+		written, ok := orphanRun(o.Key)
+		if !ok {
+			fs.Logf(o.Key, "gda: not removing orphan, as its name doesn't show which run wrote it")
+			continue
+		}
+		if time.Since(written) < opt.MinAge {
 			continue
 		}
 		if d.dryRun {
@@ -182,6 +199,21 @@ func GC(ctx context.Context, dst fs.Fs, opt GCOptions) (*GCReport, error) {
 	}
 	return r, nil
 }
+
+// orphanRun returns when the run which wrote the data object at key
+// started, from the run ID in its name.
+func orphanRun(key string) (time.Time, bool) {
+	m := runInNameRe.FindStringSubmatch(path.Base(key))
+	if m == nil {
+		return time.Time{}, false
+	}
+	t, err := ParseRunID(m[1])
+	return t, err == nil
+}
+
+// runInNameRe finds the run ID in the name of a pack or of a standalone
+// file stored under a versioned name.
+var runInNameRe = regexp.MustCompile(`\.gda\.(\d{8}T\d{6}Z)\.[^./]+(\.\d+\.tar)?(\.zst)?$`)
 
 // errorf records an error.
 func (r *GCReport) errorf(format string, args ...any) {
