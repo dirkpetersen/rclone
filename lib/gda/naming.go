@@ -61,13 +61,20 @@ func indexPartName(runID string, n int) string {
 	return fmt.Sprintf("gda-index.%s.%05d.csv", runID, n)
 }
 
+// checkpointName returns the name of the checkpoint of an index written
+// by run runID.
+func checkpointName(runID string) string {
+	return fmt.Sprintf("gda-checkpoint.%s.csv", runID)
+}
+
 // isReserved returns true if a source entry called name can't be stored
 // because it would clash with the objects GDA writes.
 func isReserved(name string, atRoot bool) bool {
 	if atRoot && name == MetaDir {
 		return true
 	}
-	if name == IndexName || (strings.HasPrefix(name, "gda-index.") && strings.HasSuffix(name, ".csv")) {
+	if name == IndexName || (strings.HasPrefix(name, "gda-index.") && strings.HasSuffix(name, ".csv")) ||
+		(strings.HasPrefix(name, "gda-checkpoint.") && strings.HasSuffix(name, ".csv")) {
 		return true
 	}
 	return strings.Contains(name, ".gda.")

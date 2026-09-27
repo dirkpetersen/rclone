@@ -477,9 +477,11 @@ Two things accumulate when backups run for a decade:
 - **Changesets.** Nightly runs leave thousands of changesets in a busy
   directory, and rebuilding its index, or its state at a past run, means
   replaying them all. Once a month, a run also saves a dated copy of each
-  changed index, `gda-index.<run>.csv`, as a checkpoint. Rebuilds and
-  point-in-time views replay only from the latest checkpoint before the
-  requested time.
+  changed index, `gda-checkpoint.<run>.csv`, as a checkpoint (counted from
+  the directory's first changeset, so first runs don't write one). Rebuilds
+  and point-in-time views replay only from the latest checkpoint before
+  the requested time, found in the same directory listing replay already
+  makes (implemented).
 - **Fragmented packs.** A busy directory's live files end up spread over
   hundreds of small delta packs that are mostly dead data. Restoring the
   directory then means restoring hundreds of objects. When a directory's live
@@ -1200,7 +1202,7 @@ the local and memory backends and production uses S3 or Ceph.
 | 5. Parallel workers | `--workers` on one host; `rclone gda plan`, `--run`/`--partition` and `rclone gda finish` across hosts | Done; resource limits per host left |
 | 6. Cost estimates | Estimator, price table, `--estimate` and `--max-cost`, JSON for Motuz | Done; Price List API refresh left |
 | 7. Browsing backend | Read-only `gda` backend for `lsjson`, mount and Motuz | Done |
-| 8. Change feeds and scale | `--changes-from` for ZFS and path lists | Change runs done; local index cache, Parquet catalog, checkpoints, rebasing, garbage collection, dedup compaction left |
+| 8. Change feeds and scale | `--changes-from` for ZFS and path lists, checkpoints, dedup index compaction | Change runs, checkpoints and dedup compaction done; local index cache, Parquet catalog, rebasing and garbage collection left |
 
 Milestone 1 limits, each lifted by a later milestone:
 
