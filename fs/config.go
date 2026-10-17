@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rclone/rclone/fs/hash"
 )
 
 // Global
@@ -435,6 +437,16 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Use mmap allocator (see docs)",
 	Groups:  "Config",
 }, {
+	Name:    "md5_simd",
+	Default: false,
+	Help:    "Use md5-simd to calculate MD5 hashes of many streams at once (see docs)",
+	Groups:  "Performance",
+}, {
+	Name:    "md5_simd_servers",
+	Default: 1,
+	Help:    "Number of md5-simd servers (cores hashing in parallel) if --md5-simd is set",
+	Groups:  "Performance",
+}, {
 	Name:    "max_buffer_memory",
 	Default: SizeSuffix(-1),
 	Help:    "If set, don't allocate more than this amount of memory as buffers",
@@ -662,6 +674,8 @@ type ConfigInfo struct {
 	ProgressTerminalTitle      bool              `config:"progress_terminal_title"`
 	Cookie                     bool              `config:"use_cookies"`
 	UseMmap                    bool              `config:"use_mmap"`
+	MD5SIMD                    bool              `config:"md5_simd"`
+	MD5SIMDServers             int               `config:"md5_simd_servers"`
 	MaxBufferMemory            SizeSuffix        `config:"max_buffer_memory"`
 	CaCert                     []string          `config:"ca_cert"`     // Client Side CA
 	ClientCert                 string            `config:"client_cert"` // Client Side Cert
@@ -764,6 +778,16 @@ func (ci *ConfigInfo) Reload(ctx context.Context) error {
 	nonZero(&ci.LowLevelRetries)
 	nonZero(&ci.Transfers)
 	nonZero(&ci.Checkers)
+
+	// Select the MD5 implementation
+	md5SIMDServers := 0
+	if ci.MD5SIMD {
+		nonZero(&ci.MD5SIMDServers)
+		md5SIMDServers = ci.MD5SIMDServers
+	}
+	if err := hash.SetMD5SIMD(md5SIMDServers); err != nil {
+		return fmt.Errorf("--md5-simd-servers: %w", err)
+	}
 
 	return LogReload(ci)
 }
