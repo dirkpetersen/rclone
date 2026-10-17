@@ -21,9 +21,10 @@ import (
 //
 // Its hashers must not be closed: md5-simd v1.1.2 never removes a
 // closed hasher from its server, which then slows down and grows for
-// ever. So hashers are reset and kept in a free list per server
-// instead, and the number of hashers is bounded by the peak number
-// in use at once.
+// ever (fixed on its master in 2021 but not released; master still
+// keeps the closed hasher's digest). So hashers are reset and kept in
+// a free list per server instead, and the number of hashers is
+// bounded by the peak number in use at once.
 
 // md5SIMDServer is an md5-simd server with its free hashers
 type md5SIMDServer struct {
