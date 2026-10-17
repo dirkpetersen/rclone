@@ -13,6 +13,8 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	gohash "hash"
+	"hash/crc32"
 	"io"
 	"math"
 	"net/http"
@@ -298,6 +300,38 @@ for data integrity checking but can cause long delays for large files
 to start uploading.`,
 			Default:  false,
 			Advanced: true,
+		}, {
+			Name: "part_checksum",
+			Help: `Checksum to send with each part of a multipart upload.
+
+Rclone reads each part of a multipart upload before sending it to
+calculate a checksum which the server verifies, so a part corrupted
+on the way is rejected. This reading costs CPU time and can limit
+the upload speed of fast networks.
+
+- md5 sends the MD5 of each part as Content-MD5 (the default). Set
+  --md5-simd to calculate the MD5s of many parts at once.
+- crc32c sends the CRC32C of each part as x-amz-checksum-crc32c,
+  which is much faster to calculate. The provider must support it
+  (AWS S3 does).
+- none sends no checksum with the parts, so the parts are not read
+  an extra time. Only use this if the network and TLS are trusted to
+  detect corruption.
+
+With crc32c or none the multipart ETag can't be checked after the
+upload, see --s3-use-multipart-etag.`,
+			Default:  partChecksumMD5,
+			Advanced: true,
+			Examples: []fs.OptionExample{{
+				Value: partChecksumMD5.String(),
+				Help:  "Send the MD5 of each part as Content-MD5.",
+			}, {
+				Value: partChecksumCRC32C.String(),
+				Help:  "Send the CRC32C of each part.",
+			}, {
+				Value: partChecksumNone.String(),
+				Help:  "Send no checksum with the parts.",
+			}},
 		}, {
 			Name: "shared_credentials_file",
 			Help: `Path to the shared credentials file.
@@ -980,6 +1014,28 @@ const (
 	maxExpireDuration   = fs.Duration(7 * 24 * time.Hour) // max expiry is 1 week
 )
 
+// partChecksum is the checksum sent with each part of a multipart upload
+type partChecksum = fs.Enum[partChecksumChoices]
+
+const (
+	partChecksumMD5 partChecksum = iota
+	partChecksumCRC32C
+	partChecksumNone
+)
+
+type partChecksumChoices struct{}
+
+func (partChecksumChoices) Choices() []string {
+	return []string{
+		partChecksumMD5:    "md5",
+		partChecksumCRC32C: "crc32c",
+		partChecksumNone:   "none",
+	}
+}
+
+// crc32cTable is the table for CRC32C part checksums
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
 type (
 	sdkLogMode        = fs.Bits[sdkLogModeChoices]
 	sdkLogModeChoices struct{}
@@ -1098,6 +1154,7 @@ type Options struct {
 	ChunkSize                   fs.SizeSuffix        `config:"chunk_size"`
 	MaxUploadParts              int                  `config:"max_upload_parts"`
 	DisableChecksum             bool                 `config:"disable_checksum"`
+	PartChecksum                partChecksum         `config:"part_checksum"`
 	SharedCredentialsFile       string               `config:"shared_credentials_file"`
 	Profile                     string               `config:"profile"`
 	SessionToken                string               `config:"session_token"`
@@ -4626,6 +4683,10 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		chunkSize = chunksize.Calculator(src, size, uploadParts, chunkSize)
 	}
 
+	if f.opt.PartChecksum == partChecksumCRC32C {
+		mReq.ChecksumAlgorithm = types.ChecksumAlgorithmCrc32c
+	}
+
 	var mOut *s3.CreateMultipartUploadOutput
 	err = f.pacer.Call(func() (bool, error) {
 		mOut, err = f.c.CreateMultipartUpload(ctx, &mReq)
@@ -4664,12 +4725,13 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 }
 
 // add a part number and etag to the completed parts
-func (w *s3ChunkWriter) addCompletedPart(partNum *int32, eTag *string) {
+func (w *s3ChunkWriter) addCompletedPart(partNum *int32, eTag *string, crc32c *string) {
 	w.completedPartsMu.Lock()
 	defer w.completedPartsMu.Unlock()
 	w.completedParts = append(w.completedParts, types.CompletedPart{
-		PartNumber: partNum,
-		ETag:       eTag,
+		PartNumber:     partNum,
+		ETag:           eTag,
+		ChecksumCRC32C: crc32c,
 	})
 }
 
@@ -4691,17 +4753,22 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		err := fmt.Errorf("invalid chunk number provided: %v", chunkNumber)
 		return -1, err
 	}
+	partChecksum := w.f.opt.PartChecksum
 	// Only account after the checksum reads have been done
 	if do, ok := reader.(pool.DelayAccountinger); ok {
 		// To figure out this number, do a transfer and if the accounted size is 0 or a
 		// multiple of what it should be, increase or decrease this number.
 		//
 		// For transfers over https the SDK does not sign the body whereas over http it does
+		reads := 2
 		if len(w.f.opt.Endpoint) >= 5 && strings.EqualFold(w.f.opt.Endpoint[:5], "http:") {
-			do.DelayAccounting(3)
-		} else {
-			do.DelayAccounting(2)
+			reads = 3
 		}
+		if partChecksum == partChecksumNone {
+			// no checksum read
+			reads--
+		}
+		do.DelayAccounting(reads)
 	}
 
 	// create checksum of buffer for integrity checking
@@ -4714,26 +4781,48 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 	// keep the source reads a useful size. It isn't taken from the pool,
 	// where it could wait for ever on --max-buffer-memory. A reader with
 	// WriterTo, such as a pool.RW, doesn't need one.
-	m := md5.New()
 	var (
 		currentChunkSize int64
 		err              error
+		md5sum           *string // base64 Content-MD5 or nil
+		crc32cSum        *string // base64 CRC32C or nil
+		checksumLog      = "none"
 	)
-	if _, ok := reader.(io.WriterTo); ok {
-		currentChunkSize, err = io.Copy(m, reader)
+	if partChecksum == partChecksumNone {
+		// The size is all that is needed - don't read the data
+		currentChunkSize, err = reader.Seek(0, io.SeekEnd)
+		if err != nil {
+			return -1, err
+		}
 	} else {
-		currentChunkSize, err = io.CopyBuffer(m, reader, make([]byte, multipart.BufferSize))
-	}
-	if err != nil {
-		return -1, err
+		var m gohash.Hash
+		if partChecksum == partChecksumCRC32C {
+			m = crc32.New(crc32cTable)
+		} else {
+			m = hash.NewMD5()
+			defer hash.ReleaseHasher(m)
+		}
+		if _, ok := reader.(io.WriterTo); ok {
+			currentChunkSize, err = io.Copy(m, reader)
+		} else {
+			currentChunkSize, err = io.CopyBuffer(m, reader, make([]byte, multipart.BufferSize))
+		}
+		if err != nil {
+			return -1, err
+		}
+		sum := m.Sum([]byte{})
+		checksumLog = partChecksum.String() + " " + hex.EncodeToString(sum)
+		if partChecksum == partChecksumCRC32C {
+			crc32cSum = aws.String(base64.StdEncoding.EncodeToString(sum))
+		} else {
+			w.addMd5(&sum, int64(chunkNumber))
+			md5sum = aws.String(base64.StdEncoding.EncodeToString(sum))
+		}
 	}
 	// If no data read and not the first chunk, don't write the chunk
 	if currentChunkSize == 0 && chunkNumber != 0 {
 		return 0, nil
 	}
-	md5sumBinary := m.Sum([]byte{})
-	w.addMd5(&md5sumBinary, int64(chunkNumber))
-	md5sum := base64.StdEncoding.EncodeToString(md5sumBinary)
 
 	// S3 requires 1 <= PartNumber <= 10000
 	s3PartNumber := aws.Int32(int32(chunkNumber + 1))
@@ -4743,7 +4832,8 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		Key:                  w.key,
 		PartNumber:           s3PartNumber,
 		UploadId:             w.uploadID,
-		ContentMD5:           &md5sum,
+		ContentMD5:           md5sum,
+		ChecksumCRC32C:       crc32cSum,
 		ContentLength:        aws.Int64(currentChunkSize),
 		RequestPayer:         w.multiPartUploadInput.RequestPayer,
 		SSECustomerAlgorithm: w.multiPartUploadInput.SSECustomerAlgorithm,
@@ -4788,9 +4878,9 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		return -1, fmt.Errorf("failed to upload chunk %d with %v bytes: %w", chunkNumber+1, currentChunkSize, err)
 	}
 
-	w.addCompletedPart(s3PartNumber, uout.ETag)
+	w.addCompletedPart(s3PartNumber, uout.ETag, crc32cSum)
 
-	fs.Debugf(w.o, "multipart upload wrote chunk %d with %v bytes, etag %v and md5 %v", chunkNumber+1, currentChunkSize, *uout.ETag, hex.EncodeToString(md5sumBinary))
+	fs.Debugf(w.o, "multipart upload wrote chunk %d with %v bytes, etag %v and checksum %v", chunkNumber+1, currentChunkSize, *uout.ETag, checksumLog)
 	return currentChunkSize, err
 }
 
@@ -4864,8 +4954,11 @@ func (o *Object) uploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.R
 	gotETag = *stringClone(s3cw.eTag)
 	versionID = stringClone(s3cw.versionID)
 
-	hashOfHashes := md5.Sum(s3cw.md5s)
-	wantETag = fmt.Sprintf("%s-%d", hex.EncodeToString(hashOfHashes[:]), len(s3cw.completedParts))
+	// The multipart ETag can only be checked if the parts' MD5s are known
+	if o.fs.opt.PartChecksum == partChecksumMD5 {
+		hashOfHashes := md5.Sum(s3cw.md5s)
+		wantETag = fmt.Sprintf("%s-%d", hex.EncodeToString(hashOfHashes[:]), len(s3cw.completedParts))
+	}
 
 	return wantETag, gotETag, versionID, s3cw.ui, nil
 }
