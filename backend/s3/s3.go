@@ -13,8 +13,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	gohash "hash"
-	"hash/crc32"
 	"io"
 	"math"
 	"net/http"
@@ -311,9 +309,11 @@ the upload speed of fast networks.
 
 - md5 sends the MD5 of each part as Content-MD5 (the default). Set
   --md5-simd to calculate the MD5s of many parts at once.
-- crc32c sends the CRC32C of each part as x-amz-checksum-crc32c,
-  which is much faster to calculate. The provider must support it
-  (AWS S3 does).
+- crc32c sends the CRC32C of each part as x-amz-checksum-crc32c.
+  Over https the SDK calculates it while sending the part (as a
+  trailer), so the part is not read an extra time and this is about
+  as fast as none. The provider must support it (AWS S3 does) and
+  return the CRC32C of each part.
 - none sends no checksum with the parts, so the parts are not read
   an extra time. Only use this if the network and TLS are trusted to
   detect corruption.
@@ -1032,9 +1032,6 @@ func (partChecksumChoices) Choices() []string {
 		partChecksumNone:   "none",
 	}
 }
-
-// crc32cTable is the table for CRC32C part checksums
-var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 type (
 	sdkLogMode        = fs.Bits[sdkLogModeChoices]
@@ -4764,8 +4761,10 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		if len(w.f.opt.Endpoint) >= 5 && strings.EqualFold(w.f.opt.Endpoint[:5], "http:") {
 			reads = 3
 		}
-		if partChecksum == partChecksumNone {
-			// no checksum read
+		if partChecksum != partChecksumMD5 {
+			// no checksum read of our own: the SDK calculates the
+			// CRC32C while sending (https) or in the read for
+			// the signature (http)
 			reads--
 		}
 		do.DelayAccounting(reads)
@@ -4788,20 +4787,19 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		crc32cSum        *string // base64 CRC32C or nil
 		checksumLog      = "none"
 	)
-	if partChecksum == partChecksumNone {
-		// The size is all that is needed - don't read the data
+	if partChecksum != partChecksumMD5 {
+		// The size is all that is needed - don't read the data.
+		//
+		// With crc32c the SDK calculates the CRC32C: over https as
+		// a trailer while it sends the part, so the data is read
+		// only once, over http before sending it.
 		currentChunkSize, err = reader.Seek(0, io.SeekEnd)
 		if err != nil {
 			return -1, err
 		}
 	} else {
-		var m gohash.Hash
-		if partChecksum == partChecksumCRC32C {
-			m = crc32.New(crc32cTable)
-		} else {
-			m = hash.NewMD5()
-			defer hash.ReleaseHasher(m)
-		}
+		m := hash.NewMD5()
+		defer hash.ReleaseHasher(m)
 		if _, ok := reader.(io.WriterTo); ok {
 			currentChunkSize, err = io.Copy(m, reader)
 		} else {
@@ -4811,13 +4809,9 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 			return -1, err
 		}
 		sum := m.Sum([]byte{})
-		checksumLog = partChecksum.String() + " " + hex.EncodeToString(sum)
-		if partChecksum == partChecksumCRC32C {
-			crc32cSum = aws.String(base64.StdEncoding.EncodeToString(sum))
-		} else {
-			w.addMd5(&sum, int64(chunkNumber))
-			md5sum = aws.String(base64.StdEncoding.EncodeToString(sum))
-		}
+		checksumLog = "md5 " + hex.EncodeToString(sum)
+		w.addMd5(&sum, int64(chunkNumber))
+		md5sum = aws.String(base64.StdEncoding.EncodeToString(sum))
 	}
 	// If no data read and not the first chunk, don't write the chunk
 	if currentChunkSize == 0 && chunkNumber != 0 {
@@ -4833,7 +4827,6 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		PartNumber:           s3PartNumber,
 		UploadId:             w.uploadID,
 		ContentMD5:           md5sum,
-		ChecksumCRC32C:       crc32cSum,
 		ContentLength:        aws.Int64(currentChunkSize),
 		RequestPayer:         w.multiPartUploadInput.RequestPayer,
 		SSECustomerAlgorithm: w.multiPartUploadInput.SSECustomerAlgorithm,
@@ -4843,6 +4836,9 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 	if w.f.opt.DirectoryBucket {
 		// Directory buckets do not support "Content-Md5" header
 		uploadPartReq.ContentMD5 = nil
+	}
+	if partChecksum == partChecksumCRC32C {
+		uploadPartReq.ChecksumAlgorithm = types.ChecksumAlgorithmCrc32c
 	}
 	var uout *s3.UploadPartOutput
 	err = w.f.pacer.Call(func() (bool, error) {
@@ -4878,6 +4874,14 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 		return -1, fmt.Errorf("failed to upload chunk %d with %v bytes: %w", chunkNumber+1, currentChunkSize, err)
 	}
 
+	if partChecksum == partChecksumCRC32C {
+		// CompleteMultipartUpload needs the CRC32C of each part
+		if uout.ChecksumCRC32C == nil || *uout.ChecksumCRC32C == "" {
+			return -1, fmt.Errorf("UploadPart response for chunk %d has no CRC32C: the provider may not support --s3-part-checksum crc32c", chunkNumber+1)
+		}
+		crc32cSum = uout.ChecksumCRC32C
+		checksumLog = "crc32c " + *crc32cSum
+	}
 	w.addCompletedPart(s3PartNumber, uout.ETag, crc32cSum)
 
 	fs.Debugf(w.o, "multipart upload wrote chunk %d with %v bytes, etag %v and checksum %v", chunkNumber+1, currentChunkSize, *uout.ETag, checksumLog)

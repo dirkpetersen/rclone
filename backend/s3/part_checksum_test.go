@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,6 +40,8 @@ type fakeMultipartServer struct {
 	crc32c     map[int]string
 	// from CompleteMultipartUpload
 	completed []fakeCompletedPart
+	// parts sent with aws-chunked encoding and a trailing checksum
+	trailers int
 	// unexpected requests
 	unexpected []string
 }
@@ -56,6 +60,8 @@ func newFakeMultipartServer(t *testing.T) *fakeMultipartServer {
 		crc32c:     map[int]string{},
 	}
 }
+
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 func crc32cBase64(data []byte) string {
 	var sum [4]byte
@@ -77,6 +83,14 @@ func (s *fakeMultipartServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		var part int
 		_, err := fmt.Sscan(q.Get("partNumber"), &part)
 		require.NoError(s.t, err)
+		if strings.Contains(r.Header.Get("Content-Encoding"), "aws-chunked") {
+			var trailer map[string]string
+			body, trailer = decodeAWSChunked(s.t, body)
+			for k, v := range trailer {
+				r.Header.Set(k, v)
+			}
+			s.trailers++
+		}
 		if md5sum := r.Header.Get("Content-Md5"); md5sum != "" {
 			s.contentMD5[part] = md5sum
 			sum := md5.Sum(body)
@@ -117,12 +131,57 @@ func (s *fakeMultipartServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// decodeAWSChunked decodes an unsigned aws-chunked body: chunks of
+// "<hex size>\r\n<data>\r\n", a chunk of size 0, then trailer lines
+func decodeAWSChunked(t *testing.T, body []byte) (data []byte, trailer map[string]string) {
+	r := bufio.NewReader(bytes.NewReader(body))
+	for {
+		line, err := r.ReadString('\n')
+		require.NoError(t, err)
+		var size int
+		_, err = fmt.Sscanf(strings.TrimSpace(strings.SplitN(line, ";", 2)[0]), "%x", &size)
+		require.NoError(t, err, "chunk size %q", line)
+		if size == 0 {
+			break
+		}
+		chunk := make([]byte, size+2)
+		_, err = io.ReadFull(r, chunk)
+		require.NoError(t, err)
+		data = append(data, chunk[:size]...)
+	}
+	trailer = map[string]string{}
+	for {
+		line, err := r.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" || err != nil {
+			break
+		}
+		k, v, ok := strings.Cut(line, ":")
+		require.True(t, ok, "trailer %q", line)
+		trailer[k] = v
+	}
+	return data, trailer
+}
+
 // uploadWithPartChecksum uploads data as a multipart upload of 5 MiB
 // parts to a fake server and returns what the server saw
 func uploadWithPartChecksum(t *testing.T, checksum string, data []byte) *fakeMultipartServer {
+	return uploadWithPartChecksumTLS(t, checksum, data, false)
+}
+
+// uploadWithPartChecksumTLS is uploadWithPartChecksum, over https if useTLS
+func uploadWithPartChecksumTLS(t *testing.T, checksum string, data []byte, useTLS bool) *fakeMultipartServer {
 	ctx := context.Background()
 	fake := newFakeMultipartServer(t)
-	srv := httptest.NewServer(fake)
+	srv := httptest.NewUnstartedServer(fake)
+	if useTLS {
+		srv.StartTLS()
+		var ci *fs.ConfigInfo
+		ctx, ci = fs.AddConfig(ctx)
+		ci.InsecureSkipVerify = true
+	} else {
+		srv.Start()
+	}
 	defer srv.Close()
 
 	f, err := fs.NewFs(ctx, fmt.Sprintf(":s3,provider=Other,endpoint='%s',access_key_id=key,secret_access_key=secret,force_path_style,no_check_bucket,no_head,chunk_size=5Mi,upload_cutoff=5Mi,upload_concurrency=2,part_checksum=%s:bucket", srv.URL, checksum))
@@ -174,6 +233,18 @@ func TestPartChecksum(t *testing.T) {
 		assert.Equal(t, "CRC32C", fake.checksumAlgorithm)
 		assert.Empty(t, fake.contentMD5)
 		require.Len(t, fake.crc32c, 3)
+		require.Len(t, fake.completed, 3)
+		for _, p := range fake.completed {
+			assert.Equal(t, crc32cBase64(partData(p.PartNumber)), p.ChecksumCRC32C, "part %d", p.PartNumber)
+		}
+	})
+
+	t.Run("crc32c over https", func(t *testing.T) {
+		// The SDK sends the CRC32C as a trailer while it sends the part
+		fake := uploadWithPartChecksumTLS(t, "crc32c", data, true)
+		assert.Equal(t, "CRC32C", fake.checksumAlgorithm)
+		assert.Equal(t, 3, fake.trailers)
+		assert.Empty(t, fake.contentMD5)
 		require.Len(t, fake.completed, 3)
 		for _, p := range fake.completed {
 			assert.Equal(t, crc32cBase64(partData(p.PartNumber)), p.ChecksumCRC32C, "part %d", p.PartNumber)
