@@ -788,6 +788,9 @@ func (ci *ConfigInfo) Reload(ctx context.Context) error {
 	if err := hash.SetMD5SIMD(md5SIMDServers); err != nil {
 		return fmt.Errorf("--md5-simd-servers: %w", err)
 	}
+	if ci.MD5SIMD && !hash.MD5SIMDSupported() {
+		Debugf(nil, "--md5-simd: this CPU has no AVX2, using the standard MD5")
+	}
 
 	return LogReload(ci)
 }

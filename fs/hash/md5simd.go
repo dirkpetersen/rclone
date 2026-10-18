@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	md5simd "github.com/minio/md5-simd"
+	"golang.org/x/sys/cpu"
 )
 
 // MD5 hashing through github.com/minio/md5-simd.
@@ -79,12 +80,21 @@ var (
 	md5SIMDServers []*md5SIMDServer // nil if crypto/md5 is used
 	md5SIMDState   atomic.Pointer[[]*md5SIMDServer]
 	md5SIMDNext    atomic.Uint64
+	// md5-simd only has assembly for amd64 with AVX2 or AVX512;
+	// elsewhere it would wrap crypto/md5 at extra cost
+	md5SIMDSupported = cpu.X86.HasAVX2
 )
 
+// MD5SIMDSupported returns whether this CPU can use md5-simd (amd64
+// with AVX2). SetMD5SIMD uses crypto/md5 on other CPUs.
+func MD5SIMDSupported() bool {
+	return md5SIMDSupported
+}
+
 // SetMD5SIMD makes MD5 use md5-simd with the given number of servers,
-// or crypto/md5 if servers is 0 or less.
+// or crypto/md5 if servers is 0 or less or the CPU is not supported
+// (see MD5SIMDSupported).
 //
-// On CPUs without AVX2 md5-simd falls back to crypto/md5 by itself.
 // Hashers which are in use keep their server, so calling it again is
 // safe at any time.
 func SetMD5SIMD(servers int) error {
@@ -93,7 +103,7 @@ func SetMD5SIMD(servers int) error {
 	}
 	md5SIMDMu.Lock()
 	defer md5SIMDMu.Unlock()
-	if servers <= 0 {
+	if servers <= 0 || !md5SIMDSupported {
 		md5SIMDState.Store(nil)
 		return nil
 	}

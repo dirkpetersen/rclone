@@ -18,10 +18,17 @@ import (
 // block size (32 KiB)
 var md5SIMDTestSizes = []int{0, 1, 55, 56, 63, 64, 65, 127, 128, 1000, 32<<10 - 1, 32 << 10, 32<<10 + 1, 64<<10 + 63, 1<<20 + 7}
 
+// withMD5SIMD enables md5-simd for the test, also on CPUs without
+// AVX2 where md5-simd's fallback server exercises the same code here
 func withMD5SIMD(t *testing.T, servers int) {
 	t.Helper()
+	supported := md5SIMDSupported
+	md5SIMDSupported = true
 	require.NoError(t, SetMD5SIMD(servers))
-	t.Cleanup(func() { require.NoError(t, SetMD5SIMD(0)) })
+	t.Cleanup(func() {
+		require.NoError(t, SetMD5SIMD(0))
+		md5SIMDSupported = supported
+	})
 }
 
 func randomData(seed int64, n int) []byte {
@@ -61,6 +68,17 @@ func TestMD5SIMDSelection(t *testing.T) {
 
 	assert.Error(t, SetMD5SIMD(65))
 	ReleaseHasher(md5.New()) // no-op for other hashers
+}
+
+func TestMD5SIMDUnsupportedCPU(t *testing.T) {
+	supported := md5SIMDSupported
+	md5SIMDSupported = false
+	defer func() { md5SIMDSupported = supported }()
+	require.NoError(t, SetMD5SIMD(2))
+	assert.False(t, MD5SIMDSupported())
+	assert.Equal(t, 0, MD5SIMDServers())
+	_, isSIMD := NewMD5().(*md5SIMDHasher)
+	assert.False(t, isSIMD, "crypto/md5 without AVX2")
 }
 
 func TestMD5SIMDMatchesCryptoMD5(t *testing.T) {

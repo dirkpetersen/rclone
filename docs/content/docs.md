@@ -2217,8 +2217,8 @@ S3 uploads) and for the parts of S3 multipart uploads (see
 It is faster than the standard MD5 only when many streams are hashed
 at once, for example with a high `--transfers` and
 `--s3-upload-concurrency`, and a little slower for a single stream.
-On CPUs without AVX2 (or not amd64) it falls back to the standard MD5
-by itself.
+On CPUs without AVX2 (or not amd64, for example arm64) this flag is
+ignored and the standard MD5 is used.
 
 ### --md5-simd-servers int
 
