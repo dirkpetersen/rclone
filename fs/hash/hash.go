@@ -2,7 +2,6 @@
 package hash
 
 import (
-	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -120,7 +119,7 @@ func (h *xxh128Hasher) Size() int {
 }
 
 func init() {
-	MD5 = RegisterHash("md5", "MD5", 32, md5.New)
+	MD5 = RegisterHash("md5", "MD5", 32, NewMD5)
 	SHA1 = RegisterHash("sha1", "SHA-1", 40, sha1.New)
 	Whirlpool = RegisterHash("whirlpool", "Whirlpool", 128, whirlpool.New)
 	CRC32 = RegisterHash("crc32", "CRC-32", 8, func() hash.Hash { return crc32.NewIEEE() })

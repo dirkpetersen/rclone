@@ -2202,6 +2202,31 @@ This is the default.
 `CAUTIOUS` will try to prevent rclone from reaching the limit. Only applicable
 for `--max-transfer`.
 
+### --md5-simd
+
+If this flag is set then rclone calculates MD5 hashes with
+[md5-simd](https://github.com/minio/md5-simd), which hashes up to 16
+independent streams at once on one core with AVX512 (8 with AVX2).
+
+This is used wherever rclone calculates an MD5 itself, for example
+for the files of the local backend (`rclone md5sum`, `rclone check`,
+the hash checked after a transfer and the Content-MD5 of single part
+S3 uploads) and for the parts of S3 multipart uploads (see
+`--s3-part-checksum`).
+
+It is faster than the standard MD5 only when many streams are hashed
+at once, for example with a high `--transfers` and
+`--s3-upload-concurrency`, and a little slower for a single stream.
+On CPUs without AVX2 (or not amd64, for example arm64) this flag is
+ignored and the standard MD5 is used.
+
+### --md5-simd-servers int
+
+The number of md5-simd servers used if `--md5-simd` is set (default 1).
+Each server uses up to one core and hashes up to 16 streams at once,
+so for many streams (for example 32 or more) on a machine with many
+cores, 2 to 4 servers are faster.
+
 ### -M, --metadata
 
 Setting this flag enables rclone to copy the metadata from the source
