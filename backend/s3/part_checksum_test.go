@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/stretchr/testify/assert"
@@ -330,6 +331,17 @@ func TestPartChecksum(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("md5-simd", func(t *testing.T) {
+		require.NoError(t, hash.SetMD5SIMD(2))
+		defer func() { require.NoError(t, hash.SetMD5SIMD(0)) }()
+		fake := newFakeMultipartServer(t)
+		require.NoError(t, uploadWithPartChecksum(t, fake, "md5", false, data, false))
+		require.Len(t, fake.contentMD5, 3)
+		for i := 1; i <= 3; i++ {
+			assert.Equal(t, md5Base64(partData(i)), fake.contentMD5[i], "Content-MD5 of part %d", i)
+		}
+	})
 
 	for _, checksum := range []string{"md5", "crc32c", "none"} {
 		for _, size := range []int{0, 1000} {
