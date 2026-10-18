@@ -332,7 +332,8 @@ against your provider before listing crc32c here.`,
 
 - md5 sends the MD5 of each part as Content-MD5 (the default). Rclone
   reads each part an extra time to calculate it, which can limit the
-  upload speed on fast networks.
+  upload speed on fast networks. Set --md5-simd to calculate the MD5s
+  of many parts at once.
 - crc32c sends the CRC32C of each part. It is calculated while the
   part is sent, so it is about as fast as none. Over https it is sent
   as a trailing checksum. Rclone combines the CRC32Cs of the parts
@@ -4898,7 +4899,8 @@ func (w *s3ChunkWriter) WriteChunk(ctx context.Context, chunkNumber int, reader 
 	if partChecksum != partChecksumMD5 {
 		currentChunkSize, err = reader.Seek(0, io.SeekEnd)
 	} else {
-		m := md5.New()
+		m := hash.NewMD5()
+		defer hash.ReleaseHasher(m)
 		if _, ok := reader.(io.WriterTo); ok {
 			currentChunkSize, err = io.Copy(m, reader)
 		} else {
