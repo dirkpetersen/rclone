@@ -3211,6 +3211,10 @@ func (f *Fs) copyMultipart(ctx context.Context, copyReq *s3.CopyObjectInput, dst
 	//structs.SetFrom(req, info)
 	setFrom_s3CreateMultipartUploadInput_s3HeadObjectOutput(req, info)
 
+	// The head info has the ChecksumType if it read the checksums,
+	// but not the algorithm, and S3 rejects a type without one
+	req.ChecksumType = ""
+
 	// If copy metadata was set then set the Metadata to that read
 	// from the head request
 	if copyReq.MetadataDirective == types.MetadataDirectiveCopy {
